@@ -23,7 +23,7 @@ public sealed partial class StateStore
         var invite = new InviteCode(Guid.NewGuid(), name, groupIds.ToArray(), HashInvite(code), maxUses, 0, created, expiresUtc);
         return Update(s =>
         {
-            ValidateGroups(s, groupIds);
+            ValidateInviteGroups(s, invite.GroupIds);
             if (s.Invites.Count >= 1024 || s.Invites.Count(item => IsUsable(item, created)) >= 256)
                 throw new ArgumentException("The invite limit has been reached (256 active, 1024 total).");
             s.Invites.Add(invite);
@@ -43,17 +43,18 @@ public sealed partial class StateStore
         return true;
     });
 
-    // This method runs only after the caller has proved the supplied device private key.
+    // The handshake proves both private identity keys before an invite can be redeemed.
     public Device RedeemInvite(EnrollmentRequest request, string? code)
     {
-        var (id, key) = ValidateRegistration(request);
+        var binding = ValidateRegistration(request);
         gate.EnterWriteLock();
         try
         {
-            EnsureIdentityAvailable(state, id, key);
-            if (state.Devices.SingleOrDefault(device => device.Id == id) is { } registered)
+            EnsureIdentityAvailable(state, binding);
+            if (state.Devices.SingleOrDefault(device => device.PublicIdentity == binding.Digest) is { } registered)
                 return registered.Enabled ? registered : throw new RemoteException("DeviceBlocked");
-            if (state.PendingDevices.SingleOrDefault(device => device.Id == id)?.Rejected == true)
+            var pending = state.PendingDevices.SingleOrDefault(d => d.ClientPublicKey == binding.Ecdh);
+            if (pending?.Rejected == true)
                 throw new RemoteException("DeviceRejected");
             if (!IsCode(code))
                 throw new RemoteException("InvalidInvite");
@@ -63,9 +64,7 @@ public sealed partial class StateStore
                 throw new RemoteException("InvalidInvite");
             return Update(s =>
             {
-                var device = CreateDevice(id, request.DeviceName, key, invite.GroupIds);
-                s.Devices.Add(device);
-                s.PendingDevices.RemoveAll(pending => pending.Id == id);
+                var device = CompleteEnrollment(s, binding, request.DeviceName, invite.GroupIds);
                 var index = s.Invites.FindIndex(item => item.Id == invite.Id);
                 s.Invites[index] = s.Invites[index] with
                 {
@@ -78,10 +77,18 @@ public sealed partial class StateStore
     }
 
     private static bool IsUsable(InviteCode invite, DateTime now) => !invite.Revoked &&
+        !invite.GroupIds.Contains(AdministratorGroupId) &&
         (invite.ExpiresUtc is null || invite.ExpiresUtc > now) && (invite.MaxUses is null || invite.Uses < invite.MaxUses);
     private static bool IsCode(string? code) => code is { Length: 32 } &&
         code.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
-    private static string HashInvite(string code) => Convert.ToHexString(SHA256.HashData(Encoding.ASCII.GetBytes(code))).ToLowerInvariant();
+    private static string HashInvite(string code) => Convert.ToHexStringLower(SHA3_256.HashData(Encoding.ASCII.GetBytes(code)));
+
+    private static void ValidateInviteGroups(ServerState state, Guid[] groupIds)
+    {
+        ValidateGroups(state, groupIds);
+        if (groupIds.Contains(AdministratorGroupId))
+            throw new ArgumentException("Invites cannot grant membership in the Administrator group. Assign it directly to an approved device.");
+    }
 
     private static void ValidateInvites(ServerState state)
     {
@@ -92,7 +99,7 @@ public sealed partial class StateStore
         foreach (var invite in state.Invites)
         {
             ValidateName(invite.Name);
-            ValidateGroups(state, invite.GroupIds);
+            ValidateInviteGroups(state, invite.GroupIds);
             if (invite.Id == Guid.Empty || invite.CodeHash is not { Length: 64 } || invite.CodeHash.Any(character => !char.IsAsciiHexDigitLower(character)) ||
                 invite.Uses < 0 || invite.MaxUses is <= 0 or > 1_000_000 || invite.MaxUses is { } limit && invite.Uses > limit ||
                 invite.CreatedUtc.Kind != DateTimeKind.Utc || invite.ExpiresUtc is { Kind: not DateTimeKind.Utc })

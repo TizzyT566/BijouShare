@@ -13,7 +13,8 @@ public static class PerformanceBenchmarks
         const int totalBytes = 64 * 1024 * 1024;
         const int directoryFiles = 2048;
         var root = Path.GetFullPath(Path.Combine("artifacts", "benchmarks", Guid.NewGuid().ToString("N")));
-        var fixture = ServerSelfTests.CreateFixture(root);
+        using var identityKem = HybridKem.Generate();
+        var fixture = ServerSelfTests.CreateFixture(root, identityKem);
         var (store, options, device, privateKey, publicKey) = fixture;
         var export = Path.Combine(root, "share");
         var directory = Path.Combine(export, "many-files");
@@ -23,7 +24,7 @@ public static class PerformanceBenchmarks
         var payload = GC.AllocateUninitializedArray<byte>(totalBytes);
         RandomNumberGenerator.Fill(payload);
         File.WriteAllBytes(Path.Combine(export, "source.bin"), payload);
-        var expectedHash = SHA256.HashData(payload);
+        var expectedHash = SHA3_256.HashData(payload);
         var results = new List<object>();
         using var audit = new AuditLog(store, NullLogger<AuditLog>.Instance);
         using var files = new FileService(store, audit);
@@ -36,7 +37,7 @@ public static class PerformanceBenchmarks
             try
             {
                 var transport = await AuthenticatedClient.ConnectAsync(socket, "127.0.0.1", options.Port,
-                    device.Id.ToString(), privateKey, publicKey, timeout.Token);
+                    device.PublicIdentity!, privateKey, identityKem, store.ServerId, timeout.Token);
                 return (socket, new RpcClientSession(transport));
             }
             catch { socket.Dispose(); throw; }
@@ -95,7 +96,7 @@ public static class PerformanceBenchmarks
                     Operation = "Close",
                     Handle = writeHandle
                 });
-                if (!KeyAgreement.Equals(expectedHash, SHA256.HashData(File.ReadAllBytes(Path.Combine(export, "target.bin")))))
+                if (!KeyAgreement.Equals(expectedHash, SHA3_256.HashData(File.ReadAllBytes(Path.Combine(export, "target.bin")))))
                     throw new InvalidDataException("Benchmark write corruption.");
                 var readHandle = (await Call(new()
                 {
@@ -119,7 +120,7 @@ public static class PerformanceBenchmarks
                         response.Data!.CopyTo(received, offset);
                     }
                 });
-                if (!KeyAgreement.Equals(expectedHash, SHA256.HashData(received)))
+                if (!KeyAgreement.Equals(expectedHash, SHA3_256.HashData(received)))
                     throw new InvalidDataException("Benchmark read corruption.");
                 Array.Clear(received);
                 await Measure("parallel-read-64MiB-16-outstanding", totalBytes, totalBytes / Wire.MaxChunk, async () =>
@@ -138,7 +139,7 @@ public static class PerformanceBenchmarks
                             response.Data!.CopyTo(received, offset);
                         });
                 });
-                if (!KeyAgreement.Equals(expectedHash, SHA256.HashData(received)))
+                if (!KeyAgreement.Equals(expectedHash, SHA3_256.HashData(received)))
                     throw new InvalidDataException("Concurrent benchmark read corruption.");
                 await Measure("random-read-4KiB", 1000L * 4096, 1000, async () =>
                 {

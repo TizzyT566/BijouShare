@@ -1,19 +1,19 @@
 using System.Text.RegularExpressions;
+using BijouShare.Shared;
 
 namespace BijouShare.Client;
 
-public sealed record WadUri(string Host, int Port, string? InviteCode)
+public sealed record WadUri(string Host, int Port, string TrustedServerId, string? InviteCode = null)
 {
     public static WadUri Parse(string value)
     {
         if (value is null || value.Length > 2048 ||
-            !Regex.IsMatch(value, @"\Awad://(?:\[[0-9a-fA-F:.%]+\]|[^:/?#@\\\s]+):[0-9]{1,5}(?:/[A-Za-z0-9_-]{1,128}|/)?\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) ||
+            !Regex.IsMatch(value, @"\A(?i:wad)://(?:\[[0-9a-fA-F:.%]+\]|[^:/?#@\\\s]+):[0-9]{1,5}/[0-9a-f]{64}(?:#[A-Za-z0-9_-]{32})?\z", RegexOptions.CultureInvariant) ||
             !Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme != "wad" || uri.Port is < 1 or > 65535 ||
-            uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0 || uri.HostNameType == UriHostNameType.Unknown)
-            throw new ArgumentException("Use a link in the form wad://host:port or wad://host:port/invite-code.");
-        var code = uri.AbsolutePath.Trim('/');
-        ValidateInviteCode(code.Length == 0 ? null : code);
-        return new(uri.IdnHost.Trim('[', ']'), uri.Port, code.Length == 0 ? null : code);
+            uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.HostNameType == UriHostNameType.Unknown)
+            throw new ArgumentException("Use wad://host:port/full-fingerprint with an optional #invite-code.");
+        return new(uri.IdnHost.Trim('[', ']'), uri.Port, ServerIdentityNaming.ValidateId(uri.AbsolutePath[1..]),
+            uri.Fragment.Length == 0 ? null : uri.Fragment[1..]);
     }
 
     public static void ValidateInviteCode(string? value)
@@ -23,6 +23,6 @@ public sealed record WadUri(string Host, int Port, string? InviteCode)
     }
 
     // Invitations are bearer credentials; diagnostic string conversion must not expose them.
-    public override string ToString() => $"wad://{(Host.Contains(':') ? "[" + Host + "]" : Host)}:{Port}";
-    internal string ToStringWithInvite() => ToString() + (InviteCode is null ? "" : "/" + InviteCode);
+    public override string ToString() => $"wad://{(Host.Contains(':') ? "[" + Host + "]" : Host)}:{Port}/{TrustedServerId}";
+    internal string ToStringWithInvite() => ToString() + (InviteCode is null ? "" : "#" + InviteCode);
 }

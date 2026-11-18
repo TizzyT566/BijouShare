@@ -1,54 +1,61 @@
+using System.Collections.Concurrent;
 using BijouShare.Shared;
 
 namespace BijouShare.Client;
 
 public sealed class ClientDriveState
 {
-    public string? MountedPoint
-    {
-        get; set;
-    }
-    public string? Error
-    {
-        get; set;
-    }
+    private sealed record Status(bool Mounted, string? Error);
+    private readonly ConcurrentDictionary<string, Status> statuses = new(StringComparer.OrdinalIgnoreCase);
+
+    public void SetMounted(string letter) => statuses[letter] = new(true, null);
+    public void SetError(string letter, string? error) => statuses[letter] = new(false, error);
+    public void Remove(string letter) => statuses.TryRemove(letter, out _);
+    public bool IsMounted(string letter) => statuses.TryGetValue(letter, out var status) && status.Mounted;
+    public string? ErrorFor(string letter) => statuses.TryGetValue(letter, out var status) ? status.Error : null;
 }
 
-public sealed class ClientManagement(ClientSettings settings, MultiServerConnection connections,
-    ILoggerFactory loggerFactory, ClientDriveState drive)
+public sealed class ClientManagement(ClientSettings settings, DriveConnections connections, ClientDriveState drive)
 {
     private readonly SemaphoreSlim changes = new(1, 1);
 
-    public object Snapshot() => new
+    public object Snapshot()
     {
-        settings.DeviceId,
-        settings.DeviceName,
-        settings.SetupComplete,
-        settings.MountPoint,
-        settings.ManagementPort,
-        cryptoSuite = Wire.CryptoSuite,
-        cryptoProvider = HybridKem.ProviderName,
-        cryptoSupported = HybridKem.IsSupported,
-        mountedPoint = drive.MountedPoint,
-        driveError = drive.Error,
-        restartRequired = drive.MountedPoint is { } mounted && mounted != settings.MountPoint,
-        availableDriveLetters = AvailableDriveLetters(),
-        servers = settings.ServerSnapshot().Select(endpoint =>
+        var drives = settings.DriveSnapshot();
+        var primary = drives.FirstOrDefault();
+        return new
         {
-            var status = connections.StatusFor(endpoint);
-            return new
+            settings.DeviceId,
+            settings.DeviceName,
+            settings.SetupComplete,
+            mountPoint = primary,
+            drives = drives.Select(mountPoint => new
             {
-                endpoint.Host,
-                endpoint.Port,
-                endpoint.ServerName,
-                endpoint.ServerId,
-                folderName = endpoint.FolderName,
-                fingerprint = endpoint.ServerKeyFingerprint,
-                status.Connected,
-                status.Error
-            };
-        }).ToArray()
-    };
+                mountPoint,
+                mounted = drive.IsMounted(mountPoint),
+                error = drive.ErrorFor(mountPoint)
+            }).ToArray(),
+            cryptoSuite = Wire.CryptoSuite,
+            cryptoProvider = HybridKem.ProviderName,
+            cryptoSupported = HybridKem.IsSupported && System.Security.Cryptography.SHA3_256.IsSupported,
+            availableDriveLetters = AvailableDriveLetters().Except(drives).ToArray(),
+            servers = settings.ServerSnapshot().Select(endpoint =>
+            {
+                var status = connections.StatusFor(endpoint);
+                return new
+                {
+                    mountPoint = endpoint.MountPoint ?? primary,
+                    endpoint.Host,
+                    endpoint.Port,
+                    serverName = endpoint.PresentedServerName,
+                    endpoint.TrustedServerId,
+                    folderName = endpoint.FolderName,
+                    status.Connected,
+                    status.Error
+                };
+            }).ToArray()
+        };
+    }
 
     public static string[] AvailableDriveLetters()
     {
@@ -57,48 +64,82 @@ public sealed class ClientManagement(ClientSettings settings, MultiServerConnect
             .Where(letter => !occupied.Contains(letter, StringComparer.OrdinalIgnoreCase)).ToArray();
     }
 
-    public async Task AddServerAsync(WadUri link, CancellationToken token = default)
+    public Task AddServerAsync(WadUri link, CancellationToken token = default) => AddServerAsync(link, null, token);
+
+    public async Task AddServerAsync(WadUri link, string? mountPoint, CancellationToken token = default)
     {
         await changes.WaitAsync(token);
         try
         {
-            var endpoint = settings.AddServer(link.Host, link.Port, link.InviteCode);
+            var endpoint = settings.AddServer(link.Host, link.Port, link.InviteCode, mountPoint, link.TrustedServerId);
             if (settings.SetupComplete)
-                connections.Synchronize(settings, loggerFactory, reconnect: endpoint);
+            {
+                var connected = connections.StatusFor(endpoint).Connected;
+                connections.Synchronize(reconnect: connected ? null : endpoint);
+                if (connected)
+                    settings.ForServer(endpoint).ClearInviteCode(link.InviteCode);
+                connections.RequestRefresh();
+            }
         }
         finally { changes.Release(); }
+    }
+
+    public async Task RemoveServerAsync(string host, int port, string? mountPoint = null, CancellationToken token = default)
+    {
+        await changes.WaitAsync(token);
+        try
+        {
+            settings.RemoveServer(host, port, mountPoint);
+            if (settings.SetupComplete)
+                connections.Synchronize();
+        }
+        finally { changes.Release(); }
+    }
+
+    private static void RequireFreeLetter(string letter)
+    {
+        if (!AvailableDriveLetters().Contains(letter, StringComparer.OrdinalIgnoreCase))
+            throw new ArgumentException("That drive letter is already in use. Choose an available letter.");
+    }
+
+    public async Task UpdateDeviceAsync(string name, CancellationToken token = default)
+    {
+        await changes.WaitAsync(token);
+        try
+        {
+            var rename = settings.DeviceName != name;
+            settings.UpdateDevice(name);
+            connections.Synchronize(reconnectAll: rename);
+            connections.RequestRefresh();
+        }
+        finally { changes.Release(); }
+    }
+
+    public async Task ChangeDriveAsync(string mountPoint, bool remove, CancellationToken token)
+    {
+        await changes.WaitAsync(token);
+        try
+        {
+            if (!settings.SetupComplete)
+                throw new ArgumentException("Complete device setup first.");
+            var mount = ClientSettings.NormalizeMountPoint(mountPoint);
+            if (remove)
+                settings.RemoveDrive(mount);
+            else
+            {
+                RequireFreeLetter(mount);
+                settings.AddDrive(mount);
+            }
+            connections.Synchronize();
+            if (!remove)
+                connections.RequestRefresh();
+        }
+        finally { changes.Release(); }
+    }
+
+    public async Task RefreshAsync(CancellationToken token = default)
+    {
         if (settings.SetupComplete)
             await connections.RefreshAsync(token);
     }
-
-    public async Task RemoveServerAsync(string host, int port, CancellationToken token = default)
-    {
-        await changes.WaitAsync(token);
-        try
-        {
-            settings.RemoveServer(host, port);
-            connections.Synchronize(settings, loggerFactory);
-        }
-        finally { changes.Release(); }
-    }
-
-    public async Task UpdateDeviceAsync(string name, string mountPoint, CancellationToken token = default)
-    {
-        await changes.WaitAsync(token);
-        try
-        {
-            var mount = ClientSettings.NormalizeMountPoint(mountPoint);
-            if (mount != drive.MountedPoint && !AvailableDriveLetters().Contains(mount, StringComparer.OrdinalIgnoreCase))
-                throw new ArgumentException("That drive letter is already in use. Choose an available letter.");
-            var rename = settings.DeviceName != name;
-            settings.UpdateDevice(name, mount);
-            connections.Synchronize(settings, loggerFactory, reconnectAll: rename);
-        }
-        finally { changes.Release(); }
-        await connections.RefreshAsync(token);
-    }
-
-    public Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token = default) => settings.SetupComplete
-        ? connections.RefreshAsync(token)
-        : Task.FromResult<IReadOnlyList<ServerConnectionStatus>>([]);
 }

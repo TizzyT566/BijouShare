@@ -1,8 +1,8 @@
 'use strict';
 
 const $ = selector => document.querySelector(selector);
-const tabs = ['overview', 'groups', 'shares', 'permissions', 'devices', 'invites', 'activity', 'settings'];
-const entityNames = { groups: 'group', shares: 'share', rules: 'permission rule', devices: 'device', pendingDevices: 'device request', invites: 'invite' };
+const tabs = ['overview', 'groups', 'shares', 'devices', 'invites', 'activity', 'settings'];
+const entityNames = { shares: 'share', devices: 'device', pendingDevices: 'device request', invites: 'invite' };
 const permissionLabels = {
   ListDirectory: 'List folders', ReadData: 'Read files', WriteData: 'Write files',
   CreateFiles: 'Create files', CreateDirectories: 'Create folders', Delete: 'Delete',
@@ -20,9 +20,10 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 const nameOf = (list, id) => list.find(item => item.id === id)?.name ?? 'Unknown';
 const enabled = value => `<span class="pill ${value ? '' : 'off'}">${value ? 'Enabled' : 'Disabled'}</span>`;
-const empty = (title, text) => `<div class="empty"><strong>${escapeHtml(title)}</strong>${escapeHtml(text)}</div>`;
+const icon = name => `<span class="bi bi-${name}" aria-hidden="true"></span>`;
+const empty = (title, text) => `<div class="empty"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p></div>`;
 const heading = (title, text, action = '') => `<div class="page-heading"><div><h1 tabindex="-1">${title}</h1><p class="muted">${text}</p></div>${action}</div>`;
-const newButton = (label, entity, reason = '') => `<button class="primary" data-new="${entity}" ${reason ? `disabled title="${escapeHtml(reason)}"` : ''}>+ ${label}</button>`;
+const newButton = (label, entity, reason = '') => `<button class="primary" data-new="${entity}" ${reason ? `disabled title="${escapeHtml(reason)}"` : ''}>${icon('plus')} ${label}</button>`;
 const serverFolderName = () => `${state.serverName}_${state.serverId.slice(0, 16)}`;
 
 function isLoopbackAddress(host) {
@@ -34,7 +35,8 @@ function isLoopbackAddress(host) {
 }
 
 function renderServerIdentity() {
-  return `<div class="panel server-identity" aria-label="Server identity"><div class="panel-title"><h2>${escapeHtml(state.serverName)}</h2><span>SERVER IDENTITY</span></div><dl><div><dt>Server ID · name and public-key hash</dt><dd class="mono server-id">${escapeHtml(state.serverId)}</dd></div><div><dt>Folder on the client drive · first 16 ID characters</dt><dd><code class="server-folder-name">${escapeHtml(serverFolderName())}</code></dd></div></dl><p class="hint">The server name is chosen during setup in this web UI. Its full ID is SHA-256 of the server name followed by its persistent public key; the drive folder uses its first 16 characters. Restarts and administrator password changes keep it.</p></div>`;
+  return `<section class="panel server-identity"><div class="panel-title"><h2>${icon('fingerprint')}Server identity</h2><button type="button" class="quiet small-button" data-copy-fingerprint>${icon('copy')}Copy fingerprint</button></div>
+    <div class="panel-body"><dl><div><dt>Verification fingerprint</dt><dd class="mono server-id" id="server-fingerprint">${escapeHtml(state.serverId)}</dd></div><div><dt>Folder on the client drive</dt><dd><code class="server-folder-name">${escapeHtml(serverFolderName())}</code></dd></div></dl></div></section>`;
 }
 
 function connectionUri(host, code = '') {
@@ -44,21 +46,23 @@ function connectionUri(host, code = '') {
   try { parsed = new URL(`http://${authority}:${state.filePort}`); }
   catch { throw new Error('Enter a valid server LAN hostname or IP.'); }
   if (!parsed.hostname || parsed.username || parsed.password || parsed.pathname !== '/') throw new Error('Enter the server hostname or IP only.');
-  return `wad://${parsed.hostname}:${state.filePort}${code ? '/' + encodeURIComponent(code) : ''}`;
+  if (!/^[a-f0-9]{64}$/.test(state.serverId)) throw new Error('The server verification fingerprint is unavailable.');
+  return `wad://${parsed.hostname}:${state.filePort}/${state.serverId}${code ? '#' + encodeURIComponent(code) : ''}`;
 }
 
 function renderConnectionLink() {
   let uri = '';
   try { uri = connectionUri(connectionHost); } catch { /* Let the address field display a validation error. */ }
-  return `<div class="panel connection-panel"><div class="panel-title"><h2>Connect a client</h2><span>ONE SHARED DRIVE</span></div><p class="muted">Open a server link on a client with BijouShare installed. Its drive stays mounted while the device waits for approval. <a href="#invites">Create an invite</a> to approve new devices automatically.</p><label for="connection-host">Server LAN hostname or IP</label><input id="connection-host" value="${escapeHtml(connectionHost)}" maxlength="253" autocomplete="off" spellcheck="false" aria-describedby="connection-host-hint${isLoopbackAddress(connectionHost) ? ' connection-local-warning' : ''}"><p id="connection-host-hint" class="hint">Use an address reachable from the client. The file connection uses port ${state.filePort}.</p><p id="connection-local-warning" class="address-warning" role="status" ${isLoopbackAddress(connectionHost) ? '' : 'hidden'}>This address points to the client itself. Enter the server’s LAN address to share this link with another device.</p><div class="connection-actions"><a id="connection-link" class="button-link" ${uri ? `href="${escapeHtml(uri)}"` : ''}>Open BijouShare</a><button type="button" data-copy-connection>Copy link</button></div><output id="connection-uri" class="mono">${escapeHtml(uri)}</output><p id="connection-error" class="error" role="alert"></p></div>`;
+  return `<section class="panel connection-panel"><div class="panel-title"><h2>${icon('link')}Connect a client</h2></div>
+    <div class="panel-body"><p class="muted">Send the connection link through a trusted channel. New devices will appear in <a href="#devices">Devices</a> for approval.</p>
+    <label for="connection-host">Server LAN hostname or IP</label><input id="connection-host" value="${escapeHtml(connectionHost)}" maxlength="253" autocomplete="off" spellcheck="false" aria-describedby="connection-host-hint${isLoopbackAddress(connectionHost) ? ' connection-local-warning' : ''}">
+    <p id="connection-host-hint" class="hint">Use an address the client can reach on port ${state.filePort}.</p><p id="connection-local-warning" class="address-warning" role="status" ${isLoopbackAddress(connectionHost) ? '' : 'hidden'}>This address points to the client itself. Enter the server’s LAN address to connect another device.</p>
+    <output id="connection-uri" class="mono">${escapeHtml(uri)}</output><div class="connection-actions"><button type="button" data-copy-connection>${icon('copy')}Copy link</button><a id="connection-link" class="button-link quiet" ${uri ? `href="${escapeHtml(uri)}"` : ''}>Open BijouShare${icon('arrow')}</a></div><p id="connection-error" class="error" role="alert"></p></div></section>`;
 }
 
-function actions(entity, item) {
-  const name = entity === 'rules'
-    ? `${nameOf(state.groups, item.groupId)} / ${nameOf(state.shares, item.shareId)} / ${item.path || 'share root'}`
-    : item.name;
-  const remove = entity === 'devices' ? 'Block' : entity === 'shares' ? 'Remove' : 'Delete';
-  return `<div class="actions"><button class="quiet" data-edit="${entity}" data-id="${item.id}" aria-label="Edit ${entityNames[entity]} ${escapeHtml(name)}">Edit</button>${entity === 'devices' && !item.enabled ? '' : `<button class="quiet danger" data-delete="${entity}" data-id="${item.id}" aria-label="${remove} ${entityNames[entity]} ${escapeHtml(name)}">${remove}</button>`}</div>`;
+function shareActions(share) {
+  const name = escapeHtml(share.name);
+  return `<div class="actions"><button class="quiet" data-edit="shares" data-id="${share.id}" aria-label="Edit share ${name}">Edit</button><button class="quiet danger" data-delete="shares" data-id="${share.id}" aria-label="Remove share ${name}">Remove</button></div>`;
 }
 
 function table(headers, rows, title = '', message = 'Add an item to get started.') {
@@ -114,6 +118,8 @@ function showLogin() {
   viewEpoch++;
   stateLoadSequence++;
   state = null;
+  resetGroupWorkspace();
+  resetDeviceWorkspace();
   $('#content').replaceChildren();
   $('#admin-name').textContent = '';
   $('#server-name').textContent = 'Server';
@@ -213,6 +219,7 @@ async function enter() {
 
 function canRefreshDevices() {
   return state && (tab === 'devices' || tab === 'invites') && !document.hidden && !editorBusy && !$('#refresh').disabled &&
+    (tab !== 'devices' || !deviceWorkspaceEditing()) &&
     !$('#editor').open && !$('#confirmation').open && !$('#invite-result').open && !document.activeElement?.closest('#content');
 }
 setInterval(async () => {
@@ -240,6 +247,7 @@ function toast(message) {
 function setBusy(form, busy) {
   form.setAttribute('aria-busy', String(busy));
   form.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+  if (form.id === 'editor-form') $('#editor-fields').inert = busy;
 }
 
 $('#login').addEventListener('submit', async event => {
@@ -269,7 +277,24 @@ $('#refresh').addEventListener('click', async () => {
   finally { $('#refresh').disabled = false; }
 });
 $('#skip-navigation').addEventListener('click', event => { event.preventDefault(); $('#content').focus(); });
-window.addEventListener('hashchange', () => { if (state) render(); });
+const navToggle = $('#nav-toggle');
+function closeMobileNavigation() {
+  navToggle.setAttribute('aria-expanded', 'false');
+}
+navToggle.addEventListener('click', () => navToggle.setAttribute('aria-expanded', String(navToggle.getAttribute('aria-expanded') === 'false')));
+window.addEventListener('hashchange', () => {
+  if (!state) return;
+  closeMobileNavigation();
+  render();
+  $('#content h1')?.focus({preventScroll: true});
+  window.scrollTo(0, 0);
+});
+$('#rail-body nav').addEventListener('click', event => {
+  if (event.target.closest('a')?.getAttribute('aria-current') === 'page' && navToggle.getAttribute('aria-expanded') === 'true') {
+    closeMobileNavigation();
+    $('#content h1')?.focus();
+  }
+});
 
 function permissionText(mask) {
   const all = state.permissions.reduce((value, permission) => value | permission.value, 0);
@@ -280,57 +305,39 @@ function permissionText(mask) {
 }
 
 function renderOverview() {
-  const { groups, shares, rules, devices, pendingDevices } = state;
-  const statistics = [
-    ['Shared locations', shares.length, 'Files, folders, and drives'],
-    ['Pending devices', pendingDevices.filter(device => !device.rejected).length, 'Waiting for approval'],
-    ['Access groups', groups.length, `${rules.length} permission rules`],
-    ['Approved devices', devices.length, `${devices.filter(device => device.enabled).length} enabled devices`]
+  const { groups, shares, devices, pendingDevices, activity } = state;
+  const pending = pendingDevices.filter(device => !device.rejected).length;
+  const metrics = [
+    ['shares', 'folder', 'Shared locations', shares.length],
+    ['devices', 'devices', 'Approved devices', devices.length],
+    ['groups', 'users', 'Access groups', groups.length],
+    ['devices', 'clock', 'Awaiting approval', pending]
   ];
-  return heading('A place for every file.', 'Manage shared storage and the devices that can access it.', newButton('Add a share', 'shares')) +
-    renderServerIdentity() +
-    renderConnectionLink() +
-    `<div class="stats">${statistics.map(([title, count, description]) => `<div class="stat"><span>${title}</span><strong>${count}</strong><small>${description}</small></div>`).join('')}</div>` +
-    (pendingDevices.some(device => !device.rejected) ? `<div class="callout approval-notice"><div><strong>New device requests are awaiting approval.</strong>Review the devices and assign their access groups.</div><a class="button-link" href="#devices">Review requests</a></div>` : '') +
-    renderSharesTable('Shared locations') +
-    `<div class="panel"><div class="panel-title"><h2>Set up access in three steps</h2><span>DENY BY DEFAULT</span></div><div class="steps"><div><span class="step-no">01 / AUTHORIZE</span><h3>Create groups and permissions</h3><p>Choose what each group can do on a share, folder, or file. Denies always take precedence.</p></div><div><span class="step-no">02 / CONNECT</span><h3>Connect a client</h3><p>Run the client once to choose its device name and shared drive letter, then open a server link.</p></div><div><span class="step-no">03 / APPROVE</span><h3>Assign device groups</h3><p>Approve the device and select its groups, or send an invite with those groups already selected.</p></div></div></div>`;
+  const listing = shares.slice(0, 4).map(share => `<li>
+    <span class="row-icon">${icon('folder')}</span><div class="row-copy"><strong>${escapeHtml(share.name)}</strong><small class="mono">${escapeHtml(share.localPath)}</small></div>${enabled(share.enabled)}</li>`).join('');
+  const events = activity.slice(0, 3).map(event => {
+    const action = event.action.replace(/([a-z])([A-Z])/g, '$1 $2');
+    return `<li><span class="row-icon">${icon(event.result === 'OK' ? 'activity' : 'alert')}</span><div class="row-copy"><strong>${escapeHtml(action)}</strong><small>${escapeHtml(event.actor)}${event.result === 'OK' ? '' : ' · ' + escapeHtml(event.result)}</small></div><time datetime="${escapeHtml(event.time)}" title="${escapeHtml(new Date(event.time).toLocaleString())}">${escapeHtml(new Date(event.time).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}))}</time></li>`;
+  }).join('');
+  return `<section class="server-hero" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow">${icon('server')}Server overview</p><h1 id="overview-title" tabindex="-1">${escapeHtml(state.serverName)}</h1><div class="hero-meta"><span>${icon('network')}TCP <code>${state.filePort}</code></span><span class="hero-divider"></span><span>${icon('lock')}Encrypted file server</span></div>
+      <div class="hero-actions">${newButton('Add share', 'shares')}<button type="button" data-new="invites">${icon('key')}Create invite</button></div></div></section>
+    <div class="stats" aria-label="Server totals">${metrics.map(([target, symbol, label, value]) => `<a class="stat" href="#${target}"><span class="stat-label">${label}</span><strong>${value.toLocaleString()}</strong><span class="stat-symbol">${icon(symbol)}</span></a>`).join('')}</div>
+    ${pending ? `<div class="callout approval-notice">${icon('clock')}<div><strong>${pending} device ${pending === 1 ? 'request awaits' : 'requests await'} approval</strong><span>Review the identities and assign their access groups.</span></div><a class="text-link" href="#devices">Review requests${icon('arrow')}</a></div>` : ''}
+    <div class="overview-grid">
+      <section class="panel summary-panel"><div class="panel-title"><h2>${icon('folder')}Shared locations</h2><a class="text-link" href="#shares">View shares${icon('arrow')}</a></div>${listing ? `<ul class="summary-list">${listing}</ul>` : empty('No shared locations', 'Add a file, folder, or drive to start sharing.')}</section>
+      <section class="panel summary-panel"><div class="panel-title"><h2>${icon('activity')}Recent activity</h2><a class="text-link" href="#activity">View log${icon('arrow')}</a></div>${events ? `<ul class="summary-list">${events}</ul>` : empty('No recent events', 'Connections and file operations will appear here.')}</section>
+      ${renderConnectionLink()}${renderServerIdentity()}
+    </div>`;
 }
 
 function renderSharesTable(title = '') {
   return table(['Name on virtual drive', 'Server path', 'Status', ''], state.shares.map(share =>
-    `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td class="mono">${escapeHtml(share.localPath)}</td><td>${enabled(share.enabled)}</td><td>${actions('shares', share)}</td></tr>`), title, 'Add a file, folder, or drive to begin sharing.');
-}
-
-function renderGroups() {
-  return heading('Groups', 'A shared set of permissions for the devices that need them.', newButton('Add group', 'groups')) +
-    table(['Group', 'Members', 'Permission rules', ''], state.groups.map(group =>
-      `<tr><td><strong>${escapeHtml(group.name)}</strong></td><td>${state.devices.filter(device => device.groupIds.includes(group.id)).length} devices</td><td>${state.rules.filter(rule => rule.groupId === group.id).length} rules</td><td>${actions('groups', group)}</td></tr>`));
-}
-
-function renderPermissions() {
-  const missing = !state.groups.length || !state.shares.length;
-  return heading('Permissions', 'Server-enforced access for every file and folder.', newButton('Add rule', 'rules', missing ? 'Create a group and a share first.' : '')) +
-    `<div class="callout"><strong>Group grants combine. Explicit denies take precedence.</strong>Paths are relative to a share. An empty path means the share root. Inherited rules apply to all descendants.${missing ? '<br>Create a group and a share before adding a permission rule.' : ''}</div>` +
-    table(['Group / share', 'Relative path', 'Allow', 'Deny', 'Inheritance', ''], state.rules.map(rule =>
-      `<tr><td><strong>${escapeHtml(nameOf(state.groups, rule.groupId))}</strong><small>${escapeHtml(nameOf(state.shares, rule.shareId))}</small></td><td class="mono">${escapeHtml(rule.path || '/')}</td><td>${escapeHtml(permissionText(rule.allow))}</td><td>${escapeHtml(permissionText(rule.deny))}</td><td>${rule.inherit ? 'This path + descendants' : 'This path only'}</td><td>${actions('rules', rule)}</td></tr>`));
+    `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td class="mono">${escapeHtml(share.localPath)}</td><td>${enabled(share.enabled)}</td><td>${shareActions(share)}</td></tr>`), title, 'Add a file, folder, or drive to begin sharing.');
 }
 
 const formattedFingerprint = value => String(value ?? '').match(/.{1,8}/g)?.join(' ') ?? '';
-function fingerprintDetails(device) {
-  return `<details class="key-details"><summary>View fingerprints</summary><p>Client identity · SHA-256</p><code class="fingerprint">${escapeHtml(formattedFingerprint(device.fingerprint))}</code><p>Server identity for this device · SHA-256</p><code class="fingerprint">${escapeHtml(formattedFingerprint(device.serverFingerprint))}</code></details>`;
-}
-
 const deviceGroups = device => device.groupIds.map(id => `<span class="pill">${escapeHtml(nameOf(state.groups, id))}</span>`).join(' ') || '<span class="muted">No groups — no access</span>';
 const timeText = value => `<time datetime="${escapeHtml(value)}">${escapeHtml(new Date(value).toLocaleString())}</time>`;
-
-function renderDevices() {
-  return heading('Devices', 'Clients request access automatically. Approve each device and assign its groups.') +
-    `<div class="callout"><strong>New client? Open its server connection link.</strong>Use the link on the Overview page, or <a href="#invites">create an invite</a> for automatic approval into selected groups. Its device name, ID, and public key will appear below. After approval, its shares appear beneath <code>${escapeHtml(serverFolderName())}</code> on the client drive. This list refreshes automatically while idle; use Refresh to check immediately.</div>` +
-    table(['Device / ID', 'Client identity', 'First / last request', 'Status', ''], state.pendingDevices.map(device =>
-      `<tr data-pending-id="${device.id}"><td><strong>${escapeHtml(device.name)}</strong><small class="mono">${escapeHtml(device.id)}</small></td><td><code class="fingerprint">${escapeHtml(formattedFingerprint(device.fingerprint))}</code></td><td>${timeText(device.firstSeenUtc)}<small>Last: ${timeText(device.lastSeenUtc)}</small></td><td><span class="pill ${device.rejected ? 'denied' : ''}">${device.rejected ? 'Blocked' : 'Awaiting approval'}</span></td><td><div class="actions"><button class="primary" data-approve="${device.id}" aria-label="Approve ${escapeHtml(device.name)}">Approve</button>${device.rejected ? '' : `<button class="quiet danger" data-delete="pendingDevices" data-id="${device.id}" aria-label="Block ${escapeHtml(device.name)}">Block</button>`}</div></td></tr>`), 'Device requests', 'No devices are waiting. New clients appear here when they connect.') +
-    table(['Device / ID', 'Group memberships', 'Identity fingerprints', 'Status', ''], state.devices.map(device =>
-      `<tr data-device-id="${device.id}"><td><strong>${escapeHtml(device.name)}</strong><small class="mono">${escapeHtml(device.id)}</small></td><td>${deviceGroups(device)}</td><td>${fingerprintDetails(device)}</td><td><span class="pill ${device.enabled ? '' : 'off'}">${device.enabled ? 'Enabled' : 'Blocked'}</span></td><td>${actions('devices', device)}</td></tr>`), 'Approved devices', 'Approve a pending device to grant access through its groups.');
-}
 
 function inviteStatus(invite) {
   if (invite.revoked) return 'Revoked';
@@ -351,22 +358,26 @@ function renderInvites() {
 function renderActivity() {
   return heading('Activity', 'Recent connections, file changes, and administrative actions.') +
     table(['Time', 'Actor', 'Action', 'Target', 'Result'], state.activity.map(event =>
-      `<tr><td><time datetime="${escapeHtml(event.time)}">${escapeHtml(new Date(event.time).toLocaleString())}</time></td><td>${escapeHtml(event.actor)}</td><td>${escapeHtml(event.action)}</td><td class="mono">${escapeHtml(event.target)}</td><td><span class="pill ${event.result === 'OK' ? '' : 'denied'}">${escapeHtml(event.result)}</span></td></tr>`), 'Recent events', 'Events appear here as the server is used.') +
+      `<tr><td><time datetime="${escapeHtml(event.time)}">${escapeHtml(new Date(event.time).toLocaleString())}</time></td><td>${escapeHtml(event.actor)}</td><td>${escapeHtml(event.action)}</td><td class="mono">${escapeHtml(event.target)}</td><td><span class="pill ${event.result === 'OK' ? '' : 'denied'}">${escapeHtml(event.result)}</span>${event.detail ? `<small>${escapeHtml(event.detail)}</small>` : ''}</td></tr>`), 'Recent events', 'Events appear here as the server is used.') +
     '<p class="hint">The latest 200 retained audit events are shown. Complete daily audit files are stored on the server.</p>';
 }
 
 function renderSettings() {
-  return heading('Settings', 'Manage administrator access to this server.') +
-    renderServerIdentity() +
-    renderConnectionLink() +
-    `<div class="panel"><div class="panel-title"><h2>Change administrator password</h2></div><form id="password-form" class="password-form">
+  return heading('Settings', 'Manage the server name and administrator access.') +
+    `<div class="settings-grid">${renderServerIdentity()}${renderConnectionLink()}` +
+    `<div class="panel"><div class="panel-title"><h2>${icon('server')}Server name</h2></div><form id="rename-server" class="password-form">
+      <label>Display name<input name="name" required maxlength="100" pattern="[A-Za-z0-9\\-]+" spellcheck="false" value="${escapeHtml(state.serverName)}" aria-describedby="rename-hint"></label>
+      <p id="rename-hint" class="hint">Clients see the new folder name when they reconnect. Existing links and fingerprints stay valid.</p>
+      <p id="rename-error" class="error" role="alert"></p><button class="primary" type="submit">Save name</button></form></div>` +
+    `<div class="panel"><div class="panel-title"><h2>${icon('key')}Administrator password</h2></div><form id="password-form" class="password-form">
       <label>Current password<input name="currentPassword" type="password" autocomplete="current-password" required maxlength="1024"></label>
       <label>New password<input name="newPassword" type="password" autocomplete="new-password" minlength="14" maxlength="1024" required aria-describedby="password-hint"></label>
       <label>Confirm new password<input name="confirmation" type="password" autocomplete="new-password" minlength="14" maxlength="1024" required></label>
-      <span class="hint" id="password-hint">At least 14 characters. Changing it ends existing administrator sessions.</span><p id="password-error" class="error" role="alert"></p><button type="submit" class="primary">Update password</button></form></div>`;
+      <span class="hint" id="password-hint">At least 14 characters. Changing it ends existing administrator sessions.</span><p id="password-error" class="error" role="alert"></p><button type="submit" class="primary">Update password</button></form></div></div>`;
 }
 
 function render() {
+  if (location.hash === '#permissions') history.replaceState(history.state, '', '#groups');
   const requested = location.hash.slice(1) || 'overview';
   tab = tabs.includes(requested) ? requested : 'overview';
   const label = tab[0].toUpperCase() + tab.slice(1);
@@ -385,11 +396,13 @@ function render() {
   $('#server-name').title = serverFolderName();
   $('#crumb').textContent = label; document.title = `${state.serverName} · ${label} · BijouShare`;
   const renderers = {
-    overview: renderOverview, groups: renderGroups,
-    shares: () => heading('Shares', 'Files, folders, and entire drives, together under one virtual drive.', newButton('Add share', 'shares')) + renderSharesTable(),
-    permissions: renderPermissions, devices: renderDevices, invites: renderInvites, activity: renderActivity, settings: renderSettings
+    overview: renderOverview, groups: renderGroupWorkspace,
+    shares: () => heading('Shares', 'Files, folders, and entire drives, together under one virtual drive.', newButton('Add share', 'shares')) + renderSharesTable() +
+      (state.storageAccount ? `<p class="hint">Windows accesses these paths as <strong>${escapeHtml(state.storageAccount)}</strong>. This account needs NTFS write access on each folder where devices can create files or folders.</p>` : ''),
+    devices: renderDeviceWorkspace, invites: renderInvites, activity: renderActivity, settings: renderSettings
   };
   $('#content').innerHTML = renderers[tab]();
+  $('#rename-server')?.addEventListener('submit', changeServerName);
   $('#password-form')?.addEventListener('submit', changePassword);
 }
 
@@ -398,25 +411,9 @@ function field(name, label, value = '', hint = '') {
   return `<label for="${id}">${label}</label><input id="${id}" name="${name}" value="${escapeHtml(value)}" required maxlength="${name === 'localPath' || name === 'path' ? '2048' : '100'}" ${hint ? `aria-describedby="${id}-hint"` : ''}>${hint ? `<span class="hint" id="${id}-hint">${hint}</span>` : ''}`;
 }
 
-function select(name, label, items, value, prefix = 'editor') {
-  const id = `${prefix}-${name}`;
-  return `<label for="${id}">${label}</label><select id="${id}" name="${name}" required><option value="" disabled ${value ? '' : 'selected'}>Choose ${label.toLowerCase()}</option>${items.map(item => `<option value="${item.id}" ${item.id === value ? 'selected' : ''}>${escapeHtml(item.name)}${item.enabled === false ? ' (disabled)' : ''}</option>`).join('')}</select>`;
-}
-
-function groupFields(groupIds = []) {
-  return `<fieldset class="memberships"><legend>Group memberships</legend><div class="check-grid">${state.groups.map(group => `<label class="check"><input type="checkbox" name="group" value="${group.id}" ${groupIds.includes(group.id) ? 'checked' : ''}>${escapeHtml(group.name)}</label>`).join('') || '<p class="hint">Create a group and its permissions to grant access.</p>'}</div></fieldset><p class="hint">Access comes only from these groups. No groups means no file access. Matching deny rules override allows from every group.</p>`;
-}
-
-function approveDevice(id) {
-  const device = state.pendingDevices.find(item => item.id === id);
-  if (!device) return;
-  openEditor(`Approve ${device.name}`,
-    `<p class="hint">${device.rejected ? 'This removes the block and approves this device.' : 'This device will be allowed to connect on its next attempt.'}</p><div class="identity-preview"><strong>${escapeHtml(device.name)}</strong><small>Device ID: ${escapeHtml(device.id)}</small><p>Client identity · SHA-256</p><code class="fingerprint">${escapeHtml(formattedFingerprint(device.fingerprint))}</code></div>` + groupFields(),
-    async form => {
-      const values = new FormData(form);
-      await api(`/pending-devices/${id}/approve`, 'POST', { groupIds: values.getAll('group'), fingerprint: device.fingerprint });
-      return 'Device approved. It can connect on its next attempt.';
-    }, 'Approve device');
+function inviteGroupFields() {
+  const groups = state.groups.filter(group => !group.isAdministrator);
+  return `<fieldset class="memberships"><legend>Group memberships</legend><div class="check-grid">${groups.map(group => `<label class="check"><input type="checkbox" name="group" value="${group.id}">${escapeHtml(group.name)}</label>`).join('') || '<p class="hint">Create a custom group to include permissions in an invite.</p>'}</div></fieldset><p class="hint">Administrator can only be assigned directly to a device. An invite with no groups grants no file access.</p>`;
 }
 
 function openEditor(title, fields, save, buttonLabel = 'Save changes') {
@@ -431,7 +428,7 @@ function localDateTime(value) {
 }
 
 function createInvite() {
-  openEditor('Create invite', field('name', 'Invite name', '', 'A label for keeping track of this invitation.') + groupFields() +
+  openEditor('Create invite', field('name', 'Invite name', '', 'A label for keeping track of this invitation.') + inviteGroupFields() +
     `<div class="invite-limits"><fieldset><legend>Number of uses</legend><label class="check"><input type="checkbox" name="unlimitedUses">Unlimited uses</label><label for="invite-max-uses">Use limit</label><input id="invite-max-uses" name="maxUses" type="number" min="1" max="1000000" step="1" value="1" required><p class="hint">Each newly enrolled device uses one. Reconnecting an enrolled device uses none.</p></fieldset><fieldset><legend>Expiration</legend><label class="check"><input type="checkbox" name="neverExpires">Never expires</label><label for="invite-expires">Expires at</label><input id="invite-expires" name="expiresUtc" type="datetime-local" value="${localDateTime(Date.now() + 7 * 24 * 60 * 60 * 1000)}" required><p class="hint">Shown in your local time zone. The server checks expiration on enrollment.</p></fieldset></div>`,
     async form => {
       const values = new FormData(form);
@@ -525,61 +522,28 @@ $('#done-invite-result').addEventListener('click', closeInviteDetails);
 $('#invite-result').addEventListener('cancel', clearInviteDetails);
 $('#invite-result').addEventListener('close', clearInviteDetails);
 
-function edit(entity, id) {
-  if (entity === 'invites') { createInvite(); return; }
-  const existing = state[entity].find(item => item.id === id);
-  const item = existing ?? { id: crypto.randomUUID(), enabled: true, groupIds: [], allow: 0, deny: 0, inherit: true };
-  let fields = '';
-  if (entity === 'groups') fields = field('name', 'Name', item.name);
-  if (entity === 'shares') fields = field('name', 'Name on virtual drive', item.name) + field('localPath', 'Absolute server path', item.localPath, 'Examples: D:\\, D:\\Team, or D:\\Reports\\summary.pdf');
-  if (entity === 'devices') fields = `<p class="hint">${escapeHtml(item.name)} · ${escapeHtml(item.id)}</p>` + groupFields(item.groupIds);
-  if (entity === 'rules') {
-    fields = select('groupId', 'Group', state.groups, item.groupId) + select('shareId', 'Share', state.shares, item.shareId) +
-      field('path', 'Relative path', item.path, 'Leave empty for the share root. Use / between folder names.') +
-      `<div class="permission-presets" role="group" aria-label="Permission presets"><button type="button" class="quiet" data-preset="read">Read only</button><button type="button" class="quiet" data-preset="write">Read and write</button><button type="button" class="quiet" data-preset="full">Full control</button><button type="button" class="quiet" data-preset="clear">Clear</button></div><p class="hint">Presets replace the selections below. Read and write excludes delete and rename.</p><div class="permission-grid title"><span>FUNCTIONALITY</span><span>ALLOW</span><span>DENY</span></div>` +
-      state.permissions.map(permission => `<div class="permission-grid"><span>${escapeHtml(permissionLabels[permission.name] ?? permission.name)}</span><input type="checkbox" name="allow" value="${permission.value}" aria-label="Allow ${escapeHtml(permissionLabels[permission.name] ?? permission.name)}" ${(item.allow & permission.value) ? 'checked' : ''}><input type="checkbox" name="deny" value="${permission.value}" aria-label="Deny ${escapeHtml(permissionLabels[permission.name] ?? permission.name)}" ${(item.deny & permission.value) ? 'checked' : ''}></div>`).join('') +
-      `<label class="check"><input type="checkbox" name="inherit" ${item.inherit ? 'checked' : ''}>Apply to all files and folders below this path</label>`;
-  }
-  if (['shares', 'devices'].includes(entity)) fields += `<label class="check"><input type="checkbox" name="enabled" ${item.enabled ? 'checked' : ''}>Enabled</label>`;
-  openEditor(`${existing ? 'Edit' : 'Add'} ${entityNames[entity]}`, fields, async form => {
+function editShare(id) {
+  const existing = state.shares.find(share => share.id === id);
+  const share = existing ?? { id: crypto.randomUUID(), enabled: true };
+  const fields = field('name', 'Name on virtual drive', share.name) +
+    field('localPath', 'Absolute server path', share.localPath, 'Examples: D:\\, D:\\Team, or D:\\Reports\\summary.pdf') +
+    `<label class="check"><input type="checkbox" name="enabled" ${share.enabled ? 'checked' : ''}>Enabled</label>`;
+  openEditor(`${existing ? 'Edit' : 'Add'} share`, fields, async form => {
     const values = new FormData(form);
-    let value = { id: item.id };
-    if (entity === 'groups') value = { ...value, name: values.get('name').trim() };
-    if (entity === 'shares') value = { ...value, name: values.get('name').trim(), localPath: values.get('localPath').trim(), enabled: values.has('enabled') };
-    if (entity === 'devices') value = { groupIds: values.getAll('group'), enabled: values.has('enabled') };
-    if (entity === 'rules') value = {
-      ...value, groupId: values.get('groupId'), shareId: values.get('shareId'), path: values.get('path').trim(), inherit: values.has('inherit'),
-      allow: values.getAll('allow').reduce((mask, bit) => mask | Number(bit), 0), deny: values.getAll('deny').reduce((mask, bit) => mask | Number(bit), 0)
-    };
-    if ('name' in value && !value.name) throw new Error('Enter a name with at least one non-space character.');
-    await api(`/${entity}/${item.id}`, 'PUT', value);
+    const name = values.get('name').trim();
+    if (!name) throw new Error('Enter a name with at least one non-space character.');
+    await api(`/shares/${share.id}`, 'PUT', { id: share.id, name, localPath: values.get('localPath').trim(), enabled: values.has('enabled') });
     return 'Changes saved.';
   });
-  if (entity === 'rules') $('#editor-fields input[name=path]').required = false;
 }
-
-function applyPreset(preset) {
-  const read = ['ListDirectory', 'ReadData', 'ReadAttributes', 'ReadPermissions'];
-  const selected = preset === 'full' ? state.permissions.map(permission => permission.name)
-    : preset === 'write' ? [...read, 'WriteData', 'CreateFiles', 'CreateDirectories', 'WriteAttributes'] : preset === 'read' ? read : [];
-  const mask = state.permissions.filter(permission => selected.includes(permission.name)).reduce((value, permission) => value | permission.value, 0);
-  $('#editor-form').querySelectorAll('input[name=allow]').forEach(input => { input.checked = (mask & Number(input.value)) !== 0; });
-  $('#editor-form').querySelectorAll('input[name=deny]').forEach(input => { input.checked = false; });
-}
-$('#editor-form').addEventListener('change', event => {
-  const input = event.target;
-  if (!input.matches('input[name=allow], input[name=deny]') || !input.checked) return;
-  $(`#editor-form input[name=${input.name === 'allow' ? 'deny' : 'allow'}][value="${input.value}"]`).checked = false;
-});
 
 function confirmDeletion(entity, id) {
   const item = state[entity].find(value => value.id === id);
-  const name = item.name ?? `${nameOf(state.groups, item.groupId)} / ${nameOf(state.shares, item.shareId)} / ${item.path || '/'}`;
+  if (!item) return;
+  const name = item.name;
   let title = `Delete ${entityNames[entity]}?`, detail = '', button = 'Delete';
-  if (entity === 'groups') detail = `This removes the group from ${state.devices.filter(device => device.groupIds.includes(id)).length} device(s) and deletes ${state.rules.filter(rule => rule.groupId === id).length} permission rule(s). Their effective access may change.`;
   if (entity === 'shares') { title = 'Remove share?'; button = 'Remove share'; detail = `Clients will lose this shared location and ${state.rules.filter(rule => rule.shareId === id).length} permission rule(s) will be removed. The server’s files remain in place.`; }
-  if (entity === 'rules') detail = 'Removing this rule changes effective access for its group. Removing a deny can grant access through other matching rules.';
-  if (entity === 'devices') { title = 'Block device?'; button = 'Block device'; detail = 'This device loses access immediately. Its identity and groups are retained. Enable it in Edit to allow it to reconnect without reenrollment.'; }
+  if (entity === 'devices') { title = 'Block device?'; button = 'Block device'; detail = 'This device loses access immediately. Its identity and groups are retained. Expand its name and select Enabled to allow it to reconnect.'; }
   if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'This device stays blocked when it retries. It will receive no file access unless you explicitly approve it later.'; }
   if (entity === 'invites') { title = 'Revoke invite?'; button = 'Revoke invite'; detail = 'This code will no longer enroll devices. Devices already enrolled keep their current groups and permissions.'; }
   $('#confirmation-title').textContent = title; $('#confirmation-name').textContent = name;
@@ -610,12 +574,11 @@ $('#confirmation').addEventListener('close', () => { pendingDeletion = null; });
 document.addEventListener('click', event => {
   const button = event.target.closest('button');
   if (!button || button.disabled || !state) return;
-  if (button.dataset.new) edit(button.dataset.new);
-  else if (button.dataset.edit) edit(button.dataset.edit, button.dataset.id);
+  if (button.dataset.new === 'invites') createInvite();
+  else if (button.dataset.new === 'shares' || button.dataset.edit === 'shares') editShare(button.dataset.id);
   else if (button.dataset.delete) confirmDeletion(button.dataset.delete, button.dataset.id);
-  else if (button.dataset.approve) approveDevice(button.dataset.approve);
-  else if (button.dataset.preset) applyPreset(button.dataset.preset);
   else if (button.hasAttribute('data-copy-connection')) copyField('#connection-uri', 'Server link');
+  else if (button.hasAttribute('data-copy-fingerprint')) copyField('#server-fingerprint', 'Server fingerprint');
   else if (button.hasAttribute('data-copy-invite-code')) copyField('#invite-code', 'Invite code');
   else if (button.hasAttribute('data-copy-invite-link')) copyField('#invite-uri', 'Invite link');
 });
@@ -634,9 +597,25 @@ $('#editor-form').addEventListener('submit', async event => {
   finally { editorBusy = false; setBusy(form, false); if (savedResult?.invite && state) showCreatedInvite(savedResult.invite); }
 });
 function closeEditor() { if (!editorBusy) $('#editor').close(); }
+$('#editor').addEventListener('cancel', event => { if (editorBusy) event.preventDefault(); });
 $('#close-editor').addEventListener('click', closeEditor);
 $('#cancel-editor').addEventListener('click', closeEditor);
 $('#editor').addEventListener('cancel', event => { if (editorBusy) event.preventDefault(); });
+
+async function changeServerName(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const name = form.elements.name.value;
+  const error = $('#rename-error');
+  error.textContent = '';
+  setBusy(form, true);
+  try {
+    await api('/server/name', 'POST', {name});
+    await reload();
+    toast('Server name updated.');
+  } catch (exception) { error.textContent = exception.message; }
+  finally { setBusy(form, false); }
+}
 
 async function changePassword(event) {
   event.preventDefault();

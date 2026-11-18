@@ -15,7 +15,7 @@ public interface IRemoteConnection
 
 public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConnection> logger) : IRemoteConnection, IDisposable
 {
-    private sealed record Connection(TcpClient Socket, RpcClientSession Session, long Generation) : IDisposable
+    private sealed record Connection(TcpClient Socket, RpcClientSession Session, string ServerId, long Generation) : IDisposable
     {
         public void Dispose()
         {
@@ -24,7 +24,7 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
         }
     }
     private readonly SemaphoreSlim connectGate = new(1, 1);
-    private readonly CancellationTokenSource lifetime = new();
+    private readonly CancellationTokenSource lifetime = CancellationTokenSource.CreateLinkedTokenSource(settings.VerificationToken);
     private Connection? connection;
     private long generation;
     private int disposed;
@@ -33,7 +33,10 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
     public RemoteReply Call(RpcRequest request, long? expectedGeneration = null) =>
         CallAsync(request, expectedGeneration).GetAwaiter().GetResult();
 
-    public async Task<RemoteReply> CallAsync(RpcRequest request, long? expectedGeneration = null, CancellationToken token = default)
+    public Task<RemoteReply> CallAsync(RpcRequest request, long? expectedGeneration = null, CancellationToken token = default) =>
+        CallForIdentityAsync(request, expectedGeneration, null, token);
+
+    internal async Task<RemoteReply> CallForIdentityAsync(RpcRequest request, long? expectedGeneration, string? routeIdentity, CancellationToken token)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
@@ -42,13 +45,20 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
         try
         {
             active = await GetConnectionAsync(expectedGeneration, timeout.Token);
+            if (!settings.IsVerificationCurrent || routeIdentity is not null && routeIdentity != active.ServerId)
+                throw new RemoteException("InvalidHandle");
             var response = await active.Session.CallAsync(request, timeout.Token);
             return new(response, active.Generation);
         }
         catch (RemoteException) { throw; }
         catch (ServerIdentityMismatchException) { throw; }
         catch (PlatformNotSupportedException) { throw new RemoteException("HybridUnavailable"); }
-        catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && active?.Session.IsClosed != true)
+        catch (CryptographicException ex) when (active is null)
+        {
+            logger.LogWarning("Authentication failed for {Host}:{Port}: {Reason}", settings.Host, settings.Port, ex.Message);
+            throw;
+        }
+        catch (OperationCanceledException) when (!lifetime.IsCancellationRequested && settings.IsVerificationCurrent && active?.Session.IsClosed != true)
         {
             // The bounded session can cancel a queued request before it sends anything.
             // Its unrelated in-flight operations must keep their authenticated connection.
@@ -94,31 +104,30 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
 
     private async Task<Connection> ConnectAsync(CancellationToken token)
     {
-        if (!settings.IsConfigured)
-            throw new InvalidOperationException("Configure the LAN server address with --server first.");
-        var privateKey = PrivateStorage.Unprotect(settings.ProtectedPrivateKey);
+        if (settings.TrustedServerId is not { } expectedId)
+            throw new RemoteException("ServerLinkRequired");
+        var privateKey = UserSecrets.Unprotect(settings.ProtectedPrivateKey);
         try
         {
-            var pinned = string.IsNullOrEmpty(settings.ServerPublicKey) ? null : Convert.FromBase64String(settings.ServerPublicKey);
-            var globalPin = settings.ServerIdentityPublicKey is { } identityKey ? Convert.FromBase64String(identityKey) : null;
+            using var identityKem = settings.OpenIdentityKem();
             var inviteCode = settings.GetInviteCode();
             var socket = new TcpClient();
             try
             {
                 var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, settings.Host, settings.Port, settings.DeviceId,
-                    settings.DeviceName, privateKey, pinned, token, globalPin, inviteCode);
+                    settings.DeviceName, privateKey, identityKem, token, expectedId, inviteCode);
                 try
                 {
-                    if (settings.TrustApprovedServer(transport.RemoteIdentityPublicKey ?? throw new CryptographicException("Missing server identity."), transport.RemoteServerId, transport.RemoteServerName, transport.RemoteServerIdentityPublicKey))
-                        logger.LogInformation("Pinned approved server identity {Fingerprint}", KeyAgreement.Fingerprint(settings.ServerPublicKey));
+                    settings.RememberServerIdentity(transport.RemoteServerId, transport.RemoteServerName,
+                        transport.RemoteServerIdentityPublicKey, transport.RemoteServerMlKemPublicKey);
                     settings.ClearInviteCode(inviteCode);
                 }
                 catch { transport.Dispose(); throw; }
                 var session = new RpcClientSession(transport);
                 DeviceName = session.DeviceName ?? throw new InvalidDataException("Server did not identify this device.");
-                logger.LogInformation("Authenticated device {Device}; key establishment P-256 + ML-KEM-768 ({Provider}); transfer mode {Mode}",
-                    DeviceName, HybridKem.ProviderName, session.BinaryPayloads ? "pipelined AES-GCM binary" : "AES-GCM JSON");
-                return new(socket, session, ++generation);
+                logger.LogInformation("Authenticated device {Device} and server {Server} using P-256 ECDH and ML-KEM-768 ({Provider}). Transfer mode {Mode}",
+                    DeviceName, transport.RemoteServerName, HybridKem.ProviderName, session.BinaryPayloads ? "pipelined AES-GCM binary" : "AES-GCM JSON");
+                return new(socket, session, transport.RemoteServerId!, ++generation);
             }
             catch { socket.Dispose(); throw; }
         }
@@ -141,6 +150,10 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
         {
             Interlocked.Exchange(ref connection, null)?.Dispose();
         }
-        finally { connectGate.Release(); }
+        finally
+        {
+            connectGate.Release();
+            lifetime.Dispose();
+        }
     }
 }

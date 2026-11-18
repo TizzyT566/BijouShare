@@ -42,7 +42,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
     {
         RemoteException r => r.Code switch
         {
-            "AccessDenied" or "DeviceBlocked" or "DeviceRejected" or "PendingApproval" => NtStatus.AccessDenied,
+            "AccessDenied" => NtStatus.AccessDenied,
             "NotFound" => NtStatus.ObjectNameNotFound,
             "Exists" => NtStatus.ObjectNameCollision,
             "SharingViolation" => NtStatus.SharingViolation,
@@ -75,6 +75,12 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
         }
         catch (Exception ex) { logger.LogDebug(ex, "Filesystem callback failed"); return Status(ex); }
     }
+    // Dokany retries STATUS_ACCESS_DENIED on DELETE opens by opening the parent, without
+    // retaining the parent callback's context for cleanup. BijouShare authorizes the child
+    // on the server. STATUS_CANNOT_DELETE preserves Win32 ERROR_ACCESS_DENIED and ends the open.
+    private static NtStatus OpenDenied(DokanAccess access) =>
+        AccessMask.Deletes((uint)access) ? NtStatus.CannotDelete : NtStatus.AccessDenied;
+
     public NtStatus CreateFile(string fileName, DokanAccess access, FileShare share, FileMode mode,
         FileOptions options, FileAttributes attributes, IDokanFileInfo info)
     {
@@ -82,6 +88,9 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
         {
             if ((options & FileOptions.Encrypted) != 0)
                 return unchecked((NtStatus)0xC00000BB);
+            using var requestor = info.GetRequestor();
+            if (requestor?.User is not { } sid || !UserDriveSecurity.Owner.Equals(sid))
+                return OpenDenied(access);
             var reply = Send(new()
             {
                 Operation = "Open",
@@ -91,6 +100,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                 Mode = mode,
                 Attributes = attributes,
                 Directory = info.IsDirectory,
+                DeleteOnClose = (options & FileOptions.DeleteOnClose) != 0 || info.DeletePending,
                 WriteThrough = (options & FileOptions.WriteThrough) != 0
             }, useHandle: false);
             info.IsDirectory = (reply.Response.Entry ?? throw new InvalidDataException("Missing open-file metadata.")).IsDirectory;
@@ -98,7 +108,12 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             return reply.Response.Existed && mode is FileMode.Create or FileMode.OpenOrCreate
                 ? DokanResult.AlreadyExists : NtStatus.Success;
         }
-        catch (Exception ex) { return Status(ex); }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Open failed for {Path}", fileName);
+            var status = Status(ex);
+            return status == NtStatus.AccessDenied ? OpenDenied(access) : status;
+        }
     }
     public void Cleanup(string fileName, IDokanFileInfo info)
     {
@@ -328,7 +343,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             if (info.IsDirectory)
             {
                 if (p.HasFlag(Permission.ListDirectory))
-                    rights |= FileSystemRights.ListDirectory;
+                    rights |= FileSystemRights.ListDirectory | FileSystemRights.Traverse;
                 if (p.HasFlag(Permission.CreateFiles))
                     rights |= FileSystemRights.CreateFiles;
                 if (p.HasFlag(Permission.CreateDirectories))
@@ -337,7 +352,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             else
             {
                 if (p.HasFlag(Permission.ReadData))
-                    rights |= FileSystemRights.ReadData;
+                    rights |= FileSystemRights.ReadData | FileSystemRights.ExecuteFile;
                 if (p.HasFlag(Permission.WriteData))
                     rights |= FileSystemRights.WriteData | FileSystemRights.AppendData;
             }
@@ -349,11 +364,11 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                 rights |= FileSystemRights.WriteAttributes | FileSystemRights.WriteExtendedAttributes;
             if (p.HasFlag(Permission.ReadPermissions))
                 rights |= FileSystemRights.ReadPermissions;
-            var owner = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var owner = UserDriveSecurity.Owner;
             result.SetOwner(owner);
             result.SetGroup(owner);
             result.SetAccessRuleProtection(true, false);
-            result.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), rights, AccessControlType.Allow));
+            result.AddAccessRule(new FileSystemAccessRule(owner, rights, AccessControlType.Allow));
         });
         security = result;
         return status;

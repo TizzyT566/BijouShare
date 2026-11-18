@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using BijouShare.Shared;
 
 namespace BijouShare.Server;
@@ -14,20 +15,57 @@ public sealed class ServerOptions
 
 public sealed record AppGroup(Guid Id, string Name);
 public sealed record ExportShare(Guid Id, string Name, string LocalPath, bool Enabled);
+public sealed record AccessScope(string Path, Permission Allow, Permission Deny, bool Inherit);
 public sealed record AccessRule(Guid Id, Guid GroupId, Guid ShareId, string Path,
-    Permission Allow, Permission Deny, bool Inherit);
+    Permission Allow, Permission Deny, bool Inherit)
+{
+    public AccessScope[] AdditionalScopes { get; init; } = [];
+
+    internal IEnumerable<AccessScope> Scopes()
+    {
+        yield return new(Path, Allow, Deny, Inherit);
+        foreach (var scope in AdditionalScopes)
+            yield return scope;
+    }
+
+    internal (Permission Allow, Permission Deny) MatchingPermissions(string relative)
+    {
+        static bool Matches(string relative, string path, bool inherit) => inherit
+            ? StateStore.AtOrBelow(relative, path)
+            : relative.Equals(path, StringComparison.OrdinalIgnoreCase);
+        var matches = Matches(relative, Path, Inherit);
+        var allow = matches ? Allow : Permission.None;
+        var deny = matches ? Deny : Permission.None;
+        foreach (var scope in AdditionalScopes)
+        {
+            if (!Matches(relative, scope.Path, scope.Inherit))
+                continue;
+            allow |= scope.Allow;
+            deny |= scope.Deny;
+        }
+        return (allow, deny);
+    }
+}
 public sealed record Device(Guid Id, string Name, Guid[] GroupIds, string ClientPublicKey,
-    byte[] ProtectedServerPrivateKey, string ServerPublicKey, bool Enabled);
+    bool Enabled, string PublicIdentity, string ClientMlKemPublicKey)
+{
+    public bool HasSameIdentity(Device authenticated) =>
+        Id == authenticated.Id &&
+        PublicIdentity == authenticated.PublicIdentity && ClientPublicKey == authenticated.ClientPublicKey &&
+        ClientMlKemPublicKey == authenticated.ClientMlKemPublicKey;
+}
 public sealed record PendingDevice(Guid Id, string Name, string ClientPublicKey, DateTime FirstSeenUtc, DateTime LastSeenUtc,
-    bool Rejected = false);
-public sealed record AdminCredential(string Name, byte[] Salt, byte[] Hash);
+    bool Rejected, string PublicIdentity, string ClientMlKemPublicKey);
+public sealed record AdminCredential(string Name, byte[] Salt, byte[] Hash, string Algorithm = "PBKDF2-HMAC-SHA3-256");
 public sealed class ServerState
 {
-    public int SchemaVersion { get; set; } = 3;
+    public int SchemaVersion { get; set; } = 6;
     public string ServerId { get; set; } = "";
     public string ServerName { get; set; } = "";
     public string ServerPublicKey { get; set; } = "";
     public byte[] ProtectedServerPrivateKey { get; set; } = [];
+    public string ServerMlKemPublicKey { get; set; } = "";
+    public byte[] ProtectedServerMlKemSeed { get; set; } = [];
     public AdminCredential? Admin
     {
         get; set;
@@ -42,6 +80,8 @@ public sealed class ServerState
 
 public sealed partial class StateStore
 {
+    public static readonly Guid AdministratorGroupId = new("7a336850-eff3-4a22-9bc8-a3972474f10c");
+    public const string AdministratorGroupName = "Administrator";
     private readonly ReaderWriterLockSlim gate = new(LockRecursionPolicy.SupportsRecursion);
     private long revision;
     public long Revision => Interlocked.Read(ref revision);
@@ -50,6 +90,7 @@ public sealed partial class StateStore
     public string ServerId => Read(s => s.ServerId);
     public string ServerName => Read(s => s.ServerName);
     public string ServerPublicKey => Read(s => s.ServerPublicKey);
+    public string ServerMlKemPublicKey => Read(s => s.ServerMlKemPublicKey);
     public bool IsInitialized => Read(s => s.Admin is not null);
     public string ServerFolderName => Read(s => ServerIdentityNaming.FolderName(s.ServerName, s.ServerId));
     public string DataDirectory
@@ -65,6 +106,15 @@ public sealed partial class StateStore
         path = System.IO.Path.Combine(DataDirectory, "state.json");
         state = File.Exists(path) ? LoadState(File.ReadAllBytes(path)) : CreateState();
         Validate(state, validatePrivateKeys: true);
+    }
+    private static ServerState LoadState(byte[] bytes)
+    {
+        using var document = JsonDocument.Parse(bytes);
+        if (document.RootElement.ValueKind != JsonValueKind.Object ||
+            !document.RootElement.TryGetProperty("schemaVersion", out var version) ||
+            version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number != 6)
+            throw new InvalidDataException("Unsupported server state format. Configure a new data directory for BijouShare v6.");
+        return Wire.Decode<ServerState>(bytes);
     }
     public T Read<T>(Func<ServerState, T> read)
     {
@@ -99,15 +149,12 @@ public sealed partial class StateStore
         if (password is null || password.Length is < 14 or > 1024)
             throw new ArgumentException("Use an administrator password of 14 to 1024 characters.");
         var salt = RandomNumberGenerator.GetBytes(32);
-        var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 600_000, HashAlgorithmName.SHA256, 32);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 600_000, HashAlgorithmName.SHA3_256, 32);
         Update(s =>
         {
             s.Admin = new(name, salt, hash);
             if (serverName is not null)
-            {
                 s.ServerName = serverName;
-                s.ServerId = ServerIdentityNaming.Id(serverName, Convert.FromBase64String(s.ServerPublicKey));
-            }
             return true;
         });
     }
@@ -119,12 +166,17 @@ public sealed partial class StateStore
         var admin = Read(s => s.Admin);
         if (admin is null)
             return null;
-        var hash = Rfc2898DeriveBytes.Pbkdf2(password, admin.Salt, 600_000, HashAlgorithmName.SHA256, 32);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(password, admin.Salt, 600_000, HashAlgorithmName.SHA3_256, 32);
         try
         {
             return KeyAgreement.Equals(admin.Hash, hash) && string.Equals(admin.Name, name, StringComparison.Ordinal) ? admin : null;
         }
         finally { CryptographicOperations.ZeroMemory(hash); }
+    }
+    public void RenameServer(string name)
+    {
+        ValidateServerName(name);
+        Update(s => s.ServerName = name);
     }
     public bool VerifyAdmin(string? name, string? password) => AuthenticateAdmin(name, password) is not null;
     public void ChangeAdminPassword(string name, string currentPassword, string newPassword)
@@ -133,7 +185,7 @@ public sealed partial class StateStore
         if (newPassword is null || newPassword.Length is < 14 or > 1024)
             throw new ArgumentException("Use an administrator password of 14 to 1024 characters.");
         var salt = RandomNumberGenerator.GetBytes(32);
-        var hash = Rfc2898DeriveBytes.Pbkdf2(newPassword, salt, 600_000, HashAlgorithmName.SHA256, 32);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(newPassword, salt, 600_000, HashAlgorithmName.SHA3_256, 32);
         Update(s =>
         {
             if (s.Admin is null || !KeyAgreement.Equals(verified.Hash, s.Admin.Hash) || s.Admin.Name != verified.Name)
@@ -143,10 +195,14 @@ public sealed partial class StateStore
         });
     }
     public Device? FindRegisteredDevice(Guid deviceId) => Read(s => s.Devices.SingleOrDefault(x => x.Id == deviceId));
+    public Device? FindRegisteredDevice(string fullIdentity) => Read(s => s.Devices.SingleOrDefault(x =>
+        x.PublicIdentity == fullIdentity));
+    public PendingDevice? FindPendingDevice(string fullIdentity) => Read(s => s.PendingDevices.SingleOrDefault(x =>
+        x.PublicIdentity == fullIdentity));
     public Device Identity(Guid deviceId) => Read(s => s.Devices.SingleOrDefault(x => x.Id == deviceId && x.Enabled)
         ?? throw new UnauthorizedAccessException());
 
-    // Call only after proving possession of the client's private key for this identity.
+    // Call only after proving possession of both client identity keys.
     public Device UpdateAuthenticatedDeviceName(Device authenticated, string name)
     {
         ValidateName(name);
@@ -154,7 +210,7 @@ public sealed partial class StateStore
         try
         {
             var current = Identity(authenticated.Id);
-            if (current.ClientPublicKey != authenticated.ClientPublicKey || current.ServerPublicKey != authenticated.ServerPublicKey)
+            if (!current.HasSameIdentity(authenticated))
                 throw new UnauthorizedAccessException();
             if (current.Name == name)
                 return current;
@@ -218,32 +274,32 @@ public sealed partial class StateStore
     }
     public Permission Permissions(Device device, Guid shareId, string relative) => Read(s =>
     {
-        var allow = Permission.None;
+        if (!device.Enabled || !s.Shares.Any(share => share.Id == shareId && share.Enabled))
+            return Permission.None;
+        var allow = device.GroupIds.Contains(AdministratorGroupId) ? Permission.FullControl : Permission.None;
         var deny = Permission.None;
         foreach (var rule in s.Rules.Where(x => x.ShareId == shareId && device.GroupIds.Contains(x.GroupId)))
         {
-            if (rule.Path.Equals(relative, StringComparison.OrdinalIgnoreCase) || rule.Inherit && AtOrBelow(relative, rule.Path))
-            {
-                allow |= rule.Allow;
-                deny |= rule.Deny;
-            }
+            var matched = rule.MatchingPermissions(relative);
+            allow |= matched.Allow;
+            deny |= matched.Deny;
         }
         return allow & ~deny;
     });
     public PendingDevice? FindPendingDevice(Guid deviceId) => Read(s => s.PendingDevices.SingleOrDefault(x => x.Id == deviceId));
 
-    // The network caller proves possession of the supplied static private key before calling this method.
+    // The handshake proves possession of both supplied identity private keys before this call.
     public bool QueueRegistration(EnrollmentRequest request)
     {
-        var (id, key) = ValidateRegistration(request);
+        var binding = ValidateRegistration(request);
         gate.EnterWriteLock();
         try
         {
-            EnsureIdentityAvailable(state, id, key);
-            if (state.Devices.Any(device => device.Id == id))
+            EnsureIdentityAvailable(state, binding);
+            if (state.Devices.Any(device => device.PublicIdentity == binding.Digest))
                 return true;
-            var pending = state.PendingDevices.SingleOrDefault(device => device.Id == id);
-            if (pending?.Rejected == true)
+            var pending = state.PendingDevices.SingleOrDefault(device => device.ClientPublicKey == binding.Ecdh);
+            if (pending is { Rejected: true })
                 throw new UnauthorizedAccessException("Device registration was rejected by an administrator.");
             var now = DateTime.UtcNow;
             if (pending is not null && pending.Name == request.DeviceName && now - pending.LastSeenUtc < TimeSpan.FromMinutes(5))
@@ -252,14 +308,10 @@ public sealed partial class StateStore
                 throw new UnauthorizedAccessException("The device approval queue is full.");
             Update(s =>
             {
-                if (pending is null)
-                    s.PendingDevices.Add(new(id, request.DeviceName, key, now, now));
-                else
-                    s.PendingDevices[s.PendingDevices.FindIndex(device => device.Id == id)] = pending with
-                    {
-                        Name = request.DeviceName,
-                        LastSeenUtc = now
-                    };
+                var record = new PendingDevice(binding.Id, request.DeviceName, binding.Ecdh, pending?.FirstSeenUtc ?? now,
+                    now, false, binding.Digest, binding.Kem);
+                s.PendingDevices.RemoveAll(device => device.ClientPublicKey == binding.Ecdh);
+                s.PendingDevices.Add(record);
                 return true;
             });
             return false;
@@ -271,14 +323,11 @@ public sealed partial class StateStore
     {
         var pending = s.PendingDevices.SingleOrDefault(device => device.Id == id)
             ?? throw new ArgumentException("No pending device request exists for this ID.");
-        if (!string.Equals(KeyAgreement.Fingerprint(pending.ClientPublicKey), expectedFingerprint, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(pending.PublicIdentity, expectedFingerprint, StringComparison.Ordinal))
             throw new ArgumentException("The pending device identity changed. Refresh and verify its fingerprint again.");
         ValidateGroups(s, groupIds);
-        EnsureIdentityAvailable(s, id, pending.ClientPublicKey);
-        var device = CreateDevice(id, pending.Name, pending.ClientPublicKey, groupIds);
-        s.PendingDevices.Remove(pending);
-        s.Devices.Add(device);
-        return device;
+        var binding = new DeviceBinding(id, pending.PublicIdentity, pending.ClientPublicKey, pending.ClientMlKemPublicKey);
+        return CompleteEnrollment(s, binding, pending.Name, groupIds);
     });
 
     public void RejectDevice(Guid id) => Update(s =>
@@ -296,45 +345,63 @@ public sealed partial class StateStore
     // Fixture construction only; production approval consumes a request through ApproveDevice.
     internal Device Enroll(EnrollmentRequest request, Guid[] groupIds) => Update(s =>
     {
-        var (id, key) = ValidateRegistration(request);
+        var binding = ValidateRegistration(request);
         ValidateGroups(s, groupIds);
-        EnsureIdentityAvailable(s, id, key);
-        if (s.Devices.Any(device => device.Id == id) || s.PendingDevices.Any(device => device.Id == id))
+        EnsureIdentityAvailable(s, binding);
+        if (s.Devices.Any(device => device.Id == binding.Id) || s.PendingDevices.Any(device => device.Id == binding.Id))
             throw new ArgumentException("Device identity already exists.");
-        var device = CreateDevice(id, request.DeviceName, key, groupIds);
-        s.Devices.Add(device);
-        return device;
+        return CompleteEnrollment(s, binding, request.DeviceName, groupIds);
     });
 
-    private static Device CreateDevice(Guid id, string name, string canonicalPublicKey, Guid[] groupIds)
+    private sealed record DeviceBinding(Guid Id, string Digest, string Ecdh, string Kem);
+    private const int ClientKemBase64Length = (HybridKem.PublicKeySize + 2) / 3 * 4;
+
+    private static Device CompleteEnrollment(ServerState state, DeviceBinding binding, string name, Guid[] groups)
     {
-        using var server = KeyAgreement.NewKey();
-        var privateKey = server.ExportPkcs8PrivateKey();
-        try
-        {
-            return new Device(id, name, groupIds.ToArray(), canonicalPublicKey,
-                PrivateStorage.Protect(privateKey), Convert.ToBase64String(server.ExportSubjectPublicKeyInfo()), true);
-        }
-        finally { CryptographicOperations.ZeroMemory(privateKey); }
+        EnsureIdentityAvailable(state, binding);
+        var device = new Device(binding.Id, name, groups.ToArray(), binding.Ecdh, true, binding.Digest, binding.Kem);
+        state.PendingDevices.RemoveAll(d => d.ClientPublicKey == binding.Ecdh);
+        state.Devices.Add(device);
+        return device;
     }
 
-    private static (Guid Id, string Key) ValidateRegistration(EnrollmentRequest request)
+    private static DeviceBinding ValidateRegistration(EnrollmentRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
-        if (!Guid.TryParse(request.DeviceId, out var id) || id == Guid.Empty)
-            throw new ArgumentException("Invalid device ID.");
         ValidateName(request.DeviceName);
-        if (string.IsNullOrEmpty(request.ClientPublicKey) || request.ClientPublicKey.Length > 512)
-            throw new ArgumentException("Invalid client public key.");
-        using var client = KeyAgreement.ImportPublic(Convert.FromBase64String(request.ClientPublicKey));
-        return (id, Convert.ToBase64String(client.ExportSubjectPublicKeyInfo()));
+        if (request.ClientPublicKey is not { Length: > 0 and <= 256 } || request.ClientMlKemPublicKey is not { Length: ClientKemBase64Length })
+            throw new ArgumentException("Both client public keys are required.");
+        var ecdh = Convert.FromBase64String(request.ClientPublicKey);
+        var kem = Convert.FromBase64String(request.ClientMlKemPublicKey);
+        var digest = DeviceIdentity.Id(ecdh, kem);
+        if (request.DeviceId != digest || Convert.ToBase64String(ecdh) != request.ClientPublicKey ||
+            Convert.ToBase64String(kem) != request.ClientMlKemPublicKey)
+            throw new ArgumentException("The device ID must match its canonical ECDH and ML-KEM public keys.");
+        return new(Guid.ParseExact(digest[..32], "N"), digest, request.ClientPublicKey, request.ClientMlKemPublicKey);
     }
 
-    private static void EnsureIdentityAvailable(ServerState s, Guid id, string key)
+    private static void EnsureIdentityAvailable(ServerState s, DeviceBinding binding)
     {
-        if (s.Devices.Any(device => device.Id == id && device.ClientPublicKey != key || device.Id != id && device.ClientPublicKey == key) ||
-            s.PendingDevices.Any(device => device.Id == id && device.ClientPublicKey != key || device.Id != id && device.ClientPublicKey == key))
-            throw new ArgumentException("The device ID or public key is already bound to another identity.");
+        bool Conflict(Guid id, string ecdh, string kem, string digest)
+        {
+            if (id != binding.Id && ecdh != binding.Ecdh && kem != binding.Kem)
+                return false;
+            return id != binding.Id || digest != binding.Digest || ecdh != binding.Ecdh || kem != binding.Kem;
+        }
+        if (s.Devices.Any(d => Conflict(d.Id, d.ClientPublicKey, d.ClientMlKemPublicKey, d.PublicIdentity)) ||
+            s.PendingDevices.Any(d => Conflict(d.Id, d.ClientPublicKey, d.ClientMlKemPublicKey, d.PublicIdentity)))
+            throw new ArgumentException("A device ID or public key is already bound to another identity.");
+    }
+
+    private static void ValidateStoredBinding(Guid id, string ecdh, string? kem, string? digest)
+    {
+        if (ecdh is not { Length: > 0 and <= 256 } || kem is not { Length: ClientKemBase64Length } || digest is not { Length: 64 })
+            throw new ArgumentException("Incomplete client identity.");
+        var raw = Convert.FromBase64String(kem);
+        var ec = Convert.FromBase64String(ecdh);
+        if (Convert.ToBase64String(ec) != ecdh || Convert.ToBase64String(raw) != kem || digest != DeviceIdentity.Id(ec, raw) ||
+            Guid.ParseExact(digest[..32], "N") != id)
+            throw new ArgumentException("Stored device ID does not match its client public keys.");
     }
 
     private static void ValidateGroups(ServerState s, Guid[] groupIds)
@@ -363,33 +430,53 @@ public sealed partial class StateStore
         var privateKey = identity.ExportPkcs8PrivateKey();
         try
         {
-            return new()
+            var created = new ServerState
             {
-                ServerId = ServerIdentityNaming.Id(name, publicKey),
+                Groups = [new(AdministratorGroupId, AdministratorGroupName)],
                 ServerName = name,
                 ServerPublicKey = Convert.ToBase64String(publicKey),
                 ProtectedServerPrivateKey = PrivateStorage.Protect(privateKey)
             };
+            AddServerKem(created);
+            return created;
         }
         finally { CryptographicOperations.ZeroMemory(privateKey); }
     }
+
+    private static string ComputeServerId(ServerState state) => ServerIdentityNaming.Id(
+        Convert.FromBase64String(state.ServerPublicKey), Convert.FromBase64String(state.ServerMlKemPublicKey));
+
+    private static void AddServerKem(ServerState state)
+    {
+        using var kem = HybridKem.Generate();
+        var seed = kem.ExportPrivateSeed();
+        try
+        {
+            state.ServerMlKemPublicKey = Convert.ToBase64String(kem.ExportPublicKey());
+            state.ProtectedServerMlKemSeed = PrivateStorage.Protect(seed);
+            state.ServerId = ComputeServerId(state);
+        }
+        finally { CryptographicOperations.ZeroMemory(seed); }
+    }
     private static void Validate(ServerState s, bool validatePrivateKeys = false)
     {
-        if (s.SchemaVersion != 3 || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
+        if (s.SchemaVersion != 6 || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
             s.Groups.Any(x => x is null) || s.Shares.Any(x => x is null) ||
             s.Rules.Any(x => x is null) || s.Devices.Any(x => x is null) || s.PendingDevices.Any(x => x is null) ||
             s.PendingDevices.Count > 4096 || s.PendingDevices.Count(device => !device.Rejected) > 256)
             throw new ArgumentException("State collections cannot be null or contain null entries.");
         ValidateInvites(s);
         ValidateServerName(s.ServerName);
-        if (string.IsNullOrEmpty(s.ServerPublicKey) || s.ProtectedServerPrivateKey is not { Length: > 0 and <= 4096 })
+        if (string.IsNullOrEmpty(s.ServerPublicKey) || s.ProtectedServerPrivateKey is not { Length: > 0 and <= 4096 } ||
+            string.IsNullOrEmpty(s.ServerMlKemPublicKey) || s.ProtectedServerMlKemSeed is not { Length: > 0 and <= 4096 })
             throw new ArgumentException("Missing server identity key material.");
         using (var publicKey = KeyAgreement.ImportPublic(Convert.FromBase64String(s.ServerPublicKey)))
         {
             var canonical = publicKey.ExportSubjectPublicKeyInfo();
-            if (s.ServerPublicKey != Convert.ToBase64String(canonical) ||
-                s.ServerId != ServerIdentityNaming.Id(s.ServerName, canonical))
-                throw new ArgumentException("The server ID must be the lowercase SHA-256 hash of its UTF-8 name followed by its canonical public key.");
+            var kemPublic = Convert.FromBase64String(s.ServerMlKemPublicKey);
+            if (s.ServerPublicKey != Convert.ToBase64String(canonical) || s.ServerMlKemPublicKey != Convert.ToBase64String(kemPublic) ||
+                s.ServerId != ServerIdentityNaming.Id(canonical, kemPublic))
+                throw new ArgumentException("The server ID must match its ECDH and ML-KEM public keys.");
             if (validatePrivateKeys)
             {
                 var privateKey = PrivateStorage.Unprotect(s.ProtectedServerPrivateKey);
@@ -400,6 +487,14 @@ public sealed partial class StateStore
                         throw new ArgumentException("The server private key does not match its public identity.");
                 }
                 finally { CryptographicOperations.ZeroMemory(privateKey); }
+                var kemSeed = PrivateStorage.Unprotect(s.ProtectedServerMlKemSeed);
+                try
+                {
+                    using var kem = HybridKem.ImportPrivateSeed(kemSeed);
+                    if (!KeyAgreement.Equals(kem.ExportPublicKey(), kemPublic))
+                        throw new ArgumentException("The server ML-KEM private seed does not match its public key.");
+                }
+                finally { CryptographicOperations.ZeroMemory(kemSeed); }
             }
         }
         static void Unique<T>(IEnumerable<T> values, string what, IEqualityComparer<T>? comparer = null)
@@ -414,14 +509,19 @@ public sealed partial class StateStore
         Unique(s.Groups.Select(x => x.Id), "group ID");
         Unique(s.Shares.Select(x => x.Id), "share ID");
         Unique(s.Rules.Select(x => x.Id), "rule ID");
+        Unique(s.Rules.Select(x => (x.GroupId, x.ShareId)), "group/share permission assignment; edit the existing assignment to add a path");
         Unique(s.Devices.Select(x => x.Id).Concat(s.PendingDevices.Select(x => x.Id)), "device ID");
         Unique(s.Groups.Select(x => x.Name), "group name", StringComparer.OrdinalIgnoreCase);
+        if (!s.Groups.Any(group => group.Id == AdministratorGroupId && group.Name == AdministratorGroupName))
+            throw new ArgumentException("The built-in Administrator group cannot be removed or renamed.");
         Unique(s.Shares.Select(x => x.Name), "share name", StringComparer.OrdinalIgnoreCase);
-        Unique(s.Devices.Select(x => x.ClientPublicKey).Concat(s.PendingDevices.Select(x => x.ClientPublicKey)), "device public key", StringComparer.Ordinal);
+        Unique(s.Devices.Select(x => x.ClientPublicKey).Concat(s.PendingDevices.Select(x => x.ClientPublicKey)), "device ECDH key", StringComparer.Ordinal);
+        Unique(s.Devices.Select(x => x.ClientMlKemPublicKey).Concat(s.PendingDevices.Select(x => x.ClientMlKemPublicKey)), "device ML-KEM key", StringComparer.Ordinal);
         if (s.Admin is { } admin)
         {
             ValidateName(admin.Name);
-            if (admin.Salt is not { Length: 32 } || admin.Hash is not { Length: 32 })
+            if (admin.Salt is not { Length: 32 } || admin.Hash is not { Length: 32 } ||
+                admin.Algorithm != "PBKDF2-HMAC-SHA3-256")
                 throw new ArgumentException("Invalid administrator credential.");
         }
         foreach (var group in s.Groups)
@@ -437,46 +537,37 @@ public sealed partial class StateStore
         }
         foreach (var rule in s.Rules)
         {
-            if (rule.Id == Guid.Empty || rule.Path != NormalizeRelative(rule.Path) ||
-                s.Groups.All(x => x.Id != rule.GroupId) || s.Shares.All(x => x.Id != rule.ShareId) ||
-                ((rule.Allow | rule.Deny) & ~Permission.FullControl) != 0)
+            if (rule.GroupId == AdministratorGroupId)
+                throw new ArgumentException("Administrator already has automatic full control on every share.");
+            if (rule.Id == Guid.Empty || rule.AdditionalScopes is null ||
+                s.Groups.All(x => x.Id != rule.GroupId) || s.Shares.All(x => x.Id != rule.ShareId))
                 throw new ArgumentException("Invalid group permission rule.");
+            var inherited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var exact = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var scope in rule.Scopes())
+            {
+                if (scope is null || scope.Path != NormalizeRelative(scope.Path) ||
+                    ((scope.Allow | scope.Deny) & ~Permission.FullControl) != 0 || (scope.Allow & scope.Deny) != 0)
+                    throw new ArgumentException("Invalid permission path or conflicting allow and deny flags.");
+                if (!(scope.Inherit ? inherited : exact).Add(scope.Path))
+                    throw new ArgumentException("A permission path with the same inheritance already exists in this assignment.");
+            }
         }
         foreach (var device in s.Devices)
         {
             ValidateName(device.Name);
+            ValidateStoredBinding(device.Id, device.ClientPublicKey, device.ClientMlKemPublicKey, device.PublicIdentity);
             if (device.Id == Guid.Empty)
                 throw new ArgumentException("Missing device ID.");
             ValidateGroups(s, device.GroupIds);
-            if (device.ProtectedServerPrivateKey is not { Length: > 0 and <= 4096 } ||
-                string.IsNullOrEmpty(device.ClientPublicKey) || string.IsNullOrEmpty(device.ServerPublicKey))
-                throw new ArgumentException("Missing device key material.");
-            using var client = KeyAgreement.ImportPublic(Convert.FromBase64String(device.ClientPublicKey));
-            using var server = KeyAgreement.ImportPublic(Convert.FromBase64String(device.ServerPublicKey));
-            if (device.ClientPublicKey != Convert.ToBase64String(client.ExportSubjectPublicKeyInfo()) ||
-                device.ServerPublicKey != Convert.ToBase64String(server.ExportSubjectPublicKeyInfo()))
-                throw new ArgumentException("Device public keys must use canonical encoding.");
-            if (validatePrivateKeys)
-            {
-                var privateKey = PrivateStorage.Unprotect(device.ProtectedServerPrivateKey);
-                try
-                {
-                    using var key = KeyAgreement.ImportPrivate(privateKey);
-                    if (!KeyAgreement.Equals(key.ExportSubjectPublicKeyInfo(), server.ExportSubjectPublicKeyInfo()))
-                        throw new ArgumentException("An enrolled server private key does not match its public key.");
-                }
-                finally { CryptographicOperations.ZeroMemory(privateKey); }
-            }
         }
         foreach (var pending in s.PendingDevices)
         {
             ValidateName(pending.Name);
+            ValidateStoredBinding(pending.Id, pending.ClientPublicKey, pending.ClientMlKemPublicKey, pending.PublicIdentity);
             if (pending.Id == Guid.Empty || pending.FirstSeenUtc.Kind != DateTimeKind.Utc || pending.LastSeenUtc.Kind != DateTimeKind.Utc ||
                 pending.LastSeenUtc < pending.FirstSeenUtc || string.IsNullOrEmpty(pending.ClientPublicKey))
                 throw new ArgumentException("Invalid pending device request.");
-            using var client = KeyAgreement.ImportPublic(Convert.FromBase64String(pending.ClientPublicKey));
-            if (pending.ClientPublicKey != Convert.ToBase64String(client.ExportSubjectPublicKeyInfo()))
-                throw new ArgumentException("Pending device public keys must use canonical encoding.");
         }
     }
 }

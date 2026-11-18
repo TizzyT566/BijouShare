@@ -1,0 +1,77 @@
+:root {
+  color-scheme: dark;
+  --ui-bg: #111112;
+  --ui-rail: #171718;
+  --ui-panel: #1c1c1e;
+  --ui-line: #39393b;
+  --ui-text: #f4f4f4;
+  --ui-muted: #adadaf;
+  --ui-font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --ui-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-family: var(--ui-font);
+  color: var(--ui-text);
+  background: var(--ui-bg);
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+::selection { background: #d5d5d5; color: #171717; }
+.brand-mark {
+  display: inline-block;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  background: url("/bijou-mark.svg") center / contain no-repeat;
+}
+
+/* A single local image serves the rail and inline action glyphs in both consoles. */
+.bi {
+  display: inline-block;
+  flex: none;
+  width: 1.15em;
+  height: 1.15em;
+  vertical-align: -0.17em;
+  background-color: currentColor;
+  mask-image: url("/console-icons.svg");
+  mask-repeat: no-repeat;
+  mask-size: 600% 500%;
+  mask-position: var(--bi-x, 0%) var(--bi-y, 0%);
+}
+.bi-home        { --bi-x:   0%; --bi-y:   0%; }
+.bi-drives      { --bi-x:  20%; --bi-y:   0%; }
+.bi-folder      { --bi-x:  40%; --bi-y:   0%; }
+.bi-shield      { --bi-x:  60%; --bi-y:   0%; }
+.bi-users       { --bi-x:  80%; --bi-y:   0%; }
+.bi-devices     { --bi-x: 100%; --bi-y:   0%; }
+.bi-key         { --bi-x:   0%; --bi-y:  25%; }
+.bi-activity    { --bi-x:  20%; --bi-y:  25%; }
+.bi-settings    { --bi-x:  40%; --bi-y:  25%; }
+.bi-refresh     { --bi-x:  60%; --bi-y:  25%; }
+.bi-logout      { --bi-x:  80%; --bi-y:  25%; }
+.bi-server      { --bi-x: 100%; --bi-y:  25%; }
+.bi-plus        { --bi-x:   0%; --bi-y:  50%; }
+.bi-link        { --bi-x:  20%; --bi-y:  50%; }
+.bi-check       { --bi-x:  40%; --bi-y:  50%; }
+.bi-chevron     { --bi-x:  60%; --bi-y:  50%; }
+.bi-copy        { --bi-x:  80%; --bi-y:  50%; }
+.bi-user        { --bi-x: 100%; --bi-y:  50%; }
+.bi-lock        { --bi-x:   0%; --bi-y:  75%; }
+.bi-arrow       { --bi-x:  20%; --bi-y:  75%; }
+.bi-monitor     { --bi-x:  40%; --bi-y:  75%; }
+.bi-clock       { --bi-x:  60%; --bi-y:  75%; }
+.bi-network     { --bi-x:  80%; --bi-y:  75%; }
+.bi-alert       { --bi-x: 100%; --bi-y:  75%; }
+.bi-terminal    { --bi-x:   0%; --bi-y: 100%; }
+.bi-fingerprint { --bi-x:  20%; --bi-y: 100%; }
+.bi-layers      { --bi-x:  40%; --bi-y: 100%; }
+
+@media (forced-colors: active) {
+  .bi { forced-color-adjust: none; color: CanvasText; }
+  .brand-mark { background-color: #161616; forced-color-adjust: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,4 +1,10 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using DokanNet;
+using Microsoft.Extensions.Logging.Abstractions;
 using BijouShare.Shared;
 
 namespace BijouShare.Client;
@@ -8,9 +14,59 @@ internal static class MultiServerSelfTests
     public static async Task RunAsync(Action<bool, string> check)
     {
         await RoutingAndHandles(check);
+        await ServerPermissions(check);
         await FailureIsolation(check);
         await AuthenticatedNames(check);
         await OfflineRecovery(check);
+        await ResumeDuringHandshake(check);
+    }
+
+    private static async Task ServerPermissions(Action<bool, string> check)
+    {
+        var remote = new FakeConnection(71) { Granted = Permission.ReadAttributes | Permission.WriteData };
+        var id = new string('a', 64);
+        using var router = new MultiServerConnection(new (string, IRemoteConnection, Func<string?>, Func<string?>)[]
+            { ("Server", remote, () => "Server", () => id) });
+        await router.RefreshAsync(CancellationToken.None);
+        var opened = router.Call(new() { Operation = "Open", Path = "/Server/Share/file", Access = AccessMask.WriteData });
+        check(opened.Response.Entry!.Permissions == remote.Granted &&
+            router.Call(new() { Operation = "Security", Path = "/Server/Share/file" }).Response.Permissions == remote.Granted,
+            "The client preserves permissions assigned by server groups on the first authenticated session");
+        router.Call(new() { Operation = "Write", Handle = opened.Response.Handle, Data = [1], Path = "/Server/Share/file" }, opened.Generation);
+        check(remote.Calls.Last().Request.Operation == "Write", "An authenticated write is forwarded to the server for authorization");
+        var directory = router.Call(new() { Operation = "Open", Path = "/Server", Access = AccessMask.GenericRead });
+        id = new string('c', 64);
+        Expect("InvalidHandle", () => router.Call(new() { Operation = "List", Handle = directory.Response.Handle, Path = "/Server" },
+            directory.Generation), check, "A directory handle cannot switch to a different identity under the same displayed name");
+    }
+
+    private static async Task ResumeDuringHandshake(Action<bool, string> check)
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var settings = ClientSettings.Create("Wake test");
+        settings.AddDrive("N:");
+        var endpoint = settings.AddServer("127.0.0.1", ((IPEndPoint)listener.LocalEndpoint).Port, null, trustedServerId: new string('a', 64));
+        using var router = new MultiServerConnection(settings, NullLoggerFactory.Instance);
+        router.RequestRefresh();
+        using var first = await listener.AcceptTcpClientAsync(deadline.Token);
+        var oldHello = await SecureTransport.ReadPlainAsync<ClientHello>(first.GetStream(), deadline.Token);
+        var recovery = router.RecoverAfterResumeAsync(deadline.Token);
+        using var second = await listener.AcceptTcpClientAsync(deadline.Token);
+        var newHello = await SecureTransport.ReadPlainAsync<ClientHello>(second.GetStream(), deadline.Token);
+        await recovery;
+        check(oldHello.DeviceId == newHello.DeviceId && oldHello.ClientPublicKey == newHello.ClientPublicKey &&
+            !oldHello.Nonce.SequenceEqual(newHello.Nonce) && endpoint.FolderName is null &&
+            router.MountedServerFolders.Length == 0,
+            "After resume, a stalled handshake is replaced promptly using the saved device identity without exposing an unverified folder");
+        endpoint.InvalidateSessions();
+        var fresh = router.RefreshAsync(deadline.Token);
+        using var third = await listener.AcceptTcpClientAsync(deadline.Token);
+        var refreshedHello = await SecureTransport.ReadPlainAsync<ClientHello>(third.GetStream(), deadline.Token);
+        await fresh;
+        check(refreshedHello.DeviceId == oldHello.DeviceId && !refreshedHello.Nonce.SequenceEqual(newHello.Nonce),
+            "Invalidating a saved endpoint refreshes its stale connection on the next probe");
     }
 
     private static async Task AuthenticatedNames(Action<bool, string> check)
@@ -117,7 +173,7 @@ internal static class MultiServerSelfTests
             Access = AccessMask.GenericRead
         }).Response;
         check(root is { Name: "", IsDirectory: true } && folder is { Name: "Office", IsDirectory: true } &&
-            openedFolder.Handle == Guid.Empty && openedFolder.Entry is { Name: "Office", IsDirectory: true } &&
+            openedFolder.Handle != Guid.Empty && openedFolder.Entry is { Name: "Office", IsDirectory: true } &&
             office.Calls.IsEmpty && home.Calls.IsEmpty,
             "Server folder metadata and read-only opens are synthetic and preserve the configured alias");
 
@@ -411,6 +467,14 @@ internal static class MultiServerSelfTests
         var probed = new FakeConnection(93);
         using var single = new MultiServerConnection(new (string, IRemoteConnection)[] { ("Probed", probed) });
         await single.RefreshAsync(CancellationToken.None);
+        var open = single.Call(new() { Operation = "Open", Path = "/Probed/Team/file", Access = AccessMask.GenericWrite });
+        probed.Failure = "Timeout";
+        await single.RecoverAfterResumeAsync(CancellationToken.None);
+        probed.Failure = null;
+        var write = single.Call(new() { Operation = "Write", Handle = open.Response.Handle, Path = "/Probed/Team/file", Data = [42] }, open.Generation);
+        check(single.Statuses.Single().Connected && write.Response.Length == 1,
+            "An unsent wake probe on a busy session preserves the connected folder and existing writer");
+        single.Call(new() { Operation = "Close", Handle = open.Response.Handle, Path = "/Probed/Team/file" }, open.Generation);
         probed.DelayedOperation = "Space";
         probed.ReadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         probed.ReleaseRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -439,6 +503,7 @@ internal static class MultiServerSelfTests
 
     private sealed class FakeConnection(byte marker) : IRemoteConnection, IDisposable
     {
+        public Permission Granted { get; init; } = Permission.FullControl;
         // Deliberately collide across independent server sessions.
         public Guid RemoteHandle { get; } = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         public long Generation { get; set; } = 17;
@@ -497,6 +562,7 @@ internal static class MultiServerSelfTests
                 "Read" => new RpcResponse { Data = [marker] },
                 "List" => new RpcResponse { Entries = [Entry("Team", true)] },
                 "Stat" => new RpcResponse { Entry = Entry("file", false) },
+                "Security" => new RpcResponse { Permissions = Granted },
                 "Space" => new RpcResponse { FreeBytes = FreeBytes, TotalBytes = TotalBytes },
                 "Write" => new RpcResponse { Length = request.DataCount },
                 _ => new RpcResponse()
@@ -523,8 +589,8 @@ internal static class MultiServerSelfTests
         }
 
         public void Dispose() => Disposed = true;
-        private static RemoteEntry Entry(string name, bool directory) => new(name,
+        private RemoteEntry Entry(string name, bool directory) => new(name,
             directory ? FileAttributes.Directory : FileAttributes.Normal, directory ? 0 : 1,
-            DateTime.UnixEpoch, DateTime.UnixEpoch, DateTime.UnixEpoch, Permission.FullControl);
+            DateTime.UnixEpoch, DateTime.UnixEpoch, DateTime.UnixEpoch, Granted);
     }
 }

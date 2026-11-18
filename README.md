@@ -5,40 +5,31 @@ A C#/.NET 10 Windows solution containing exactly **two executable projects**:
 | Project | Role |
 | --- | --- |
 | `BijouShare.Server` | Windows service, encrypted LAN file server, device approval, groups/shares/rules, and an ASP.NET Core administration UI. |
-| `BijouShare.Client` | Windows service that registers its persistent device identity automatically and mounts all configured servers under one Dokany drive, with a root folder for each server. |
+| `BijouShare.Client` | Windows session launcher and per-user client. Each Windows account has its own device identity, server connections and Dokany drive letters. |
 
-`Shared/` contains linked source compiled into both projects. It is not another project. Both services can also run in a console for setup and troubleshooting. Version 0.4 replaces enrollment-file exchange and application users with automatic device requests, administrator approval, and device group memberships. It retains the optimized binary/AES-GCM transport and whole-drive visibility fix.
+`Shared/` contains the protocol and storage helpers compiled into both projects. Both services can also run interactively for setup and troubleshooting.
 
-Version 0.5 names server folders using `ServerName_<first16hex>`, where the full ID is SHA-256 of the UTF-8 server name followed by its canonical SPKI public-key bytes. The full public key remains the client's pinned authentication anchor; the shortened suffix is for display. Server names allow only ASCII letters, digits, and hyphens.
+Server folders use `ServerName_<first16hex>`. The client checks the server’s public keys against the full 64-character fingerprint in its connection link. Renaming the server changes the folder prefix on reconnect and keeps its fingerprint and links valid. The folder suffix is a display abbreviation. Server names allow ASCII letters, digits and hyphens.
 
-## Prerequisites and build
+## Install on Windows
 
-- Windows x64 and the .NET 10 SDK or newer for building.
-- Windows CNG with native ML-KEM support on **both** machines. The runtime checks `MLKem.IsSupported`; unsupported systems report the requirement and cannot fall back to ECDH alone. No external native DLL or managed ML-KEM implementation is bundled. See [Microsoft's native PQC support documentation](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/libraries#post-quantum-cryptography-pqc).
-- PowerShell 7.3 or newer for the helper scripts, including service installation.
-- [Dokany 2.3.x](https://github.com/dokan-dev/dokany/releases) installed on **client machines**. The project uses [DokanNet 2.3.0.3](https://www.nuget.org/packages/DokanNet). The server accesses its own local files directly; it does not require the Dokany driver.
-- A free client drive letter, such as `N:`.
+Run **BijouShare.Server-2.0.11-win-x64-Setup.exe** on the computer hosting the shares and **BijouShare.Client-2.0.11-win-x64-Setup.exe** on each client. Both installers request administrator elevation, start the installed service immediately and configure it to start at Windows boot. You can install both on the same computer.
 
-```powershell
-dotnet restore BijouShare.slnx
-dotnet build BijouShare.slnx -c Release
-.\scripts\Publish.ps1
-```
+After an interactive installation or upgrade, click **BijouShare Server** or **BijouShare Client** in the Windows notification area to open its web UI. The icon may be under **Show hidden icons**. If setup asks for a restart, use the icon after signing in again.
 
-The publish script creates self-contained Windows x64 distributions under `artifacts\bijoushare\publish\Server` and `artifacts\bijoushare\publish\Client`, along with a build manifest, this guide, and a standalone installer script. Keep each entire service directory together, including server `wwwroot` and configuration files. Use `--help` on either executable to inspect setup commands without creating state or connecting to the server.
+The client requires the 64-bit Dokany runtime and matching driver, version 2.3 or later in the 2.x series. If either is missing or incompatible, client setup opens the [Dokany project page](https://github.com/dokan-dev/dokany) and waits. Install Dokany and choose **Retry** in BijouShare Setup. **Cancel** exits before installing BijouShare. The server uses the native Windows filesystem directly.
 
-## 1. Initialize and start the server
+Both applications require a Windows version with native CNG support for ML-KEM-768 and SHA3-256. [Microsoft’s native PQC support documentation](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/libraries#post-quantum-cryptography-pqc).
 
-Run the server from elevated PowerShell with no setup arguments:
+## 1. Set up the server
 
-```powershell
-cd artifacts\bijoushare\publish\Server
-.\BijouShare.Server.exe
-```
+Task Manager shows one `BijouShare.Server.exe` under **LOCAL SERVICE**. It hosts the shares and web UI even when everyone signs out. Each signed-in Windows session can also run one `BijouShare.Server.Tray.exe` under that user's account. Choosing **Exit** from the tray menu closes that session's icon and leaves the service running.
 
-On first run, the browser opens [the local server UI](http://127.0.0.1:5080). Its setup wizard requires a server name, administrator name, password of at least 14 characters, and password confirmation. Every field starts empty; no default values or credentials are supplied. Server names must contain 1–100 ASCII letters, digits, or hyphens. Setup is restricted to this computer and can initialize the server only once. The encrypted file listener becomes available after setup succeeds. Sign in to administer the server afterward.
+Interactive setup asks Explorer to show the server icon and checks that it appeared. If the icon is missing, open **Start > BijouShare > BijouShare Server**. Opening the shortcut again reuses the existing tray helper. The icon also starts at future sign-ins.
 
-`--init-admin` opens the same web setup/sign-in flow; it does not reset an existing administrator. Change an existing administrator password through Settings after signing in. Existing configured servers keep their identity, credentials, groups, and permissions and display the normal sign-in page. Windows services expose the same web UI without launching a browser; `--no-browser` also suppresses browser launch for diagnostics.
+Click **BijouShare Server** in the Windows notification area to open [the local server UI](http://127.0.0.1:5080) in your default browser. The icon may be under **Show hidden icons**. The setup wizard requires a server name, administrator name, password of at least 14 characters, and password confirmation. Every field starts empty; no default values or credentials are supplied. Server names must contain 1–100 ASCII letters, digits, or hyphens. Setup is restricted to this computer and can initialize the server only once. The encrypted file listener becomes available after setup succeeds. Sign in to administer the server afterward.
+
+`--init-admin` starts the same tray and setup flow. On an initialized server, the icon opens the administrator sign-in page. Change the administrator password in **Settings** after signing in. Pass `--no-browser` to either application for headless diagnostics.
 
 Open [the administration UI](http://127.0.0.1:5080) **on the server**. Create groups, shares, and group permission rules. A share can point to a file (`D:\Reports\summary.pdf`), a folder (`D:\Team`), or a drive (`D:\`). Shares appear inside that server's client folder, for example `N:\DarkArchives_838cff90d76c4ed0\Team`. The administrator login controls this UI; there are no application-user accounts for file access.
 
@@ -57,69 +48,85 @@ For remote web administration, configure an HTTPS Kestrel endpoint with a truste
 
 ## 2. Set up and manage a client
 
-On each client, run elevated:
+The installed service starts a client worker and tray icon for each signed-in Windows user. Each icon opens that account’s private management page.
 
-```powershell
-.\BijouShare.Client.exe
-```
+Click **BijouShare Client** in the Windows notification area to open your account’s private management page. Each click uses the current session’s management address and credentials. You can close the browser and keep using your drives. First-run setup asks only for a device name. You can leave the client with no drives. Select **Add drive** in the sidebar and choose a letter when you want a drive to appear in File Explorer. Configured drives stay mounted when their servers are offline.
 
-The client opens its management UI at [http://127.0.0.1:5081](http://127.0.0.1:5081). First-run setup asks for the device name and one unused shared drive letter. After saving, the drive mounts immediately and stays mounted while the client runs, including when it contains no servers or all servers are pending/offline. Existing configurations are reused automatically. No setup arguments are required.
+Use **Connect a server** on the drive tab and paste a connection or invite link from the administrator. Connections are added without remounting the drive. Without an invitation, an unknown device appears on the server under **Devices → Awaiting approval**; an administrator approves it and selects groups. Once authenticated, its server folder appears in the shared drive. Removing the last server leaves an empty mounted drive.
 
-Use **Add server** in the client UI to enter a hostname/port, paste a connection link, or supply an invitation. Connections are added without remounting the drive. Without an invitation, an unknown device appears on the server under **Devices → Awaiting approval**; an administrator approves it and selects groups. Once authenticated, its server folder appears in the shared drive. Removing the last server leaves an empty mounted drive.
+Select a drive's sidebar tab before adding a server. Each tab shows that drive’s server folders, approval status and server fingerprints. Renaming a device preserves both of its identity keys and its device ID. Each account manages its own connections through its client tray icon.
 
-The client UI shows connection/approval status, server identity fingerprints, and each mounted folder. Device name changes reconnect servers with the saved identity; groups and keys stay intact. Drive-letter changes are saved for the next client restart and the UI shows when a restart is needed. Names may contain spaces and must be 1-100 characters without surrounding whitespace or control characters. Management is restricted to this computer, with loopback/Host/Origin checks and CSRF protection. Local applications share this machine-wide device identity.
+After sleep or a network change, the client checks its saved servers again. A healthy session can keep its open files. When a session or the Dokany mount has been lost, wait for the server folder to return and reopen the file. If a write was interrupted, check the destination before retrying it. BijouShare cannot know whether the server completed a write whose acknowledgement was lost.
 
 ### Connection links and invitations
 
-Interactive startup registers `wad://` links for the current Windows user. The service installer also registers the handler for the machine. Webpages can link to either form:
+Interactive startup registers `wad://` links for the current Windows user. The service installer also registers the handler for the machine. Links copied from the server web UI include the required fingerprint in the path and an optional invite code after `#`. Deliver the entire link through a trusted channel because it establishes which server the client will trust. The following links illustrate the format.
 
 ```powershell
-wad://192.168.1.10:7443
-wad://192.168.1.10:7443/INVITE_CODE
+wad://192.168.1.10:7443/<64-hex-server-fingerprint>
+wad://192.168.1.10:7443/<64-hex-server-fingerprint>#<invite-code>
 ```
 
-Links forward to the running client through a local activation channel; they do not start a second drive instance. If setup is unfinished, the link waits for the web setup to finish. Use bracketed IPv6 addresses, for example `wad://[::1]:7443`. Re-register an installed handler with `BijouShare.Client.exe --register-protocol` if the executable is moved.
+Windows passes the full URI to a short-lived protocol handler, so Windows process-creation auditing can record the original invite. The handler starts the client with an empty command line if needed and delivers the link through a private named pipe restricted to this Windows account. It exits after the client acknowledges the saved link. Opening a link to an already connected server preserves open files. If there are no drives, queued links survive a client restart and connect when you explicitly add your first drive. Use bracketed IPv6 addresses, for example `wad://[::1]:7443/<64-hex-server-fingerprint>`. Re-register an installed handler with `BijouShare.Client.exe --register-protocol` if the executable is moved.
 
 The server's **Invites** page creates multiple independent codes with selected groups, a use limit or **Unlimited**, and an expiration or **Never**. The code and shareable link are shown once; store them when creating the invite. The server stores only the code hash. A valid invite automatically approves a device after private-key proof and assigns precisely those groups. Enrollment and use consumption are atomic; reconnecting an already approved device does not consume a use or change its groups. Expired, exhausted, and revoked codes cannot approve new devices. Invitations cannot override an administrator's rejection or device block. Revoking an invite prevents new enrollments; devices already enrolled retain their assigned groups until edited or blocked.
 
-Invite codes are bearer credentials and travel only inside the mutually authenticated AES-GCM connection. Pending client codes are DPAPI-protected on disk and cleared after successful authentication. The client UI never returns private keys or invite credentials in its state API.
+Invite codes are bearer credentials sent inside the AES-GCM connection. Pending client codes use current-user DPAPI on disk and are cleared after successful authentication.
 
-Use `--data-dir <absolute-directory>` for custom state. Reusing that state reuses the identity. The first approved connection pins the server's complete public identity key automatically; subsequent connections require that same key and proof of its private-key possession. This first-contact trust assumes the configured LAN endpoint is the intended server. The UI and client expose fingerprints if independent verification is needed. An existing pin is never silently replaced; `--reset-server-trust` is an explicit recovery action for an intentional server identity replacement.
+Before enrollment, the client hashes the server’s two public keys, compares the result with the fingerprint in the link, and checks proof of possession of the corresponding private keys. A mismatch stops the connection before the client submits its proof or sends an invite. The client checks the same fingerprint on subsequent connections.
 
-Rejected requests remain **Blocked** until explicitly approved. Blocking an already-approved device retains its identity and server key, so enabling it again requires no enrollment exchange. Changes to device groups apply to existing file sessions. The virtual drive is machine-wide when run as a service: local applications share that device's group permissions. Individual interactive Windows accounts are not file-access principals.
+Once approved, the device can read and write according to its server group permissions. A connection link without an invite queues a new device for administrator approval. A valid invite grants the preconfigured groups.
 
-### Multiple servers, one drive
+Rejected requests remain **Blocked** until explicitly approved. Blocking an already-approved device retains its identity and server key, so enabling it again requires no enrollment exchange. Changes to device groups apply to existing file sessions. The server approves each Windows user’s client identity separately and applies the groups assigned to that identity.
 
-Add more servers in the management UI or open another `wad://` link. All use the same client identity and drive letter. Command-line configuration and `--probe` remain available for diagnostics and automation:
+### Drive letters and server placement
+
+Add more servers in the management UI or open another `wad://` link. Servers on all of your drives use your account’s device identity. External links target your primary drive. To connect on another drive, open its sidebar tab and paste the link. Command-line configuration and `--probe` remain available for diagnostics and automation:
 
 ```powershell
-.\BijouShare.Client.exe --server 192.168.1.20 --port 7443 --probe
+.\BijouShare.Client.exe --server 192.168.1.20 --port 7443 --server-id $trustedServerFingerprint --probe
 .\BijouShare.Client.exe
 ```
 
-The resulting layout is `N:\DarkArchives_838cff90d76c4ed0\Team`, `N:\Media_73be70cb6df84275\Movies`, and so on. Names and full hash IDs come from the authenticated server; local IP addresses and client aliases cannot override folder names. Each server independently approves the same device identity, assigns its groups, and has its own pinned server key. There is one configured mount letter for the entire client. A pending, blocked, or offline server does not prevent an approved server from working. When a connection/retry fails, its server folder is temporarily hidden from the drive root. Saved endpoints, identities, and pins stay in the client management UI. Background probes retry every 15 seconds and restore the same folder after authentication succeeds, without remounting the shared drive. A cached server also stays hidden at startup until it reconnects. A collision in the shortened displayed suffix fails closed when the full identities differ, including remembered offline identities.
+The resulting layout is `N:\DarkArchives_838cff90d76c4ed0\Team`, `N:\Media_73be70cb6df84275\Movies`, and so on. Names and full hash IDs come from the authenticated server; local IP addresses and client aliases cannot override folder names. Each server independently approves the same device identity, assigns its groups, and has its own fingerprint. Two signed-in accounts can both use N: and see different servers. A pending, blocked, or offline server does not prevent an approved server from working. When a connection/retry fails, its server folder is temporarily hidden from the drive root. Saved endpoints, identities, and pins stay in the client management UI. Background probes retry every 15 seconds and restore the same folder after authentication succeeds, without remounting the shared drive. A cached server also stays hidden at startup until it reconnects. A collision in the shortened displayed suffix fails closed when the full identities differ, including remembered offline identities.
 
 Cross-server copies use the normal read/write permissions of the respective servers. A rename between server roots returns a cross-device error; applications can move such files by copying and then deleting when permitted.
 
-## 3. Install the Windows services
+## Service management and updates
 
-Deploy the full service directories to a protected installation location, such as the following paths, and stop console instances. Run the installer elevated after server administrator initialization and client web setup. A client with no servers can be installed; it starts with an empty drive:
+The installers deploy to `%ProgramFiles%\BijouShare\Server` and `%ProgramFiles%\BijouShare\Client`. **BijouShare.Server** runs as **LOCAL SERVICE**. Grant that account the NTFS permissions it needs for each exported location. **BijouShare.Client** runs as **LocalSystem** and starts the drive worker with each signed-in user’s Windows token. Both services use automatic startup and restart on failure. Use **Services** to stop or restart them.
+
+Run the newer setup executable to upgrade an installer-managed service. Use **Settings → Apps → Installed apps** to uninstall either role independently. Server identities, configuration and per-user client profiles survive uninstall. The setup executables also support `/repair`, `/uninstall`, `/passive` and `/quiet`. An unattended client install fails with exit code 1603 when Dokany is missing. Install Dokany before running setup unattended.
+
+### Unattended installation
+
+Run setup from an elevated PowerShell session or a deployment agent running as SYSTEM. Use `/quiet` (alias `/qn`) for silent operation or `/passive` for progress without prompts. The same switches work for a fresh install, an upgrade, `/repair`, or `/uninstall`. Setup always suppresses automatic restarts and accepts `/norestart` explicitly.
 
 ```powershell
-.\scripts\Install-Service.ps1 -Role Server -PublishDirectory 'C:\Program Files\BijouShare\Server' -WhatIf
-.\scripts\Install-Service.ps1 -Role Server -PublishDirectory 'C:\Program Files\BijouShare\Server' -Start
-.\scripts\Install-Service.ps1 -Role Client -PublishDirectory 'C:\Program Files\BijouShare\Client' -Start
+$setup = '.\BijouShare.Server-2.0.11-win-x64-Setup.exe'
+$result = Start-Process -FilePath $setup -ArgumentList '/quiet', '/norestart' -Wait -PassThru
+$result.ExitCode
 ```
 
-Use the actual deployed directories. The installer does not copy files: it verifies initialization, refuses unsafe reparse paths or writable ancestor directories, protects the published tree, and registers the executable with a quoted absolute path. `-WhatIf` previews the action without installing a service or changing ACLs. Pass `-DataDirectory` when using custom state. Partial service registration is rolled back if configuration/startup fails.
+For a client, use `BijouShare.Client-2.0.11-win-x64-Setup.exe` after deploying Dokany. For an unattended repair or removal, add `/repair` or `/uninstall` to the argument list. Exit code `0` means success, `3010` means success with a restart required, and `1603` means installation failed. Unattended setup starts the installed service and skips the completion message. Users can open the web UI from the tray after sign-in.
 
-Install the server on its server machine and the client on each client machine; both can coexist for local testing. The server runs as **LOCAL SERVICE**; the client runs as **LocalSystem**, which is needed for the machine-wide driver mount. Grant LOCAL SERVICE the underlying NTFS rights required for the exported files/folders. Application group permissions are always limited by the server service account's actual filesystem access. The installer leaves firewall rules unchanged.
+**Moving from a script-installed service.** Setup detects an existing unmanaged service with the same name. Before switching, record its executable path and any custom server data directory in **Services**. Stop the old service and remove its service registration from elevated PowerShell with `sc.exe delete BijouShare.Server` or `sc.exe delete BijouShare.Client`, as appropriate. Keep your configuration and data directories. If the old server used a custom data directory, set `Server:DataDirectory` to that path in the installed server’s `appsettings.json` and restart the service before configuring the web UI.
 
-Service names are `BijouShare.Server` and `BijouShare.Client`. The installer configures automatic startup and restart on failure. Manage them with `Start-Service`, `Stop-Service`, and the Windows Services console. For updates, stop the service, replace its published files, and start it again. Install Dokany separately before starting a client service.
+## Build the installers
+
+Use Windows x64, 64-bit PowerShell 7.4 or later, the .NET 10 SDK, and the Windows .NET Framework 4.x compiler. From the repository root, run:
+
+```powershell
+.\Installer\Build.ps1
+```
+
+The build restores pinned WiX tools, publishes both self-contained services, and verifies both setup executables before writing them and their SHA3-256 checksums to `artifacts\bijoushare\installers`. Building requires no service installation. To build just the applications, run `dotnet build BijouShare.slnx -c Release`.
 
 ## Access rules
 
-Devices contain their identity, enabled status, and group memberships. **Only groups receive permissions.** Rules reference a group, share, relative path, allow flags, deny flags, and inheritance setting. New devices/groups/shares have no access until matching group rules grant it. Application users and direct device-permission assignments do not exist.
+**Only groups receive permissions.** Open **Groups** and select a group to manage its share permissions. Each ordinary group can have one permission entry per share. To set different access for a folder or file, add a path inside that entry. Each path has its own allow flags, deny flags, and inheritance setting. Use **Rename** beside a group name and press Enter to save or Escape to cancel.
+
+Every server has a permanent **Administrator** device group. Devices assigned to it receive full file access on current and future enabled shares. Explicit denies from another group still take precedence. In **Devices**, select a device name to expand its settings. Use the scrollable group checklist to assign memberships during approval or change them later. For long lists, **Filter groups** finds groups by name and keeps selections made under earlier searches. The server rejects invitations that include Administrator, as well as attempts to rename or delete the group. The administration web UI uses its own sign-in.
 
 Available permissions: list directories, read data, write data, create files, create directories, delete, rename/move, read attributes, write attributes/timestamps, and read permissions. `FullControl` combines those ten functions; it does not grant administration UI access or permission-policy editing from a client.
 
@@ -134,6 +141,10 @@ Available permissions: list directories, read data, write data, create files, cr
 
 ## File concurrency and reconnection
 
+Explorer can inspect a folder’s attributes while another application renames it. If Explorer reports **Folder In Use**, check **Activity** on the server for a **SharingViolation** at the time of the rename. The failed open can be on the parent directory. For a conflicting BijouShare handle, the detail identifies the device, path, and share flags. A separate message identifies a conflict reported by Windows on the server’s backing storage.
+
+Client 2.0.4 fixes a parent directory handle that could stay open after Dokany retried a denied child open. Stop the client on the affected device before replacing its binaries, then restart it. Ending the old connection releases its outstanding handles.
+
 Multiple clients/readers can keep the same file open. At most **one writable handle per physical file** is allowed, retained until its final Windows close/disconnect, including outstanding mapped I/O. Requested Windows `FILE_SHARE_READ/WRITE/DELETE` flags are also honored, so an application can request stricter sharing. A reader must allow shared writing to coexist with a writer. Metadata changes, truncation, deletes, renames, and byte-range locks are coordinated by the server. Locks apply to clients of this service; they do not arbitrate unrelated local programs accessing the same storage. Native open sharing additionally excludes external writers while a remote writable handle is open.
 
 Reads/writes are chunked; directory results are paginated. There is no offline cache. A heartbeat reconnects the client after network loss. Existing remote handles become invalid after reconnection, and applications must reopen their files. Writes are never automatically retried after an uncertain network outcome. Disconnected server sessions are reclaimed after a 90-second idle timeout; application-level heartbeat traffic normally runs every 15 seconds.
@@ -142,17 +153,13 @@ A request canceled while still waiting to transmit reports an IO timeout and lea
 
 ## Performance and upgrading
 
-Version **0.8 requires both endpoints to be updated together**. Protocol v3 requires `P256-MLKEM768-HKDFSHA256-AES256GCM`; previous classical-only protocols and missing/altered hybrid fields are rejected. There is no compatibility switch or automatic downgrade. Existing device IDs, persistent identity keys, server IDs, pins, groups, shares, and permissions remain valid; no enrollment reset or state migration is needed.
+BijouShare releases the client and server together under the version in `Directory.Build.props`. Deploy the matching server and client packages for each update, including releases that fix only one component.
 
-Version 0.4 introduced automatic approval. Stop each process/service, replace its published files, and restart it while preserving configuration and `%ProgramData%` state. Existing approved device keys/pins remain valid. On first server startup, legacy users are removed and each device receives its former user's groups. A device stays enabled only if both it and its former user were enabled. The exact legacy state is backed up inside the protected server data directory as `state.json.before-device-groups-<id>.bak` before schema migration. Rolling back to a pre-0.4 server requires restoring that private state backup along with the old binaries. Current clients and servers must both use protocol v3.
-
-Version 0.5 introduced authenticated server folder names. Existing server state gains a persistent global P-256 identity key and a name derived from a sanitized machine name; a protected exact backup is created as `state.json.before-server-identity-<id>.bak`. Groups, devices, their key pairs, permission rules, pending decisions, and administrator credentials are preserved. The active schema version is 3. Updated clients require the server's authenticated identity metadata and hybrid protocol; they never invent an IP-based folder for an incompatible endpoint.
-
-Version 0.6 adds browser-based client setup/management, persistent empty drive mounting, `wad://` activation, and server invitations. Both endpoints need 0.6 or later to redeem invitations. Version 0.7 adds browser-based server setup and temporarily hides disconnected server folders until they reconnect. Existing server/device keys, administrator credentials, permissions, pins, and drive settings are retained; no schema migration is required.
+Version 2.0 requires protocol v6 and fresh server and client configurations. When replacing an earlier installation, stop both apps and retain the old state directories separately. Start setup with empty data directories, configure the groups and shares, and distribute new links from the server. The apps reject earlier state files without rewriting them.
 
 Modern peers negotiate raw binary file payloads inside AES-256-GCM frames, eliminating JSON Base64 expansion. Transfers use chunks up to 1 MiB and a bounded window of 16 requests per connection. Reads can execute concurrently; mutations retain request order and coordinate with earlier reads. Server IO permits concurrent readers across connections while retaining the single-writer rule. Buffer pooling reduces large allocations, and directory pagination keeps a bounded enumeration cursor instead of repeatedly scanning preceding entries. Current authorization is checked for every request; cached permissions and directory cursors are invalidated when server configuration changes.
 
-The client authentication log reports `P-256 + ML-KEM-768 (Windows CNG)` for key establishment and `pipelined AES-GCM binary` for optimized transfers. ECDH and ML-KEM run only during connection setup; file contents and operation metadata continue to use symmetric AES-256-GCM. The JSON payload test mode also requires the hybrid handshake.
+P-256 ECDH and ML-KEM-768 run during connection setup. File contents and operation metadata use symmetric AES-256-GCM for both the binary transfer mode and the diagnostic JSON mode.
 
 Run an isolated encrypted TCP benchmark on the server machine with:
 
@@ -164,44 +171,36 @@ It generates test files under `artifacts\benchmarks` in the working directory, v
 
 ## Keys, state, and scope
 
-Server state defaults to `%ProgramData%\BijouShare\Server`; client configuration/identity defaults to `%ProgramData%\BijouShare\Client`. Both accept `--data-dir <absolute-directory>`; use the same argument for setup and service installation when overriding the location. Use a dedicated directory, never a drive root or reparse path. Client `client.json` also contains endpoint, server pin, mount letter, and request timeout settings. The client validates its key pair, endpoint, mount point, and timeout before connecting. Stop a client before editing that file. A data directory can be held by only one running/setup instance.
+Server state defaults to `%ProgramData%\BijouShare\Server`. Each Windows user's client state lives in `%USERPROFILE%\.bijoushare`, independently of the executable location. Its `client.json` contains both identity public keys, the current-user DPAPI-protected P-256 private key and ML-KEM private seed, the full device ID, and the user's drive and server settings. The client checks that each private key matches its public key and that the pair matches the saved device ID. The profile also contains `web-keys\` and the instance lock.
 
-Private keys use Windows machine-bound DPAPI and restricted directory ACLs. Server private keys are distinct per enrolled device. Machine-bound encrypted state is not portable to another machine: re-enroll devices after migration. Administrator passwords use PBKDF2-SHA256 with random salt and 600,000 iterations. Configuration updates are atomic; audit events append to daily JSONL files under the server data directory's `audit` folder. Frequent open/write audit records use a bounded queue and a 250 ms flush interval, drained on graceful shutdown; an abrupt process or machine failure can lose the unflushed tail. Authentication, administration, and other audit records flush synchronously. Recent activity is reloaded after restart from bounded tails of the latest audit files; the UI shows up to 200 recent events. Archive/rotate old daily files according to your retention needs.
+Client startup restricts the profile directory and its existing files, including client.json, backups and web keys, to the owning Windows account and SYSTEM. New files inherit these permissions. The server excludes client profiles even when an enclosing directory or drive is shared. Local Windows administrators can take ownership using operating system privileges.
 
-Every connection uses fresh client/server ephemeral P-256 keys, a fresh client ML-KEM-768 key, and random challenges. The server encapsulates to that ML-KEM key using native Windows CNG. HKDF-SHA256 combines the fixed-length persistent identity ECDH secret, ephemeral ECDH secret, and ML-KEM shared secret. Separate purpose/role labels derive handshake authentication keys and 72 bytes of independent directional AES-256-GCM keys/nonce prefixes. Version, exact suite, both ephemeral public contributions, ML-KEM ciphertext, identities, approval status, and capabilities are transcript-bound. Wrong or tampered ML-KEM ciphertext yields an unrelated secret and fails proof confirmation before invitations or file operations are sent. Secrets are cleared after use; ephemeral private keys are disposed and never persisted.
+Client private keys and pending invite secrets use current-user DPAPI. Server private keys use machine-bound DPAPI. Both use restricted directory ACLs. Each server has one persistent ECDH and ML-KEM identity for all clients. A replacement machine needs its own setup, connection links and device approvals. Administrator password hashes use PBKDF2-HMAC-SHA3-256 with random salt and 600,000 iterations. Configuration updates are atomic; audit events append to daily JSONL files under the server data directory's `audit` folder. Frequent open/write audit records use a bounded queue and a 250 ms flush interval, drained on graceful shutdown; an abrupt process or machine failure can lose the unflushed tail. Authentication, administration, and other audit records flush synchronously. Recent activity is reloaded after restart from bounded tails of the latest audit files; the UI shows up to 200 recent events. Archive/rotate old daily files according to your retention needs.
 
-**All file contents and operation metadata remain symmetrically encrypted with AES-256-GCM.** Sequence-number nonces reject frame tampering and replay. The hybrid exchange protects recorded session confidentiality against compromise of the classical ECDH component. Persistent device and server identity authentication still uses P-256; this change does not provide post-quantum signatures or protection against an active attacker who can break those long-term identity keys. Existing identity keys, pins, and server folder hashes remain unchanged.
+**Fingerprints.** Each Windows client profile and each server has a persistent P-256 ECDH key pair and a persistent ML-KEM-768 key pair. Both use the same ID formula. Concatenate the canonical DER SubjectPublicKeyInfo bytes for the ECDH public key with the raw ML-KEM encapsulation key bytes, hash once with SHA3-256, and encode the result as 64 lowercase hexadecimal characters. Display names, addresses and drive letters are independent of the ID. Change the server display name under **Settings** or the client name under **Device settings**.
 
-The server-wide identity is separate from its persistent per-device ECDH keys. Its additional role-separated proof combines the global identity ECDH secret with the same ephemeral ECDH and ML-KEM contributions and binds the server name, full name/public-key hash, and session transcript. The client verifies the complete hash and full pinned public key; it never relies on the 16-character display suffix alone. A changed key, missing naming metadata, or absent hybrid contribution fails authentication.
+**Handshake and transfers.** Both peers contribute fresh ephemeral key material and random nonces and prove possession of their persistent keys. The ECDH contribution hashes the static and ephemeral raw agreements together. The ML-KEM contribution hashes the secrets encapsulated to the client identity, server identity and ephemeral client key, in that order. The hybrid secret is `SHA3-256(ECDH contribution || ML-KEM contribution)`.
+
+Key confirmation and traffic keys use separate purpose labels bound to the handshake transcript. Each direction has its own AES-256-GCM key and nonce prefix and advances its frame counter. This separates traffic in both directions and across reconnects, including sessions opened in the same second. The one-step SHA3 key expansion follows the counter, shared-secret and context layout in [NIST SP 800-56C Rev. 2, section 4.1](https://doi.org/10.6028/NIST.SP.800-56Cr2).
 
 The exported namespace supports ordinary Windows file/folder I/O, memory-mapped I/O, attributes, timestamps, sizing, enumeration, rename, deletion, and locking. Native write-through requests are honored, and paging writes cannot extend EOF. NTFS-specific features such as alternate data streams, reparse points/symlinks/junctions, hard-link creation, sparse controls, EFS, compression controls, and client-side ACL modification are not exposed. Unsupported EFS creation requests fail instead of silently creating an unencrypted file. Reparse paths, traversal, device names, and alternate-stream syntax are rejected. Windows short-name aliases are expanded before permission/confinement checks. The server's data directory, default `%ProgramData%\BijouShare` tree, and executable directory are excluded even when sharing an entire drive. Local storage administrators and the service host remain trusted; do not let untrusted local processes replace share path components with reparse points during file operations.
 
 ## Validation
 
-If the drive has not appeared, check whether the device is awaiting approval or blocked in the server UI. If it is mounted but empty, verify that the device belongs to a group with a permission rule for the enabled share. To grant access to the share root, leave the rule's relative path empty; do not repeat the share name. The read-only preset includes the root metadata/list permissions required by Explorer. Physical Hidden/System flags on a drive root do not hide an explicitly exported virtual share; child-file attributes remain unchanged.
+If Explorer cannot open the drive letter, check that drive’s mount status in the client web UI for the signed-in Windows account. The client periodically opens the virtual root and remounts the drive after repeated failures. A configured drive should open even with zero connected servers.
 
-Tests are compiled into the existing executables, preserving the two-project solution:
+If the mounted drive is empty, check the server connection status in the drive’s tab. If a server folder opens but has no shares, check device membership and the enabled shares in the server UI. For ordinary groups, leave the relative path empty to grant access to a share root. The read-only preset includes the root permissions Explorer uses to list it. An exported drive root remains visible even when Windows marks its physical root Hidden or System. Entries below the root retain their Windows attributes.
 
-```powershell
-dotnet BijouShare.Server/bin/Release/net10.0-windows/BijouShare.Server.dll --self-test
-dotnet BijouShare.Client/bin/Release/net10.0-windows/BijouShare.Client.dll --self-test
-```
+If creating a folder inside a share fails, open **Activity** on the server and find the denied **Open** for that path. The detail identifies a missing BijouShare group permission or a Windows storage denial when that check fails. For a Windows denial, find the account shown under **Shares** and check its NTFS permissions on the physical parent folder. Folder creation needs **Create folders / append data**. Use **Modify** on the intended subtree if that account also needs to edit, rename, and delete files.
 
-The server tests cover permissions, live revocation, single-writer sharing, handle ownership, range locks, path rejection, protected storage, rename policy, directory pagination, real encrypted TCP authentication, concurrent request correlation, and mutation ordering. Hybrid tests exercise native ML-KEM encapsulation/decapsulation, malformed inputs, implicit rejection, all-secret key derivation, transcript/role binding, downgrade refusal, and preserved pins. Protocol tests also cover symmetric encryption, tampering, replay, binary bounds, and exact short reads.
-
-For repeatable end-to-end acceptance testing, publish first and run the following elevated:
+Run the built-in checks from each published service directory.
 
 ```powershell
-.\scripts\Test-Acceptance.ps1
-# Optional: with Node.js, Chrome, and playwright available
-.\scripts\Test-Acceptance.ps1 -WebUi
-# Override occupied ports or the drive letter when needed
-.\scripts\Test-Acceptance.ps1 -Drive 'R:\' -FilePort 17444 -AdminPort 15081
+.\BijouShare.Server.exe --self-test
+.\BijouShare.Client.exe --self-test
 ```
 
-The wrapper creates isolated fixtures with test-only credentials, checks native file operations and live permission changes, and starts two servers plus a fresh client on one drive to verify automatic approval, group deny precedence, independent pins, cross-server copying, outage isolation, and block/re-enable behavior. Temporary processes stop in `finally` blocks. It refuses occupied test ports/drive letters. The mount test requires a generated acceptance-fixture marker before writing, to avoid accidentally testing a production share. Keep test-only credentials out of deployed state.
-
-For browser QA, install `playwright` in your development environment, or set `PLAYWRIGHT_MODULE` to an existing package path. Browser screenshots are saved under `artifacts\ui`; isolated fixture logs remain under `artifacts\acceptance-<id>` for troubleshooting. Test artifacts use only generated identities, state, and files.
+The server tests cover group permissions and live revocation, single-writer sharing, path confinement, encrypted TCP authentication and request ordering. The client tests cover per-user profiles, invite parsing, fingerprint checks, server routing and reconnects. Shared tests exercise native ML-KEM, known SHA3 fingerprint and key derivation vectors, role-specific key confirmation, AES-GCM tamper detection and replay rejection.
 
 Before a release, check dependency advisories with:
 
@@ -210,9 +209,3 @@ dotnet list BijouShare.slnx package --vulnerable --include-transitive --no-resto
 ```
 
 Implementation references: [DokanNet callback contract](https://github.com/dokan-dev/dokan-dotnet/blob/master/DokanNet/IDokanOperations.cs), [official mount example](https://github.com/dokan-dev/dokan-dotnet/blob/master/sample/DokanNetMirror/Program.cs), and [Microsoft Windows service hosting](https://learn.microsoft.com/en-us/dotnet/core/extensions/windows-service).
-
-## Upgrading to BijouShare 0.9
-
-Upgrade both the server and all clients together: the authenticated protocol name is now BijouShare. Stop previous service instances before replacing binaries. Install the services under their new BijouShare.Server and BijouShare.Client names; remove obsolete service registrations so they cannot start alongside the replacement. Re-register the wad URI handler from the new client executable using --register-protocol.
-
-New installations default to the BijouShare folders under ProgramData. To retain an existing installation, pass --data-dir with its original absolute data directory on the same Windows computer, and use that same directory when installing the renamed service. This retains device keys, server identity, approval records, groups, permissions, invites, and client settings. Keep a backup of that directory before upgrading. The product rename requires signing in to the web UI again.

@@ -9,13 +9,16 @@ namespace BijouShare.Server;
 
 public static class AdminApi
 {
+    public sealed record ServerNameUpdate(string Name);
     public sealed record Login(string Name, string Password);
     public sealed record PasswordChange(string CurrentPassword, string NewPassword);
     public sealed record DeviceApproval(Guid[] GroupIds, string Fingerprint);
     public sealed record DeviceUpdate(bool Enabled, Guid[] GroupIds);
     public sealed record InviteCreation(string Name, Guid[] GroupIds, int? MaxUses, DateTimeOffset? ExpiresUtc);
+    public sealed record PermissionRuleUpdate(Guid Id, Guid GroupId, Guid ShareId, string Path,
+        Permission Allow, Permission Deny, bool Inherit, AccessScope[]? AdditionalScopes = null);
     public sealed record Setup(string ServerName, string AdminName, string Password, string ConfirmPassword);
-    public static string CredentialVersion(AdminCredential admin) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(admin.Hash));
+    public static string CredentialVersion(AdminCredential admin) => Convert.ToHexString(System.Security.Cryptography.SHA3_256.HashData(admin.Hash));
     public static void MapAdminApi(this WebApplication app)
     {
         app.MapGet("/api/session", (HttpContext context, IAntiforgery antiforgery, StateStore store) => Results.Ok(new
@@ -76,17 +79,26 @@ public static class AdminApi
             return Results.Ok();
         }).RequireRateLimiting("login");
         var api = app.MapGroup("/api").RequireAuthorization();
+        api.MapPost("/server/name", (ServerNameUpdate update, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "RenameServer", update.Name, () => { store.RenameServer(update.Name); return true; }));
         api.MapPost("/logout", async (HttpContext context) => { await context.SignOutAsync(); return Results.Ok(); });
         api.MapGet("/state", (StateStore store, AuditLog audit, ServerOptions options) => store.Read(s => Results.Ok(new
         {
             s.ServerName,
             s.ServerId,
             s.ServerPublicKey,
+            s.ServerMlKemPublicKey,
             filePort = options.Port,
+            storageAccount = FileService.StorageAccount,
             cryptoSuite = Wire.CryptoSuite,
             cryptoProvider = HybridKem.ProviderName,
             cryptoSupported = HybridKem.IsSupported,
-            s.Groups,
+            groups = s.Groups.Select(group => new
+            {
+                group.Id,
+                group.Name,
+                isAdministrator = group.Id == StateStore.AdministratorGroupId
+            }),
             s.Shares,
             s.Rules,
             devices = s.Devices.Select(d => new
@@ -95,8 +107,8 @@ public static class AdminApi
                 d.Name,
                 d.GroupIds,
                 d.Enabled,
-                fingerprint = KeyAgreement.Fingerprint(d.ClientPublicKey),
-                serverFingerprint = KeyAgreement.Fingerprint(d.ServerPublicKey)
+                d.PublicIdentity,
+                fingerprint = d.PublicIdentity
             }),
             pendingDevices = s.PendingDevices.Select(d => new
             {
@@ -105,7 +117,8 @@ public static class AdminApi
                 d.FirstSeenUtc,
                 d.LastSeenUtc,
                 d.Rejected,
-                fingerprint = KeyAgreement.Fingerprint(d.ClientPublicKey)
+                d.PublicIdentity,
+                fingerprint = d.PublicIdentity
             }),
             invites = s.Invites.Select(invite => new
             {
@@ -127,12 +140,16 @@ public static class AdminApi
             {
                 if (id != group.Id)
                     throw new ArgumentException("ID mismatch.");
+                if (id == StateStore.AdministratorGroupId)
+                    throw new ArgumentException("The built-in Administrator group cannot be edited.");
                 Upsert(s.Groups, group, x => x.Id == id);
                 return true;
             })));
         api.MapDelete("/groups/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "DeleteGroup", id.ToString(), () => store.Update(s =>
             {
+                if (id == StateStore.AdministratorGroupId)
+                    throw new ArgumentException("The built-in Administrator group cannot be deleted.");
                 s.Groups.RemoveAll(x => x.Id == id);
                 s.Rules.RemoveAll(x => x.GroupId == id);
                 s.Devices = s.Devices.Select(d => d with { GroupIds = d.GroupIds.Where(g => g != id).ToArray() }).ToList();
@@ -179,15 +196,26 @@ public static class AdminApi
                 s.Rules.RemoveAll(x => x.ShareId == id);
                 return true;
             })));
-        api.MapPut("/rules/{id:guid}", (Guid id, AccessRule rule, StateStore store, AuditLog audit, HttpContext context) =>
+        api.MapPut("/rules/{id:guid}", (Guid id, PermissionRuleUpdate rule, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "PermissionRule", rule.Path, () => store.Update(s =>
             {
                 if (id != rule.Id)
                     throw new ArgumentException("ID mismatch.");
-                Upsert(s.Rules, rule with
+                var existing = s.Rules.Find(entry => entry.Id == id);
+                if (rule.AdditionalScopes is null && existing is { AdditionalScopes.Length: > 0 } &&
+                    (existing.GroupId != rule.GroupId || existing.ShareId != rule.ShareId))
+                    throw new ArgumentException("Include the additional permission paths when moving this rule to another group or share.");
+                var scopes = rule.AdditionalScopes ?? existing?.AdditionalScopes ?? [];
+                var updated = new AccessRule(id, rule.GroupId, rule.ShareId, StateStore.CanonicalRulePath(s, rule.ShareId, rule.Path),
+                    rule.Allow, rule.Deny, rule.Inherit)
                 {
-                    Path = StateStore.CanonicalRulePath(s, rule.ShareId, rule.Path)
-                }, x => x.Id == id);
+                    AdditionalScopes = scopes.Select(scope =>
+                    {
+                        ArgumentNullException.ThrowIfNull(scope);
+                        return scope with { Path = StateStore.CanonicalRulePath(s, rule.ShareId, scope.Path) };
+                    }).ToArray()
+                };
+                Upsert(s.Rules, updated, x => x.Id == id);
                 return true;
             })));
         api.MapDelete("/rules/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
@@ -245,13 +273,8 @@ public static class AdminApi
             if (WindowsPaths.TryGetAttributes(ancestor, out var attributes) && (attributes & FileAttributes.ReparsePoint) != 0)
                 throw new ArgumentException("Choose the actual local path. Reparse points, symbolic links, and junctions cannot be exported.");
         var canonical = WindowsPaths.Canonical(local);
-        foreach (var protectedDirectory in new[] { dataDirectory, AppContext.BaseDirectory,
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BijouShare") })
-        {
-            var root = WindowsPaths.Canonical(protectedDirectory).TrimEnd('\\');
-            if (canonical.Equals(root, StringComparison.OrdinalIgnoreCase) || canonical.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException("Service data and executable directories cannot be exported.");
-        }
+        if (FileService.IsProtectedExportPath(canonical, FileService.ProtectedRoots(dataDirectory)))
+            throw new ArgumentException("BijouShare data, client profiles and executable directories cannot be exported.");
         return canonical;
     }
     private static IResult Save<T>(HttpContext context, AuditLog audit, string action, string target, Func<T> save)

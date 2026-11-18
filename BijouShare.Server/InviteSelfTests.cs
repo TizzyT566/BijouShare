@@ -40,7 +40,7 @@ internal static class InviteSelfTests
         static EnrollmentRequest Request(string name = "Invited laptop")
         {
             using var key = KeyAgreement.NewKey();
-            return new(Guid.NewGuid().ToString(), name, Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()));
+            return TestRegistration.Create(name, Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()));
         }
 
         var root = Path.GetFullPath(Path.Combine("artifacts", "invite-tests", Guid.NewGuid().ToString("N")));
@@ -49,6 +49,10 @@ internal static class InviteSelfTests
         Reject(() => store.CreateInvite("Invalid uses", groups, 0, null), "Invite use limits must be positive or unlimited");
         Reject(() => store.CreateInvite("Expired", groups, null, DateTime.UtcNow.AddMinutes(-1)), "New invites cannot already be expired");
         Reject(() => store.CreateInvite("Unknown group", [Guid.NewGuid()], 1, null), "Invites can grant only existing groups");
+        var beforeForbiddenInvite = store.Revision;
+        Reject(() => store.CreateInvite("Privileged invitation", [.. groups, StateStore.AdministratorGroupId], null, null),
+            "An invite cannot include the Administrator group, even alongside an ordinary group");
+        Check(store.Revision == beforeForbiddenInvite, "Rejecting a privileged invitation leaves server state untouched");
         Reject(() => store.CreateInvite("Bad date", groups, 1, DateTime.SpecifyKind(DateTime.UtcNow.AddHours(1), DateTimeKind.Unspecified)),
             "Invite expirations must use UTC in persisted state");
         var unlimited = store.CreateInvite("Unlimited", groups, null, null);
@@ -67,11 +71,11 @@ internal static class InviteSelfTests
             "A valid invite directly approves the proven device with its configured groups");
         var revision = store.Revision;
         var second = store.RedeemInvite(request, single.Code);
-        Check(second.Id == first.Id && second.ServerPublicKey == first.ServerPublicKey && second.GroupIds.SequenceEqual(first.GroupIds) &&
+        Check(second.Id == first.Id && second.HasSameIdentity(first) && second.GroupIds.SequenceEqual(first.GroupIds) &&
             store.Revision == revision && store.Read(state => state.Invites.Single(invite => invite.Id == single.Invite.Id).Uses) == 0,
             "Known device reconnects neither consume invites nor replace keys or groups");
         var reloaded = new StateStore(options);
-        Check(reloaded.FindRegisteredDevice(first.Id)!.ServerPublicKey == first.ServerPublicKey &&
+        Check(reloaded.FindRegisteredDevice(first.Id)!.HasSameIdentity(first) &&
             reloaded.Read(state => state.Invites.Single(invite => invite.Id == unlimited.Invite.Id).Uses) == 1,
             "Invite limits and approved device identities survive reload");
 
@@ -95,7 +99,7 @@ internal static class InviteSelfTests
             "A valid invite promotes an existing pending request without leaving a duplicate identity");
         var rejected = Request("Rejected laptop");
         store.QueueRegistration(rejected);
-        store.RejectDevice(Guid.Parse(rejected.DeviceId));
+        store.RejectDevice(TestRegistration.RecordId(rejected.DeviceId));
         var usesBefore = store.Read(state => state.Invites.Single(invite => invite.Id == unlimited.Invite.Id).Uses);
         Status(() => store.RedeemInvite(rejected, unlimited.Code), "DeviceRejected", "An invite cannot override an administrator's rejection");
         store.Update(state => { var index = state.Devices.FindIndex(device => device.Id == first.Id); state.Devices[index] = state.Devices[index] with { Enabled = false }; return true; });
@@ -121,26 +125,31 @@ internal static class InviteSelfTests
             var privateKey = networkIdentity.ExportPkcs8PrivateKey();
             try
             {
-                var id = Guid.NewGuid().ToString();
+                using var identityKem = HybridKem.Generate();
+                var id = DeviceIdentity.Id(networkIdentity.ExportSubjectPublicKeyInfo(), identityKem.ExportPublicKey());
                 var proofInvite = store.CreateInvite("Private-key proof required", groups, 1, null);
                 using (var socket = new TcpClient())
                 using (var ephemeral = KeyAgreement.NewKey())
                 using (var kem = HybridKem.Generate())
                 {
-                    var unprovenId = Guid.NewGuid();
+                    var unprovenId = id;
                     await socket.ConnectAsync("127.0.0.1", options.Port, deadline.Token);
                     await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientHello(Wire.Version, unprovenId.ToString(),
                         RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
                     {
                         CryptoSuite = Wire.CryptoSuite,
                         MlKemPublicKey = kem.ExportPublicKey(),
+                        IdentityMlKemPublicKey = identityKem.ExportPublicKey(),
                         InviteEnrollment = true,
-                        ServerIdentityMetadata = true,
                         BinaryPayloads = true,
                         DeviceName = "Unproven invitation",
                         ClientPublicKey = Convert.ToBase64String(networkIdentity.ExportSubjectPublicKeyInfo())
                     }, deadline.Token);
-                    _ = await SecureTransport.ReadPlainAsync<ServerHello>(socket.GetStream(), deadline.Token);
+                    var serverHello = await SecureTransport.ReadPlainAsync<ServerHello>(socket.GetStream(), deadline.Token);
+                    var (ciphertext, secret) = HybridKem.Encapsulate(serverHello.ServerMlKemPublicKey!);
+                    CryptographicOperations.ZeroMemory(secret);
+                    await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientKeyExchange(ciphertext), deadline.Token);
+                    _ = await SecureTransport.ReadPlainAsync<ServerProof>(socket.GetStream(), deadline.Token);
                     await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientProof(new byte[32]), deadline.Token);
                     var ended = await socket.GetStream().ReadAsync(new byte[1], deadline.Token);
                     Check(ended == 0 && store.FindRegisteredDevice(unprovenId) is null &&
@@ -178,16 +187,16 @@ internal static class InviteSelfTests
                     var relay = Relay();
                     using (var socket = new TcpClient())
                     using (var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", ((IPEndPoint)proxy.LocalEndpoint).Port,
-                        id, "Invited network laptop", privateKey, null, deadline.Token, inviteCode: wireInvite.Code))
+                        id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId, wireInvite.Code))
                     using (var rpc = new RpcClientSession(transport))
                     {
-                        var approved = store.FindRegisteredDevice(Guid.Parse(id))!;
+                        var approved = store.FindRegisteredDevice(id)!;
                         var response = await rpc.CallAsync(new()
                         {
                             Operation = "List"
                         }, deadline.Token);
                         Check(approved.Enabled && response.Entries!.Any(entry => entry.Name == "Team") &&
-                            KeyAgreement.Equals(transport.RemoteIdentityPublicKey!, Convert.FromBase64String(approved.ServerPublicKey)) &&
+                            KeyAgreement.Equals(transport.RemoteServerMlKemPublicKey!, Convert.FromBase64String(store.ServerMlKemPublicKey)) &&
                             transport.RemoteServerId == store.ServerId,
                             "Encrypted invite enrollment authenticates and exposes authorized files immediately with the permanent key pinned");
                     }
@@ -199,34 +208,40 @@ internal static class InviteSelfTests
                 finally { proxy.Stop(); }
                 using (var socket = new TcpClient())
                 using (var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
-                    id, "Invited network laptop", privateKey, Convert.FromBase64String(store.FindRegisteredDevice(Guid.Parse(id))!.ServerPublicKey), deadline.Token,
-                    Convert.FromBase64String(store.ServerPublicKey), wireInvite.Code))
+                    id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId, wireInvite.Code))
                     Check(store.Read(state => state.Invites.Single(invite => invite.Id == wireInvite.Invite.Id).Uses) == 1,
                         "An exhausted invite does not prevent its already approved client from reconnecting with the same pins");
                 var failedInvite = store.CreateInvite("Authentication check", groups, 1, null);
-                using var wrongServer = KeyAgreement.NewKey();
+                var wrongFingerprint = (store.ServerId[0] == '0' ? "1" : "0") + store.ServerId[1..];
+                using var invitedEc = KeyAgreement.NewKey();
+                using var invitedKem = HybridKem.Generate();
+                var invitedId = DeviceIdentity.Id(invitedEc.ExportSubjectPublicKeyInfo(), invitedKem.ExportPublicKey());
+                var invitedPrivate = invitedEc.ExportPkcs8PrivateKey();
                 try
                 {
                     using var socket = new TcpClient();
                     using var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
-                        Guid.NewGuid().ToString(), "Untrusted endpoint", privateKey, null, deadline.Token,
-                        wrongServer.ExportSubjectPublicKeyInfo(), failedInvite.Code);
-                    throw new InvalidOperationException("Accepted the wrong global server key.");
+                        invitedId, "Untrusted hybrid identity", invitedPrivate, invitedKem, deadline.Token, wrongFingerprint, failedInvite.Code);
+                    throw new InvalidOperationException("Accepted the wrong trusted server fingerprint.");
                 }
                 catch (ServerIdentityMismatchException)
                 {
-                    Check(store.Read(state => state.Invites.Single(invite => invite.Id == failedInvite.Invite.Id).Uses) == 0,
-                        "A global server identity mismatch fails before sending or consuming an invite");
+                    Check(store.Read(state => state.Invites.Single(invite => invite.Id == failedInvite.Invite.Id).Uses) == 0 &&
+                        store.FindRegisteredDevice(invitedId) is null && store.FindPendingDevice(invitedId) is null,
+                        "A mismatched server fingerprint cannot consume an invite or queue an enrollment");
                 }
+                finally { CryptographicOperations.ZeroMemory(invitedPrivate); }
                 try
                 {
                     using var badInviteIdentity = KeyAgreement.NewKey();
+                    using var badInviteKem = HybridKem.Generate();
                     var badInvitePrivate = badInviteIdentity.ExportPkcs8PrivateKey();
                     try
                     {
                         using var socket = new TcpClient();
                         using var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
-                            Guid.NewGuid().ToString(), "Bad invite", badInvitePrivate, null, deadline.Token, inviteCode: new string('x', 32));
+                            DeviceIdentity.Id(badInviteIdentity.ExportSubjectPublicKeyInfo(), badInviteKem.ExportPublicKey()),
+                            "Bad invite", badInvitePrivate, badInviteKem, deadline.Token, store.ServerId, new string('x', 32));
                         throw new InvalidOperationException("Accepted an invalid invite over TCP.");
                     }
                     finally { CryptographicOperations.ZeroMemory(badInvitePrivate); }

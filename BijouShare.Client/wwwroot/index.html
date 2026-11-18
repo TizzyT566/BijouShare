@@ -1,35 +1,150 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BijouShare · Client</title><link rel="stylesheet" href="/client.css"><script src="/client.js" defer></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111112">
+  <title>BijouShare · Client</title>
+  <link rel="icon" href="/bijou-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/console.css">
+  <link rel="stylesheet" href="/client.css">
+  <script src="/client.js" defer></script>
 </head>
 <body>
-  <main id="loading" class="welcome"><div class="mark" aria-hidden="true">B</div><h1>Your shared drive, together.</h1><p id="loading-message">Connecting to this client's management service…</p><button id="retry-load" hidden>Try again</button></main>
-  <main id="setup" class="welcome" hidden>
-    <div class="setup-card"><div class="mark" aria-hidden="true">B</div><p class="eyebrow">WELCOME TO BIJOUSHARE</p><h1>Make room for your servers.</h1><p class="muted">Choose a name for this device and one drive letter. Your servers will share that drive.</p>
-      <div class="steps" aria-label="Setup progress: step 1 of 2"><span id="step-one" class="current" aria-current="step">1 <span>Your device</span></span><span id="step-two">2 <span>Your drive</span></span></div>
-      <form id="setup-form">
-        <section id="setup-name-step"><label for="setup-name">Device name</label><input id="setup-name" name="deviceName" maxlength="100" required autocomplete="off" aria-describedby="name-help"><p id="name-help" class="hint">The name server administrators see when this device connects.</p><button id="continue-setup" type="button" class="primary">Continue <span aria-hidden="true">→</span></button></section>
-        <section id="setup-drive-step" hidden><label for="setup-drive">Shared drive letter</label><select id="setup-drive" name="mountPoint" required aria-describedby="drive-help"></select><p id="drive-help" class="hint">The drive starts empty and stays mounted. Connecting a server adds its own folder.</p><p id="setup-pending" class="notice" hidden></p><div class="form-actions"><button id="back-setup" type="button">Back</button><button id="finish-setup" type="submit" class="primary">Create my drive</button></div></section>
-        <p id="setup-error" class="error" role="alert"></p>
-      </form>
-    </div><p class="local-note">Managed on this computer · encrypted file transfers</p>
+  <main id="loading" class="welcome">
+    <div class="loading-card">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>BijouShare<small>Client console</small></span></div>
+      <h1>Your shared drives</h1>
+      <p id="loading-message" role="status">Connecting to the client service…</p>
+      <button id="retry-load" hidden>Try again</button>
+    </div>
   </main>
+
+  <main id="setup" class="welcome" hidden>
+    <div class="setup-card">
+      <div class="setup-visual">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>BijouShare<small>Client console</small></span></div>
+      </div>
+      <div class="setup-fields">
+        <h1>Set up BijouShare</h1>
+        <p class="muted">Choose the name server administrators will see when you connect.</p>
+        <form id="setup-form">
+          <label for="setup-name">Device name</label>
+          <input id="setup-name" name="deviceName" maxlength="100" required autocomplete="off" aria-describedby="name-help">
+          <p id="name-help" class="hint">You can change this later in Device settings.</p>
+          <button id="finish-setup" type="submit" class="primary">Finish setup <span class="bi bi-arrow" aria-hidden="true"></span></button>
+          <p id="setup-error" class="error" role="alert"></p>
+        </form>
+      </div>
+    </div>
+  </main>
+
   <div id="dashboard" class="shell" hidden>
-    <a href="#servers" class="skip">Skip to servers</a>
-    <aside><a class="brand" href="#servers"><span class="mark small" aria-hidden="true">B</span>BijouShare</a><p class="eyebrow">THIS DEVICE</p><strong id="sidebar-name"></strong><div class="drive-badge"><span id="drive-letter">N:</span><div><strong>Shared drive</strong><small id="drive-status">Starting…</small></div></div><nav aria-label="Client management"><a href="#servers">Connected servers</a><a href="#device-settings">Device settings</a></nav><p class="aside-note">One drive. Every server.<br>Access through your device's groups.</p></aside>
-    <main class="main"><header><span>Client management <span class="local-pill">LOCAL</span></span><button id="refresh" type="button">Refresh connections</button></header>
-      <section id="servers"><div class="page-heading"><div><p class="eyebrow">YOUR NETWORK</p><h1>All your servers, one drive.</h1><p class="muted">Connect with a server address or open a <code>wad://</code> link.</p></div><span id="connected-count" class="count">0 connected</span></div>
-        <p id="service-notice" class="notice" role="status" hidden></p><p id="drive-notice" class="notice" role="status" hidden></p>
-        <div class="panel add-panel"><div><h2>Connect a server</h2><p class="muted">An invite link approves this device using the server's selected groups. Without an invite, an administrator approves it.</p></div><form id="add-server"><label for="server-link">Server link or address</label><div class="input-action"><input id="server-link" name="uri" placeholder="192.168.1.10:7443" required autocomplete="off" spellcheck="false" aria-describedby="server-link-help"><button type="submit" class="primary">Connect</button></div><p id="server-link-help" class="hint">Enter a server address or paste a <code>wad://</code> invite link. Invite codes stay private.</p><p id="server-error" class="error" role="alert"></p></form></div>
-        <div id="server-list" aria-live="polite"></div>
-      </section>
-      <section id="device-settings" class="panel settings"><div><p class="eyebrow">DEVICE SETTINGS</p><h2>A name of your own.</h2><p class="muted">Your name follows this device to every server. Groups and access are managed by each server.</p></div><form id="device-form"><label for="device-name">Device name</label><input id="device-name" maxlength="100" required autocomplete="off"><label for="device-drive">Shared drive letter</label><select id="device-drive" required></select><p class="hint">Changing the name reconnects servers and closes open remote files. A new drive letter takes effect when you restart the client service.</p><button type="submit" class="primary">Save device settings</button><p id="device-error" class="error" role="alert"></p></form><p class="device-id">Device ID <code id="device-id"></code></p></section>
-      <footer>P-256 + ML-KEM-768 hybrid key establishment · AES-256-GCM data encryption</footer>
+    <a href="#content" class="skip">Skip to content</a>
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>BijouShare<small>Client console</small></span></div>
+      <p class="rail-label drive-label">Your drives</p>
+      <div id="sidebar-tabs" role="tablist" aria-orientation="vertical" aria-label="Client management">
+        <div id="drive-tabs" role="presentation"></div>
+        <button type="button" role="tab" id="tab-add" aria-controls="add" aria-selected="false" tabindex="-1"><span class="bi bi-plus" aria-hidden="true"></span>Add drive</button>
+        <div class="rail-divider" role="presentation"></div>
+        <button type="button" role="tab" id="tab-settings" aria-controls="settings" aria-selected="false" tabindex="-1"><span class="bi bi-settings" aria-hidden="true"></span>Device settings</button>
+      </div>
+      <div class="profile">
+        <span class="profile-icon"><span class="bi bi-monitor" aria-hidden="true"></span></span>
+        <div><small>This device</small><strong id="sidebar-name"></strong></div>
+      </div>
+    </aside>
+
+    <main id="content" class="main" tabindex="-1">
+      <header class="topbar">
+        <div class="crumb"><span>Client console</span><span class="bi bi-chevron" aria-hidden="true"></span><strong id="view-name"></strong></div>
+        <button id="refresh" type="button" hidden><span class="bi bi-refresh" aria-hidden="true"></span>Refresh connections</button>
+      </header>
+      <div class="workspace">
+        <p id="refresh-error" class="error" role="alert"></p>
+        <p id="service-notice" class="notice" role="status" hidden></p>
+        <div id="drive-panels"></div>
+
+        <section id="add" role="tabpanel" aria-labelledby="tab-add" hidden>
+          <div class="drive-hero">
+            <div class="hero-content"><h1 id="add-title">Add your first drive</h1>
+              <p class="hero-description">Bring server folders together under one drive letter in File Explorer.</p>
+            </div>
+          </div>
+          <div class="panel configure">
+            <div class="section-title"><span class="tile"><span class="bi bi-drives" aria-hidden="true"></span></span><div><h2>Drive letter</h2><p class="muted">Choose an available letter for this Windows profile.</p></div></div>
+            <form id="add-drive" class="action-form">
+              <label class="sr-only" for="new-letter">Drive letter</label>
+              <div class="input-action"><select id="new-letter" name="mountPoint" required></select>
+                <button id="add-drive-button" type="submit" class="primary"><span class="bi bi-plus" aria-hidden="true"></span>Add drive</button>
+              </div>
+              <p id="letter-help" class="hint" hidden>No drive letters are available. Free a letter in Windows to add a drive.</p>
+              <p id="drives-error" class="error" role="alert"></p>
+            </form>
+          </div>
+          <div id="pending" class="panel" hidden>
+            <div class="section-title"><span class="tile"><span class="bi bi-clock" aria-hidden="true"></span></span><div><h2>Servers waiting for a drive</h2><p class="muted">These servers will connect when you add your first drive.</p></div></div>
+            <ul id="pending-list"></ul><p id="pending-error" class="error" role="alert"></p>
+          </div>
+        </section>
+
+        <section id="settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+          <div class="page-heading"><h1>Device settings</h1><p class="muted">Servers assign group permissions to your Windows profile’s device identity.</p></div>
+          <div class="settings-grid">
+            <div class="panel">
+              <div class="section-title"><span class="tile"><span class="bi bi-monitor" aria-hidden="true"></span></span><h2>Device name</h2></div>
+              <form id="device-form">
+                <label for="device-name">Name shown to administrators</label>
+                <input id="device-name" maxlength="100" required autocomplete="off" aria-describedby="rename-note">
+                <p id="rename-note" class="hint">Changing the name reconnects servers and closes open remote files.</p>
+                <button type="submit" class="primary">Save device settings</button><p id="device-error" class="error" role="alert"></p>
+              </form>
+            </div>
+            <div class="panel fingerprint-panel">
+              <div class="section-title"><span class="tile"><span class="bi bi-fingerprint" aria-hidden="true"></span></span><h2>Device fingerprint</h2></div>
+              <p class="muted">This public ID identifies your device during approval. It stays the same when you rename the device.</p>
+              <code id="device-id"></code>
+              <button type="button" id="copy-device-id"><span class="bi bi-copy" aria-hidden="true"></span>Copy fingerprint</button>
+            </div>
+          </div>
+        </section>
+      </div>
     </main>
   </div>
-  <dialog id="remove-dialog" aria-labelledby="remove-title" aria-describedby="remove-detail"><h2 id="remove-title">Disconnect this server?</h2><p id="remove-name" class="server-name"></p><p id="remove-detail" class="muted">Its folder is removed from this drive and open files on this server are closed. The server keeps this device's approval and groups.</p><p id="remove-error" class="error" role="alert"></p><div class="form-actions"><button id="cancel-remove" type="button">Cancel</button><button id="confirm-remove" type="button" class="danger">Disconnect server</button></div></dialog>
+
+  <template id="drive-template">
+    <section role="tabpanel" class="drive-panel" hidden>
+      <div class="drive-hero">
+        <div class="hero-content"><h1 class="drive-title"></h1>
+          <div class="hero-meta"><span class="mount-state"><span class="mount-icon bi" aria-hidden="true"></span><span class="drive-status"></span></span><span class="count"></span></div>
+        </div>
+      </div>
+      <p class="drive-notice notice" role="status" hidden></p>
+      <div class="panel add-panel">
+        <div class="section-title"><span class="tile"><span class="bi bi-link" aria-hidden="true"></span></span><div><h2>Connect a server</h2><p class="muted">Use the connection or invite link from your server administrator.</p></div></div>
+        <form class="connect-form action-form">
+          <label><span class="sr-only">Connection or invite link</span><input name="uri" placeholder="wad://server:7443/fingerprint#invite" required autocomplete="off" spellcheck="false"></label>
+          <button type="submit" class="primary">Connect <span class="bi bi-arrow" aria-hidden="true"></span></button>
+          <p class="link-target hint" hidden></p><p class="server-error error" role="alert"></p>
+        </form>
+      </div>
+      <section class="server-section" aria-label="Servers on this drive">
+        <div class="list-heading"><h2>Servers on this drive</h2><span class="server-total"></span></div>
+        <div class="server-list" aria-live="polite"></div>
+      </section>
+      <div class="drive-actions"><button class="remove-drive quiet" type="button">Remove drive</button><small class="remove-help hint"></small></div>
+      <p class="remove-drive-error error" role="alert"></p>
+    </section>
+  </template>
+
+  <dialog id="remove-dialog" aria-labelledby="remove-title" aria-describedby="remove-name remove-detail">
+    <span class="tile"><span class="bi bi-server" aria-hidden="true"></span></span>
+    <h2 id="remove-title">Disconnect this server?</h2><p id="remove-name" class="server-name"></p>
+    <p id="remove-detail" class="muted">Disconnecting removes the folder from this drive and closes its open files. The server keeps your device’s approval and groups.</p>
+    <p id="remove-error" class="error" role="alert"></p>
+    <div class="form-actions"><button id="cancel-remove" type="button">Cancel</button><button id="confirm-remove" type="button" class="primary">Disconnect server</button></div>
+  </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

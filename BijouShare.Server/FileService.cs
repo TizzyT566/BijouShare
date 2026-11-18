@@ -1,19 +1,37 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using BijouShare.Shared;
 
 namespace BijouShare.Server;
 
+// Only the administrator audit receives this explanation. The file protocol still returns AccessDenied.
+internal sealed class FileAccessDenial(string detail, Exception? inner = null) : UnauthorizedAccessException(detail, inner);
+internal sealed class FileSharingConflict(string detail) : IOException(detail);
+
 public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
 {
+    internal static string StorageAccount { get; } = GetStorageAccount();
+    private static string GetStorageAccount()
+    {
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        try { return identity.Name; }
+        catch (System.Security.Principal.IdentityNotMappedException) { return identity.User!.Value; }
+    }
     private readonly ReaderWriterLockSlim gate = new();
     private long prunedRevision = -1;
     private readonly ConcurrentDictionary<(Guid principal, Guid Share, string Path), Permission> permissions = new();
     private int permissionCacheMisses;
     private readonly ConcurrentDictionary<Guid, string> shareRoots = new();
-    private readonly string[] protectedRoots = [WindowsPaths.Canonical(store.DataDirectory),
-        WindowsPaths.Canonical(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BijouShare")),
-        WindowsPaths.Canonical(AppContext.BaseDirectory)];
+    private readonly string[] protectedRoots = ProtectedRoots(store.DataDirectory);
+    internal static string[] ProtectedRoots(string dataDirectory)
+    {
+        var programData = WindowsPaths.Canonical(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData));
+        // Older installations can still have private identities in their original ProgramData tree.
+        return [WindowsPaths.Canonical(dataDirectory), WindowsPaths.Canonical(AppContext.BaseDirectory),
+            Path.Combine(programData, "BijouShare"), Path.Combine(programData, "NetworkDrive")];
+    }
     private readonly Dictionary<Guid, OpenHandle> handles = [];
     private readonly List<RangeLock> ranges = [];
     private readonly Dictionary<(Guid Session, Guid Handle, string Path), DirectoryCursor> directoryCursors = [];
@@ -34,6 +52,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         public Location Location { get; set; } = location;
         public uint Access { get; } = access;
         public FileShare Share { get; } = share;
+        public FileShare SharingAccess { get; } = GetSharingAccess(access);
+        public bool ReservesSharing => !Cleaned && SharingAccess != FileShare.None;
+        public bool DeniesDeleteSharing => ReservesSharing && !Share.HasFlag(FileShare.Delete);
         public FileStream? Stream { get; } = stream;
         public bool Directory { get; } = directory;
         public bool AppendOnly { get; } = appendOnly;
@@ -98,7 +119,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     {
         var device = store.Identity(deviceId);
         var principal = device; // Re-evaluated even on existing handles.
-        if (authenticatedDevice is not null && !SameBinding(device, authenticatedDevice))
+        if (authenticatedDevice is not null && !device.HasSameIdentity(authenticatedDevice))
             throw new UnauthorizedAccessException("The device binding changed. Authenticate again.");
         if (request.Operation == "Ping")
             return new();
@@ -133,7 +154,11 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             throw new RemoteException("InvalidHandle");
         var location = handle?.Location ?? Resolve(request.Path);
         if (handle?.Stream is not null && request.Operation is "Read" or "Write" or "Flush" or "Stat" or "Security")
+        {
             CheckShare(location); // An already-open OS handle cannot be redirected by a later path/junction change.
+            if (IsClientProfilePath(location.Physical))
+                throw new UnauthorizedAccessException();
+        }
         else
             CheckLocation(location);
         return request.Operation switch
@@ -156,9 +181,6 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             _ => throw new RemoteException("Unsupported")
         };
     }
-
-    private static bool SameBinding(Device current, Device authenticated) => current.Id == authenticated.Id &&
-        current.ClientPublicKey == authenticated.ClientPublicKey && current.ServerPublicKey == authenticated.ServerPublicKey;
 
     private static RpcResponse OpenRoot(RpcRequest request)
     {
@@ -194,10 +216,45 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         path.Equals(root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) ||
         path.Equals(root, StringComparison.OrdinalIgnoreCase) ||
         path.StartsWith(root.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+    internal static bool IsProtectedExportPath(string canonicalPath, string[] protectedRoots)
+    {
+        if (protectedRoots.Any(root => Within(canonicalPath, root)))
+            return true;
+        return IsClientProfilePath(canonicalPath);
+    }
+
+    private static bool IsClientProfilePath(string path)
+    {
+        if (path.EndsWith(@"\.bijoushare", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains(@"\.bijoushare\", StringComparison.OrdinalIgnoreCase))
+            return true;
+        const string defaultBase = @"\AppData\Local\BijouShare\Client";
+        if (path.EndsWith(defaultBase, StringComparison.OrdinalIgnoreCase) ||
+            path.Contains(defaultBase + "\\", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Custom profile bases can be on any drive. Only probe SID components:
+        // normal shares and their file operations do not need any extra file I/O.
+        var offset = 0;
+        while ((offset = path.IndexOf(@"\S-1-", offset, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            var end = path.IndexOf('\\', offset + 1);
+            var directory = end < 0 ? path : path[..end];
+            var component = directory.AsSpan(offset + 5);
+            if (component.Length != 0 && component.IndexOfAnyExcept("0123456789-") < 0 &&
+                (WindowsPaths.TryGetAttributes(Path.Combine(directory, ".instance.lock"), out _) ||
+                 WindowsPaths.TryGetAttributes(Path.Combine(directory, "client.json"), out _)))
+                return true;
+            if (end < 0)
+                break;
+            offset = end;
+        }
+        return false;
+    }
     private void CheckLocation(Location location)
     {
         CheckShare(location);
-        if (protectedRoots.Any(root => Within(location.Physical, root)))
+        if (IsProtectedExportPath(location.Physical, protectedRoots))
             throw new UnauthorizedAccessException();
         var currentPath = location.Physical;
         while (!string.IsNullOrEmpty(currentPath))
@@ -228,8 +285,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     }
     private void Demand(Location location, Device principal, Permission permission)
     {
-        if ((Effective(location, principal) & permission) != permission)
-            throw new UnauthorizedAccessException();
+        var missing = permission & ~Effective(location, principal);
+        if (missing != Permission.None)
+            throw new FileAccessDenial($"Device group permissions do not grant {missing} on {Virtual(location)}.");
     }
     private Location Parent(Location location)
     {
@@ -336,7 +394,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 StateStore.NormalizeRelative(entry.Name);
                 var child = new Location(location.Share, (location.Relative.Length == 0 ? "" : location.Relative + "/") + entry.Name,
                     Path.Combine(location.Physical, entry.Name));
-                if (protectedRoots.Any(root => Within(child.Physical, root)))
+                if (IsProtectedExportPath(child.Physical, protectedRoots))
                     continue;
                 Demand(child, principal, Permission.ReadAttributes);
                 // FindFirst/FindNext already returns these fields. Reopening/stat-ing every child
@@ -415,23 +473,21 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             throw new RemoteException("NotADirectory");
         directory |= request.Directory;
         DemandHandleAccess(location, principal, request.Access, directory);
-        if (request.Mode is FileMode.Create or FileMode.Truncate or FileMode.Append && !directory)
-            Demand(location, principal, Permission.WriteData);
+        var write = AccessMask.Writes(request.Access);
+        if (!directory && !write &&
+            (request.Mode is FileMode.Truncate or FileMode.Append || existed && request.Mode == FileMode.Create))
+            throw new UnauthorizedAccessException();
         if (!existed)
         {
             var parent = Parent(location);
             Demand(parent, principal, directory ? Permission.CreateDirectories : Permission.CreateFiles);
             if (!Directory.Exists(parent.Physical))
                 throw new DirectoryNotFoundException();
-            if (!directory && !AccessMask.Writes(request.Access))
-                throw new UnauthorizedAccessException();
             ValidateAttributes(request.Attributes);
         }
-        if (!directory && request.Mode is (FileMode.Create or FileMode.Truncate or FileMode.Append) && !AccessMask.Writes(request.Access))
-            throw new UnauthorizedAccessException();
         if (directory && existed && request.Mode is FileMode.Create or FileMode.Truncate or FileMode.Append)
             throw new UnauthorizedAccessException();
-        CheckSharing(location.Physical, request.Access, request.Share, null, directory);
+        CheckSharing(location.Physical, request.Access, request.Share, directory);
         FileStream? stream = null;
         try
         {
@@ -440,17 +496,27 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 if (!existed)
                     Directory.CreateDirectory(location.Physical);
             }
-            else if (AccessMask.Reads(request.Access) || AccessMask.Writes(request.Access))
+            else if (!existed && !write)
             {
-                var write = AccessMask.Writes(request.Access);
+                // Adding a new directory entry is a parent right. The resulting handle can
+                // be metadata-only or read-only, even if the device may never write file data.
+                stream = CreateWithoutWriteAccess(location.Physical, AccessMask.Reads(request.Access), request.Attributes);
+            }
+            else if (AccessMask.Reads(request.Access) || write)
+            {
                 var access = AccessMask.Reads(request.Access) ? (write ? FileAccess.ReadWrite : FileAccess.Read) : FileAccess.Write;
                 // The registry enforces each caller's FILE_SHARE flags. Physical sharing also excludes external writers.
-                var mode = request.Mode == FileMode.Append ? FileMode.OpenOrCreate : request.Mode;
+                var mode = !existed ? FileMode.CreateNew : request.Mode switch
+                {
+                    FileMode.Append or FileMode.OpenOrCreate => FileMode.Open,
+                    FileMode.Create => FileMode.Truncate,
+                    _ => request.Mode
+                };
                 stream = new FileStream(location.Physical, mode, access,
                     write ? FileShare.Read | FileShare.Delete : FileShare.ReadWrite | FileShare.Delete, 4096,
                     FileOptions.RandomAccess | (request.WriteThrough ? FileOptions.WriteThrough : FileOptions.None));
             }
-            if (!existed && request.Attributes != 0)
+            if (!existed && (directory || write) && request.Attributes != 0)
             {
                 ApplyAttributes(location, request.Attributes);
             }
@@ -473,25 +539,65 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 Existed = existed
             };
         }
+        catch (UnauthorizedAccessException ex) when (ex is not FileAccessDenial)
+        {
+            var operation = existed ? "opening the item" : directory ? "creating the folder" : "creating the file";
+            throw new FileAccessDenial($"Windows denied storage access for {StorageAccount} while {operation}. Check the NTFS permissions on the item and its parent.", ex);
+        }
         finally { stream?.Dispose(); }
     }
-    private void CheckSharing(string path, uint access, FileShare share, Guid? except, bool directory = false)
+
+    private static FileStream? CreateWithoutWriteAccess(string path, bool read, FileAttributes attributes)
     {
-        foreach (var h in handles.Values.Where(x => x.Id != except && x.Location.Physical.Equals(path, StringComparison.OrdinalIgnoreCase)))
+        // FileStream requires write access for CreateNew. CREATE_NEW on Windows can instead
+        // acquire just the requested read access and still guarantees an atomic collision check.
+        var handle = CreateFileNative(@"\\?\" + path, read ? AccessMask.GenericRead : 0u,
+            FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.CreateNew,
+            (uint)FileOptions.RandomAccess | (uint)(attributes & SettableAttributes), IntPtr.Zero);
+        try
+        {
+            if (handle.IsInvalid)
+            {
+                var hr = Marshal.GetHRForLastWin32Error();
+                var error = Marshal.GetExceptionForHR(hr)!;
+                throw error is COMException ? new IOException(error.Message, hr) : error;
+            }
+            if (read)
+                return new FileStream(handle, FileAccess.Read);
+        }
+        catch { handle.Dispose(); throw; }
+        handle.Dispose();
+        return null;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern SafeFileHandle CreateFileNative(string path, uint access, FileShare share, IntPtr security,
+        FileMode mode, uint flags, IntPtr template);
+
+    private static FileShare GetSharingAccess(uint access)
+    {
+        var required = FileShare.None;
+        if (AccessMask.Reads(access)) required |= FileShare.Read;
+        if (AccessMask.Writes(access)) required |= FileShare.Write;
+        if (AccessMask.Deletes(access)) required |= FileShare.Delete;
+        return required;
+    }
+
+    private static FileSharingConflict SharingConflict(OpenHandle holder, string reason) =>
+        new($"{reason} Device '{holder.Identity.Name}' has '{Virtual(holder.Location)}' open (access 0x{holder.Access:X8}, sharing {holder.Share}).");
+
+    private void CheckSharing(string path, uint access, FileShare share, bool directory)
+    {
+        // Attribute, security and synchronize-only opens do not participate in Windows share-mode checks.
+        var required = GetSharingAccess(access);
+        if (required == FileShare.None)
+            return;
+        foreach (var h in handles.Values.Where(x => x.Location.Physical.Equals(path, StringComparison.OrdinalIgnoreCase)))
         {
             if (!directory && AccessMask.Writes(access) && h.Writer)
-                throw new RemoteException("SharingViolation");
-            // Cleanup ends the application's share-access reservation. A mapped reference may still
-            // retain the stream/writer lease until final close, but must not block ordinary readers.
-            if (h.Cleaned)
-                continue;
-            if (AccessMask.Reads(access) && !h.Share.HasFlag(FileShare.Read) ||
-                AccessMask.Writes(access) && !h.Share.HasFlag(FileShare.Write) ||
-                AccessMask.Deletes(access) && !h.Share.HasFlag(FileShare.Delete) ||
-                AccessMask.Reads(h.Access) && !share.HasFlag(FileShare.Read) ||
-                AccessMask.Writes(h.Access) && !share.HasFlag(FileShare.Write) ||
-                AccessMask.Deletes(h.Access) && !share.HasFlag(FileShare.Delete))
-                throw new RemoteException("SharingViolation");
+                throw SharingConflict(h, "A writable file handle is already open.");
+            if (h.ReservesSharing && ((required & ~h.Share) != 0 || (h.SharingAccess & ~share) != 0))
+                throw SharingConflict(h, $"Requested access 0x{access:X8} with sharing {share} conflicts with an open handle.");
         }
     }
     private OpenHandle GetHandle(Guid session, Guid id) => handles.TryGetValue(id, out var h) && h.Session == session
@@ -616,8 +722,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     }
     private void Mutation(Location location, OpenHandle? handle)
     {
-        if (handles.Values.Any(x => x.Id != handle?.Id && x.Writer && x.Location.Physical.Equals(location.Physical, StringComparison.OrdinalIgnoreCase)))
-            throw new RemoteException("SharingViolation");
+        var writer = handles.Values.FirstOrDefault(x => x.Id != handle?.Id && x.Writer && x.Location.Physical.Equals(location.Physical, StringComparison.OrdinalIgnoreCase));
+        if (writer is not null)
+            throw SharingConflict(writer, "A writable file handle is still open.");
     }
     private void MetadataMutation(Location location, Device principal, OpenHandle? h)
     {
@@ -626,20 +733,19 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             throw new UnauthorizedAccessException();
         Mutation(location, h);
     }
+    private const FileAttributes SettableAttributes = FileAttributes.ReadOnly | FileAttributes.Hidden | FileAttributes.System |
+        FileAttributes.Archive | FileAttributes.Temporary | FileAttributes.NotContentIndexed;
+
     private static void ValidateAttributes(FileAttributes attributes)
     {
-        const FileAttributes allowed = FileAttributes.ReadOnly | FileAttributes.Hidden | FileAttributes.System |
-            FileAttributes.Archive | FileAttributes.Normal | FileAttributes.NotContentIndexed;
-        if ((attributes & ~(allowed | FileAttributes.Directory)) != 0)
+        if ((attributes & ~(SettableAttributes | FileAttributes.Normal | FileAttributes.Directory)) != 0)
             throw new RemoteException("Unsupported");
     }
     private static void ApplyAttributes(Location location, FileAttributes attributes)
     {
         ValidateAttributes(attributes);
-        const FileAttributes allowed = FileAttributes.ReadOnly | FileAttributes.Hidden | FileAttributes.System |
-            FileAttributes.Archive | FileAttributes.Normal | FileAttributes.NotContentIndexed;
         var directory = Directory.Exists(location.Physical);
-        File.SetAttributes(location.Physical, (attributes & allowed & ~FileAttributes.Normal) |
+        File.SetAttributes(location.Physical, (attributes & SettableAttributes) |
             (directory ? FileAttributes.Directory : 0));
     }
     private RpcResponse SetAttributes(Location location, Device principal, OpenHandle? h, FileAttributes attributes)
@@ -670,8 +776,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             throw new UnauthorizedAccessException();
         Mutation(location, h);
         foreach (var other in handles.Values.Where(x => x.Id != h?.Id && Within(x.Location.Physical, location.Physical)))
-            if (!other.Share.HasFlag(FileShare.Delete))
-                throw new RemoteException("SharingViolation");
+            if (other.DeniesDeleteSharing)
+                throw SharingConflict(other, "An open handle prevents deletion.");
         if (Directory.Exists(location.Physical) && Directory.EnumerateFileSystemEntries(location.Physical).Any())
             throw new RemoteException("NotEmpty");
         if ((File.GetAttributes(location.Physical) & FileAttributes.ReadOnly) != 0)
@@ -716,8 +822,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         Mutation(destination, source.Physical.Equals(destination.Physical, StringComparison.OrdinalIgnoreCase) ? h : null);
         foreach (var other in handles.Values.Where(x => x.Id != h?.Id &&
             (Within(x.Location.Physical, source.Physical) || x.Location.Physical.Equals(destination.Physical, StringComparison.OrdinalIgnoreCase))))
-            if (!other.Share.HasFlag(FileShare.Delete) || other.Writer)
-                throw new RemoteException("SharingViolation");
+            if (other.DeniesDeleteSharing || other.Writer)
+                throw SharingConflict(other, "An open handle prevents the rename.");
         // A directory rename must not move unreadable descendants into a more permissive path.
         var scopes = store.Read(s => s.Shares.Where(x => x.Enabled &&
                 string.Equals(Path.GetPathRoot(x.LocalPath), Path.GetPathRoot(source.Physical), StringComparison.OrdinalIgnoreCase))
@@ -732,10 +838,18 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 throw new RemoteException("IsDirectory");
             Demand(destination, principal, Permission.Delete | Permission.WriteData);
         }
-        if (directory)
-            Directory.Move(source.Physical, destination.Physical);
-        else
-            File.Move(source.Physical, destination.Physical, request.Replace);
+        try
+        {
+            if (directory)
+                Directory.Move(source.Physical, destination.Physical);
+            else
+                File.Move(source.Physical, destination.Physical, request.Replace);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException && (ex.HResult & 0xffff) == 5)
+        {
+            // Windows can also refuse a directory move while a file inside it is open.
+            throw new FileAccessDenial($"Windows denied the rename on backing storage for {StorageAccount}. Check for open files and verify permissions on the source and destination folders.", ex);
+        }
         // Enumerators are bound to the original physical directory. Discard them before a
         // renamed/recreated path can reuse that cursor and expose entries from the moved tree.
         ClearDirectoryCursors();
@@ -796,11 +910,11 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                             return (Permission.None, Permission.None);
                         var allow = Permission.None;
                         var deny = Permission.None;
-                        foreach (var rule in s.Rules.Where(x => x.GroupId == group.Id && x.ShareId == scope.Share.Id &&
-                            (x.Path.Equals(relative, StringComparison.OrdinalIgnoreCase) || x.Inherit && StateStore.AtOrBelow(relative, x.Path))))
+                        foreach (var rule in s.Rules.Where(x => x.GroupId == group.Id && x.ShareId == scope.Share.Id))
                         {
-                            allow |= rule.Allow;
-                            deny |= rule.Deny;
+                            var matching = rule.MatchingPermissions(relative);
+                            allow |= matching.Allow;
+                            deny |= matching.Deny;
                         }
                         return (allow & ~deny, deny);
                     }
@@ -852,12 +966,24 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         {
             if ((store.Permissions(principal, share.Id, "") & Permission.ReadAttributes) == 0)
                 continue;
-            var root = Path.GetPathRoot(share.LocalPath)!;
-            if (!roots.Add(root))
-                continue;
-            var drive = new DriveInfo(root);
-            free += drive.AvailableFreeSpace;
-            total += drive.TotalSize;
+            try
+            {
+                var path = shareRoots.GetOrAdd(share.Id, _ => WindowsPaths.Canonical(share.LocalPath));
+                if (IsProtectedExportPath(path, protectedRoots))
+                    continue;
+                var root = Path.GetPathRoot(path)!;
+                if (!roots.Add(root))
+                    continue;
+                var drive = new DriveInfo(root);
+                var available = drive.AvailableFreeSpace;
+                var capacity = drive.TotalSize;
+                free += available;
+                total += capacity;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Removable volumes may be unready after resume. Keep reporting the healthy volumes.
+            }
         }
         return new()
         {
@@ -891,7 +1017,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             {
                 var identity = store.Identity(h.Identity.Id);
                 var owner = identity;
-                if (!SameBinding(identity, h.Identity))
+                if (!identity.HasSameIdentity(h.Identity))
                 {
                     Release(h);
                     continue;
@@ -937,6 +1063,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     public static string ErrorCode(Exception exception) => exception switch
     {
         RemoteException remote => remote.Code,
+        FileSharingConflict => "SharingViolation",
         UnauthorizedAccessException => "AccessDenied",
         FileNotFoundException or DirectoryNotFoundException => "NotFound",
         ArgumentException or NotSupportedException => "InvalidParameter",

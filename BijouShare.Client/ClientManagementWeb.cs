@@ -8,9 +8,10 @@ namespace BijouShare.Client;
 
 public static class ClientManagementWeb
 {
-    public sealed record DeviceUpdate(string DeviceName, string MountPoint);
-    public sealed record ServerRequest(string? Uri = null, string? Host = null, int Port = 7443, string? InviteCode = null);
-    public sealed record ServerRemoval(string Host, int Port);
+    public sealed record DeviceUpdate(string DeviceName);
+    public sealed record DriveRequest(string MountPoint);
+    public sealed record ServerRequest(string Uri, string? MountPoint = null);
+    public sealed record ServerRemoval(string Host, int Port, string? MountPoint = null);
 
     public static void AddServices(IServiceCollection services)
     {
@@ -78,16 +79,15 @@ public static class ClientManagementWeb
         }));
         app.MapGet("/api/state", (ClientManagement management) => Results.Ok(management.Snapshot()));
         app.MapPut("/api/device", (DeviceUpdate update, ClientManagement management, CancellationToken token) =>
-            Change(async () => await management.UpdateDeviceAsync(update.DeviceName, update.MountPoint, token), management));
+            Change(() => management.UpdateDeviceAsync(update.DeviceName, token), management));
+        app.MapPost("/api/drives", (DriveRequest request, ClientManagement management, CancellationToken token) =>
+            Change(() => management.ChangeDriveAsync(request.MountPoint, remove: false, token), management));
+        app.MapPost("/api/drives/remove", (DriveRequest request, ClientManagement management, CancellationToken token) =>
+            Change(() => management.ChangeDriveAsync(request.MountPoint, remove: true, token), management));
         app.MapPost("/api/servers", (ServerRequest request, ClientManagement management, CancellationToken token) =>
-            Change(async () =>
-            {
-                var link = request.Uri is { Length: > 0 } uri ? WadUri.Parse(uri)
-                    : new WadUri(request.Host ?? throw new ArgumentException("Enter a server link or host."), request.Port, request.InviteCode);
-                await management.AddServerAsync(link, token);
-            }, management));
+            Change(() => management.AddServerAsync(WadUri.Parse(request.Uri), request.MountPoint, token), management));
         app.MapPost("/api/servers/remove", (ServerRemoval request, ClientManagement management, CancellationToken token) =>
-            Change(async () => await management.RemoveServerAsync(request.Host, request.Port, token), management));
+            Change(async () => await management.RemoveServerAsync(request.Host, request.Port, request.MountPoint, token), management));
         app.MapPost("/api/refresh", (ClientManagement management, CancellationToken token) =>
             Change(async () => { await management.RefreshAsync(token); }, management));
     }

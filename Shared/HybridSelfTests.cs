@@ -78,120 +78,105 @@ public static class HybridSelfTests
             using var serverEphemeral = KeyAgreement.NewKey();
             var identity = Keep(KeyAgreement.Agree(clientIdentity, serverIdentity.ExportSubjectPublicKeyInfo()));
             var ephemeral = Keep(KeyAgreement.Agree(clientEphemeral, serverEphemeral.ExportSubjectPublicKeyInfo()));
-            var serverPublic = serverIdentity.ExportSubjectPublicKeyInfo();
-            var hello = new ClientHello(Wire.Version, Guid.NewGuid().ToString(), RandomNumberGenerator.GetBytes(32), clientEphemeral.ExportSubjectPublicKeyInfo())
+            using var persistentKem = HybridKem.Generate();
+            var persistentPublic = persistentKem.ExportPublicKey();
+            var seed = Keep(persistentKem.ExportPrivateSeed());
+            using var restored = HybridKem.ImportPrivateSeed(seed);
+            Check(restored.ExportPublicKey().AsSpan().SequenceEqual(persistentPublic),
+                "Restoring a protected ML-KEM seed retains its identity public key");
+            var staticChallenge = HybridKem.Encapsulate(persistentPublic);
+            var staticSecret = Keep(staticChallenge.Secret);
+            Check(KeyAgreement.Equals(staticSecret, Keep(restored.Decapsulate(staticChallenge.Ciphertext))),
+                "The restored identity key opens a fresh possession challenge");
+            var generator = Convert.FromHexString("3059301306072a8648ce3d020106082a8648ce3d03010703420004" +
+                "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296" +
+                "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+            Check(DeviceIdentity.Id(generator, new byte[HybridKem.PublicKeySize]) ==
+                "709c897923c6641ab9fc76a96723b4515e884c41a8a563d24391d08030a50140",
+                "A fixed P-256 SPKI and canonical ML-KEM encoding match the independent v6 fingerprint vector");
+            var vector = Enumerable.Range(0, 192).Select(i => (byte)i).ToArray();
+            var vectorSecret = Keep(KeyAgreement.SessionSecret(vector[..32], vector[32..64], vector[64..96], vector[96..128], vector[128..160]));
+            Check(Convert.ToHexStringLower(vectorSecret) == "872c95f69e4e254ee0d0580c20693063903f42e0c9cd3d14f8e397a937b28757" &&
+                Convert.ToHexStringLower(KeyAgreement.Proof(vectorSecret, vector[160..], "server")) ==
+                    "0993040f7200b8ae44a71e6265ed72fcf616cdff4ded701813191e1f14f534ab" &&
+                Convert.ToHexStringLower(Keep(KeyAgreement.SessionMaterial(vectorSecret, vector[160..]))) ==
+                    "fb8a1d3710bed58b8fd982120ed763d0ba8a90f9be47f6bbbf811a2b6e1785d7cc819250ed70ae8e324ae792a260f1a5d7fa4253cf6834f91bbd2d60cb38c61be6903e2b87ee4169",
+                "Independent SHA3 vectors match the hybrid combiner, server proof and directional traffic material");
+            var canonicalPublic = clientIdentity.ExportSubjectPublicKeyInfo();
+            var id = DeviceIdentity.Id(canonicalPublic, persistentPublic);
+            Check(id == Convert.ToHexStringLower(SHA3_256.HashData([.. canonicalPublic, .. persistentPublic])) &&
+                ServerIdentityNaming.Id(canonicalPublic, persistentPublic) == id,
+                "Client and server use the same SHA3-256 fingerprint over the exact canonical public keys");
+            Check(DeviceIdentity.Id(serverIdentity.ExportSubjectPublicKeyInfo(), persistentPublic) != id &&
+                DeviceIdentity.Id(canonicalPublic, publicKey) != id, "Changing either persistent key changes the full fingerprint");
+            using var serverKem = HybridKem.Generate();
+            var serverKemPublic = serverKem.ExportPublicKey();
+            var toServer = HybridKem.Encapsulate(serverKemPublic);
+            Keep(toServer.Secret);
+            var serverKemSecret = Keep(serverKem.Decapsulate(toServer.Ciphertext));
+            var secret = Keep(KeyAgreement.SessionSecret(identity, ephemeral, staticSecret, toServer.Secret, recovered));
+            var serverSecret = Keep(KeyAgreement.SessionSecret(
+                Keep(KeyAgreement.Agree(serverIdentity, canonicalPublic)),
+                Keep(KeyAgreement.Agree(serverEphemeral, clientEphemeral.ExportSubjectPublicKeyInfo())),
+                staticSecret, serverKemSecret, first.Secret));
+            Check(KeyAgreement.Equals(secret, serverSecret), "The peers independently derive the same bidirectional hybrid secret");
+            Check(KeyAgreement.Equals(secret, SHA3_256.HashData([
+                .. SHA3_256.HashData([.. identity, .. ephemeral]),
+                .. SHA3_256.HashData([.. staticSecret, .. serverKemSecret, .. first.Secret])])),
+                "The hybrid secret combines raw P-256 and ML-KEM shared contributions with SHA3-256");
+            var inputs = new[] { identity, ephemeral, staticSecret, serverKemSecret, first.Secret };
+            for (var i = 0; i < inputs.Length; i++)
             {
-                CryptoSuite = Wire.CryptoSuite,
-                MlKemPublicKey = publicKey,
-                DeviceName = "Hybrid regression device",
-                ClientPublicKey = Convert.ToBase64String(clientIdentity.ExportSubjectPublicKeyInfo()),
-                ServerIdentityMetadata = true,
-                BinaryPayloads = true
-            };
-            var response = new ServerHello(RandomNumberGenerator.GetBytes(32), serverEphemeral.ExportSubjectPublicKeyInfo(), [])
-            {
-                Version = Wire.Version,
-                CryptoSuite = Wire.CryptoSuite,
-                MlKemCiphertext = first.Ciphertext,
-                IdentityPublicKey = serverPublic,
-                ServerName = "HybridServer",
-                ServerId = ServerIdentityNaming.Id("HybridServer", serverPublic),
-                GlobalIdentityPublicKey = serverPublic
-            };
-            var transcript = KeyAgreement.Transcript(hello, response, serverPublic);
-            var material = Keep(KeyAgreement.SessionMaterial(identity, ephemeral, first.Secret, transcript));
-            Check(material.Length == 72 && !material.AsSpan(0, 32).SequenceEqual(material.AsSpan(32, 32)),
-                "The hybrid schedule creates independent directional AES-256 keys and nonce prefixes");
-            Check(!KeyAgreement.Equals(material, Keep(KeyAgreement.SessionMaterial(Keep(Flip(identity)), ephemeral, first.Secret, transcript))) &&
-                !KeyAgreement.Equals(material, Keep(KeyAgreement.SessionMaterial(identity, Keep(Flip(ephemeral)), first.Secret, transcript))) &&
-                !KeyAgreement.Equals(material, Keep(KeyAgreement.SessionMaterial(identity, ephemeral, Keep(Flip(first.Secret)), transcript))),
-                "Every static ECDH, ephemeral ECDH, and ML-KEM contribution affects the traffic keys");
-            var serverProof = KeyAgreement.HybridProof(identity, ephemeral, first.Secret, transcript, "server");
-            Check(KeyAgreement.Equals(serverProof, KeyAgreement.HybridProof(identity, ephemeral, recovered, transcript, "server")) &&
-                !KeyAgreement.Equals(serverProof, KeyAgreement.HybridProof(identity, ephemeral, first.Secret, transcript, "client")) &&
-                !KeyAgreement.Equals(serverProof, KeyAgreement.HybridProof(identity, ephemeral, first.Secret, transcript, "server-identity")),
-                "Hybrid key confirmation agrees between peers and separates server, client, and global-identity roles");
-            var rejectedSecret = Keep(recipient.Decapsulate(Flip(first.Ciphertext)));
-            Check(!KeyAgreement.Equals(first.Secret, rejectedSecret) &&
-                !KeyAgreement.Equals(serverProof, KeyAgreement.HybridProof(identity, ephemeral, rejectedSecret, transcript, "server")),
-                "ML-KEM implicit rejection produces a different secret and fails authenticated key confirmation");
-            Check(!KeyAgreement.Equals(material, Keep(KeyAgreement.SessionMaterial(identity, ephemeral, first.Secret, Flip(transcript)))) &&
-                !KeyAgreement.Equals(serverProof, KeyAgreement.HybridProof(identity, ephemeral, first.Secret, Flip(transcript), "server")),
-                "Fresh or modified transcripts change both traffic keys and authentication proofs");
-
-            void Bound(ClientHello changedHello, ServerHello changedResponse, string label) =>
-                Check(!KeyAgreement.Equals(transcript, KeyAgreement.Transcript(changedHello, changedResponse, serverPublic)), label);
-            Bound(hello with
-            {
-                Version = Wire.Version - 1
-            }, response, "The client protocol version is bound to hybrid authentication");
-            Bound(hello, response with
-            {
-                Version = Wire.Version - 1
-            }, "The server protocol version is bound to hybrid authentication");
-            Bound(hello with
-            {
-                CryptoSuite = "classical-only"
-            }, response, "The client cipher suite cannot be stripped or replaced without detection");
-            Bound(hello, response with
-            {
-                CryptoSuite = "classical-only"
-            }, "The server cipher suite cannot be stripped or replaced without detection");
-            Bound(hello with
-            {
-                MlKemPublicKey = freshRecipient.ExportPublicKey()
-            }, response,
-                "The client's ephemeral ML-KEM public key is bound to the authenticated transcript");
-            Bound(hello, response with
-            {
-                MlKemCiphertext = second.Ciphertext
-            },
-                "The server's ML-KEM ciphertext is bound to the authenticated transcript");
-            Bound(hello with
-            {
-                MlKemPublicKey = null
-            }, response, "Omitting the ML-KEM public key changes the authenticated transcript");
-            Bound(hello, response with
-            {
-                MlKemCiphertext = null
-            }, "Omitting the ML-KEM ciphertext changes the authenticated transcript");
-            Bound(hello with
-            {
-                InviteEnrollment = true
-            }, response, "Invitation capability is bound to the hybrid transcript");
-            Bound(hello, response with
-            {
-                InviteEnrollment = true
-            }, "Invitation acknowledgement is bound to the hybrid transcript");
-            Bound(hello, response with
-            {
-                PendingApproval = true
-            }, "The pending/approved decision is bound to the hybrid transcript");
-            Bound(hello, response with
-            {
-                ServerName = "AnotherServer"
-            }, "The server name is bound to the hybrid transcript");
-            Bound(hello, response with
-            {
-                GlobalIdentityPublicKey = clientIdentity.ExportSubjectPublicKeyInfo()
-            },
-                "The pinned global server identity is bound to the hybrid transcript");
-            Check(KeyAgreement.Equals(transcript, KeyAgreement.Transcript(hello, response with
-            {
-                Proof = RandomNumberGenerator.GetBytes(32),
-                ServerIdentityProof = RandomNumberGenerator.GetBytes(32)
-            }, serverPublic)), "Authentication proofs are excluded from their own transcript to avoid circular key derivation");
-            foreach (var length in new[] { 31, 33 })
-            {
-                Reject(() => KeyAgreement.SessionMaterial(new byte[length], ephemeral, first.Secret, transcript),
-                    "The hybrid schedule rejects an invalid static ECDH secret length");
-                Reject(() => KeyAgreement.SessionMaterial(identity, new byte[length], first.Secret, transcript),
-                    "The hybrid schedule rejects an invalid ephemeral ECDH secret length");
-                Reject(() => KeyAgreement.SessionMaterial(identity, ephemeral, new byte[length], transcript),
-                    "The hybrid schedule rejects an invalid ML-KEM secret length");
-                Reject(() => KeyAgreement.HybridProof(identity, ephemeral, first.Secret, new byte[length], "server"),
-                    "Hybrid authentication rejects an invalid transcript hash length");
+                var changed = inputs.ToArray();
+                changed[i] = Keep(Flip(changed[i]));
+                Check(!KeyAgreement.Equals(secret, Keep(KeyAgreement.SessionSecret(changed[0],changed[1],changed[2],changed[3],changed[4]))),
+                    $"Hybrid secret contribution {i + 1} affects authentication and traffic keys");
             }
+            var hello = new ClientHello(Wire.Version, id, RandomNumberGenerator.GetBytes(32), clientEphemeral.ExportSubjectPublicKeyInfo())
+            {
+                CryptoSuite = Wire.CryptoSuite, ClientPublicKey = Convert.ToBase64String(canonicalPublic), DeviceName = "Device",
+                IdentityMlKemPublicKey = persistentPublic, MlKemPublicKey = publicKey, BinaryPayloads = true
+            };
+            var serverPublic = serverIdentity.ExportSubjectPublicKeyInfo();
+            var response = new ServerHello(RandomNumberGenerator.GetBytes(32),serverEphemeral.ExportSubjectPublicKeyInfo())
+            {
+                Version = Wire.Version, CryptoSuite = Wire.CryptoSuite, GlobalIdentityPublicKey = serverPublic, ServerMlKemPublicKey = serverKemPublic,
+                ServerName = "Server", ServerId = ServerIdentityNaming.Id(serverPublic, serverKemPublic),
+                MlKemCiphertext = first.Ciphertext, IdentityMlKemCiphertext = staticChallenge.Ciphertext
+            };
+            var exchange = new ClientKeyExchange(toServer.Ciphertext);
+            var transcript = KeyAgreement.Transcript(hello, response, exchange);
+            var serverProof = KeyAgreement.Proof(serverSecret, transcript, "server");
+            var clientProof = KeyAgreement.Proof(secret, transcript, "client");
+            Check(KeyAgreement.Equals(serverProof, KeyAgreement.Proof(secret, transcript, "server")) && !KeyAgreement.Equals(clientProof, serverProof),
+                "Fresh client and server key confirmation proofs agree only for the designated sender");
+            var traffic = Keep(KeyAgreement.SessionMaterial(secret, transcript));
+            Check(traffic.Length == 72 && !traffic.AsSpan(0,32).SequenceEqual(traffic.AsSpan(32,32)) &&
+                !traffic.AsSpan(0,32).SequenceEqual(clientProof) && !traffic.AsSpan(32,32).SequenceEqual(serverProof),
+                "Directional AES-256 keys and nonce prefixes are separate from confirmation proofs");
+            void Bound(ClientHello h, ServerHello r, ClientKeyExchange x, string field)
+            {
+                var other = KeyAgreement.Transcript(h, r, x);
+                Check(!KeyAgreement.Equals(serverProof, KeyAgreement.Proof(secret, other, "server")) &&
+                    !KeyAgreement.Equals(traffic, Keep(KeyAgreement.SessionMaterial(secret, other))),
+                    $"{field} is bound to key confirmation and traffic keys");
+            }
+            Bound(hello with { Nonce = Flip(hello.Nonce) }, response, exchange, "Client freshness");
+            Bound(hello,response with { Nonce = Flip(response.Nonce) },exchange,"Server freshness");
+            Bound(hello with { Version = 5 }, response, exchange, "Client protocol version");
+            Bound(hello,response with { CryptoSuite = null },exchange,"Server suite");
+            Bound(hello with { ClientPublicKey = null, IdentityMlKemPublicKey = null }, response, exchange, "Client identity keys");
+            Bound(hello,response with { GlobalIdentityPublicKey = null, ServerMlKemPublicKey = null },exchange,"Server identity keys");
+            Bound(hello,response with { ServerName = "Other" },exchange,"Server display name");
+            Bound(hello,response with { ServerId = id },exchange,"Expected server fingerprint");
+            Bound(hello with { BinaryPayloads = false }, response, exchange, "Transfer negotiation");
+            Bound(hello,response with { PendingApproval = true, InviteEnrollment = true },exchange,"Enrollment status");
+            Bound(hello,response with { IdentityMlKemCiphertext = Flip(staticChallenge.Ciphertext) },exchange,"Challenge to the client identity key");
+            Bound(hello,response with { MlKemCiphertext = Flip(first.Ciphertext) },exchange,"Ephemeral ML-KEM challenge");
+            Bound(hello,response,exchange with { MlKemCiphertext = Flip(exchange.MlKemCiphertext) },"Challenge to the server identity key");
+            Reject(() => KeyAgreement.SessionSecret([],ephemeral,staticSecret,serverKemSecret,first.Secret), "Malformed raw secret length is rejected");
+            Reject(() => KeyAgreement.Proof(secret, [], "server"), "Malformed transcript length is rejected");
+            Reject(() => KeyAgreement.Proof(secret, transcript, "reflection"), "Unknown proof roles are rejected");
         }
         finally
         {

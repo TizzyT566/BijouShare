@@ -4,7 +4,11 @@ using BijouShare.Shared;
 
 namespace BijouShare.Server;
 
-public sealed record AuditEvent(DateTime Time, string Actor, string Action, string Target, string Result);
+public sealed record AuditEvent(DateTime Time, string Actor, string Action, string Target, string Result)
+{
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? Detail { get; init; }
+}
 public sealed class AuditLog : IDisposable
 {
     private readonly StateStore store;
@@ -35,12 +39,12 @@ public sealed class AuditLog : IDisposable
         writerTask = Task.Run(DrainAsync);
     }
     public AuditEvent[] Recent() => recent.Reverse().Take(200).ToArray();
-    public void Write(string actor, string action, string target, string result = "OK")
+    public void Write(string actor, string action, string target, string result = "OK", string? detail = null)
     {
         lock (lifecycle)
         {
             ObjectDisposedException.ThrowIf(disposed != 0, this);
-            var entry = Record(actor, action, target, result);
+            var entry = Record(actor, action, target, result, detail);
             Persist(entry, flush: true);
         }
     }
@@ -54,9 +58,12 @@ public sealed class AuditLog : IDisposable
                 Persist(entry, flush: true); // Bounded backpressure; never drop audit evidence.
         }
     }
-    private AuditEvent Record(string actor, string action, string target, string result)
+    private AuditEvent Record(string actor, string action, string target, string result, string? detail = null)
     {
-        var entry = new AuditEvent(clock.GetUtcNow().UtcDateTime, Limit(actor, 200), Limit(action, 80), Limit(target, 2048), Limit(result, 200));
+        var entry = new AuditEvent(clock.GetUtcNow().UtcDateTime, Limit(actor, 200), Limit(action, 80), Limit(target, 2048), Limit(result, 200))
+        {
+            Detail = detail is null ? null : Limit(detail, 512)
+        };
         recent.Enqueue(entry);
         while (recent.Count > 200)
             recent.TryDequeue(out _);

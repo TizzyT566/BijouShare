@@ -1,5 +1,7 @@
-using System.Diagnostics;
 using System.Net;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Security.Principal;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Antiforgery;
@@ -13,6 +15,31 @@ try
 {
     if (!OperatingSystem.IsWindows())
         throw new PlatformNotSupportedException("BijouShare requires Windows.");
+    if (args.Contains("--open-management", StringComparer.Ordinal))
+    {
+        if (args.Length != 1)
+            throw new ArgumentException("Use --open-management by itself to open the installed server's web UI.");
+        if (!Environment.UserInteractive || WindowsServiceHelpers.IsWindowsService())
+            throw new InvalidOperationException("Open server management from a signed-in Windows session.");
+        await ServerTray.OpenInstalledManagementAsync();
+        return 0;
+    }
+    if (args.Contains("--prepare-service-storage", StringComparer.Ordinal))
+    {
+        if (args.Length != 1)
+            throw new ArgumentException("Server storage preparation accepts no options.");
+        try
+        {
+            ServiceStorageSetup.Prepare();
+            return 0;
+        }
+        catch (Exception error) when (error is IOException or InvalidDataException or Win32Exception or
+            UnauthorizedAccessException or System.Security.SecurityException or IdentityNotMappedException)
+        {
+            ReportStorageFailure(error);
+            return 1;
+        }
+    }
     if (args.Contains("--help") || args.Contains("-h"))
     {
         Console.WriteLine("""
@@ -20,16 +47,19 @@ try
 
             BijouShare.Server.exe [--data-dir <absolute-directory>] [configuration options]
             BijouShare.Server.exe --init-admin [--data-dir <absolute-directory>]
+            BijouShare.Server.exe --tray-only
+            BijouShare.Server.exe --open-management
             BijouShare.Server.exe --self-test
             BijouShare.Server.exe --benchmark [--benchmark-output <report.json>]
             BijouShare.Server.exe --create-test-fixture <new-directory>
 
-            Run without arguments to start the server and open first-time setup in its local web UI.
-            --init-admin opens the same setup/sign-in page; existing credentials are not reset.
-            --no-browser starts without opening a browser (for services and diagnostics).
+            Interactive runs show a BijouShare Server notification icon. Click it for setup or sign-in.
+            --init-admin uses the same tray and setup flow and preserves existing credentials.
+            --tray-only shows the icon for the installed server service in your Windows session.
+            --open-management opens the installed server's web UI once in your default browser.
+            --no-browser runs the server headlessly for services and diagnostics.
             Administration defaults to http://127.0.0.1:5080; encrypted file traffic uses TCP 7443.
             Configuration examples: --Server:Port 7443 --Server:ListenAddress 0.0.0.0 --urls http://127.0.0.1:5080
-            Stop an installed instance before using the same data directory from another process.
             """);
         return 0;
     }
@@ -46,6 +76,22 @@ try
         ServerSelfTests.WriteAcceptanceFixture(CommandOption(args, "--create-test-fixture")!);
         return 0;
     }
+    var isService = WindowsServiceHelpers.IsWindowsService();
+    if (args.Contains("--tray-only") && args.Length != 1)
+        throw new ArgumentException("Use --tray-only by itself to open the installed server's notification icon.");
+    if (!isService && Environment.UserInteractive &&
+        (args.Contains("--tray-only") || (args.All(argument => argument == "--init-admin") && ServerTray.IsInstalledExecutable())))
+    {
+        var companion = Path.Combine(AppContext.BaseDirectory, "BijouShare.Server.Tray.exe");
+        if (File.Exists(companion))
+        {
+            using var launched = Process.Start(new ProcessStartInfo(companion, "--tray-only") { UseShellExecute = false });
+            return 0;
+        }
+        return ServerTray.RunCompanion();
+    }
+    if (args.Contains("--tray-only"))
+        throw new ArgumentException("Use --tray-only in a signed-in Windows session.");
     var builder = WebApplication.CreateBuilder(new WebApplicationOptions
     {
         Args = args.Where(argument => argument is not ("--init-admin" or "--no-browser")).ToArray(),
@@ -55,6 +101,11 @@ try
     var options = builder.Configuration.GetSection("Server").Get<ServerOptions>() ?? new();
     if (dataArgument is not null)
         options.DataDirectory = dataArgument;
+    var interactive = !isService && Environment.UserInteractive && !args.Contains("--no-browser");
+    var firstIcon = true;
+    using var iconInstance = interactive ? ServerTray.ClaimStandaloneIcon(options.DataDirectory, out firstIcon) : null;
+    if (!firstIcon && args.All(argument => argument is "--init-admin" or "--data-dir" || argument == dataArgument))
+        return 0;
     using var storageLease = StorageLease.Acquire(options.DataDirectory, includeLocalService: true);
     var store = new StateStore(options);
     builder.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Server");
@@ -63,6 +114,8 @@ try
     builder.Services.AddSingleton<AuditLog>();
     builder.Services.AddSingleton<FileService>();
     builder.Services.AddHostedService<FileServer>();
+    if (isService)
+        builder.Services.AddHostedService<ServerTrayEndpoint>();
     builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(store.DataDirectory, "web-keys")))
         .ProtectKeysWithDpapi(true).SetApplicationName("BijouShare.Server");
     builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(o =>
@@ -124,7 +177,7 @@ try
                 QueueLimit = 0
             }));
     });
-    var app = builder.Build();
+    await using var app = builder.Build();
     app.Use(async (context, next) =>
     {
         context.Response.Headers["X-Content-Type-Options"] = "nosniff";
@@ -172,9 +225,9 @@ try
         await next();
     });
     app.MapAdminApi();
-    if ((!store.IsInitialized || args.Contains("--init-admin")) && !args.Contains("--no-browser") && !WindowsServiceHelpers.IsWindowsService())
-        app.Lifetime.ApplicationStarted.Register(() => OpenManagementBrowser(app.Urls));
-    await app.RunAsync();
+    await app.StartAsync();
+    using var tray = interactive ? ServerTray.StartForHost(app) : null;
+    await app.WaitForShutdownAsync();
     return Environment.ExitCode;
 }
 catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException or UnauthorizedAccessException or
@@ -184,24 +237,30 @@ catch (Exception ex) when (ex is ArgumentException or InvalidOperationException 
     return 1;
 }
 
-static void OpenManagementBrowser(IEnumerable<string> addresses)
+static void ReportStorageFailure(Exception error)
 {
-    var url = addresses.Select(value => Uri.TryCreate(value, UriKind.Absolute, out var uri) ? uri : null)
-        .FirstOrDefault(uri => uri is not null && (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
-            IPAddress.TryParse(uri.Host.Trim('[', ']'), out var address) && IPAddress.IsLoopback(address)))?.AbsoluteUri;
-    if (url is null)
+    var native = error.GetBaseException() as Win32Exception;
+    var reason = native is null ? error.Message : $"{error.Message} (Windows error {native.NativeErrorCode}: {native.Message})";
+    Console.Error.WriteLine($"BijouShare.Server: {reason}");
+    int code = native?.NativeErrorCode ?? (error.HResult & 0xffff);
+    int id = error switch
     {
-        Console.WriteLine("Complete server setup from a loopback web endpoint on this computer.");
-        return;
-    }
-    Console.WriteLine($"Server management: {url}");
+        InvalidDataException => 4202,
+        UnauthorizedAccessException or System.Security.SecurityException => 4201,
+        _ when code == 5 => 4201,
+        _ when code is 32 or 33 => 4203,
+        _ => 4204
+    };
     try
     {
-        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        using var identity = WindowsIdentity.GetCurrent();
+        if (identity.IsSystem)
+            EventLog.WriteEntry("BijouShare.Server", $"Server storage preparation failed. {reason}", EventLogEntryType.Error, id);
     }
-    catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException)
+    catch (Exception loggingError) when (loggingError is Win32Exception or InvalidOperationException or
+        IOException or UnauthorizedAccessException or System.Security.SecurityException)
     {
-        Console.WriteLine($"Open server management in your browser: {url}");
+        // The MSI must retain the original storage failure even when the event log is unavailable.
     }
 }
 

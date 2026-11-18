@@ -16,19 +16,10 @@ public static class ServerIdentityNaming
     public static string ValidateId(string? serverId)
     {
         if (serverId is not { Length: 64 } || serverId.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
-            throw new ArgumentException("The server ID must be a lowercase SHA-256 public-key hash.");
+            throw new ArgumentException("Enter the full 64-character lowercase hexadecimal server fingerprint.");
         return serverId;
     }
-    public static string Id(string name, byte[] publicKey)
-    {
-        using var imported = KeyAgreement.ImportPublic(publicKey);
-        var prefix = System.Text.Encoding.UTF8.GetBytes(ValidateName(name));
-        return Convert.ToHexStringLower(SHA256.HashData([.. prefix, .. imported.ExportSubjectPublicKeyInfo()]));
-    }
-    public static string KeyFingerprint(byte[] publicKey)
-    {
-        using var imported = KeyAgreement.ImportPublic(publicKey);
-        return Convert.ToHexStringLower(SHA256.HashData(imported.ExportSubjectPublicKeyInfo()));
-    }
+    public static string Id(byte[] ecdhSpki, byte[] mlKemPublic) => DeviceIdentity.Id(ecdhSpki, mlKemPublic);
+
     public static string FolderName(string name, string serverId) => ValidateName(name) + "_" + ValidateId(serverId)[..16];
 }

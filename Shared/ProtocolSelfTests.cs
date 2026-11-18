@@ -33,10 +33,8 @@ public static class ProtocolSelfTests
             throw new Exception("Accepted P-384");
         }
         catch (CryptographicException) { Check(true, "Non-P-256 public keys are rejected"); }
-        var kemSecret = RandomNumberGenerator.GetBytes(HybridKem.SharedSecretSize);
-        var material = KeyAgreement.SessionMaterial(a, b, kemSecret, transcript);
-        var other = KeyAgreement.SessionMaterial(a, b, kemSecret, RandomNumberGenerator.GetBytes(32));
-        CryptographicOperations.ZeroMemory(kemSecret);
+        var material = KeyAgreement.SessionMaterial(a, transcript);
+        var other = KeyAgreement.SessionMaterial(a, RandomNumberGenerator.GetBytes(32));
         Check(!KeyAgreement.Equals(material, other), "Fresh challenges produce different traffic keys");
         var stream = new MemoryStream();
         using var sender = new SecureTransport(stream, material, false);
@@ -117,7 +115,7 @@ public static class ProtocolSelfTests
             {
                 await SecureTransport.WritePlainAsync(output, new
                 {
-                    text = new string('x', 8192)
+                    text = new string('x', Wire.MaxHandshakeFrame)
                 }, CancellationToken.None);
                 throw new Exception("Accepted oversized handshake");
             }
@@ -132,52 +130,6 @@ public static class ProtocolSelfTests
             }
             catch (ArgumentException) { Check(true, "Transport key material has an explicit fixed length"); }
         }
-        var legacyHello = new ClientHello(Wire.Version, Guid.NewGuid().ToString(), new byte[32], client.ExportSubjectPublicKeyInfo());
-        Check(!System.Text.Encoding.UTF8.GetString(Wire.Encode(legacyHello)).Contains("binaryPayloads", StringComparison.Ordinal),
-            "Default payload encoding flags are omitted consistently");
-        Check(!KeyAgreement.Equals(KeyAgreement.Transcript(legacyHello, new ServerHello(new byte[32], [], []), []),
-            KeyAgreement.Transcript(legacyHello with
-            {
-                BinaryPayloads = true
-            }, new ServerHello(new byte[32], [], []), [])),
-            "Binary transfer negotiation is bound to the authenticated transcript");
-        var metadataHello = legacyHello with
-        {
-            ServerIdentityMetadata = true,
-            DeviceName = "Device",
-            ClientPublicKey = Convert.ToBase64String(client.ExportSubjectPublicKeyInfo())
-        };
-        var metadataServer = new ServerHello(new byte[32], [], []) { ServerId = ServerIdentityNaming.Id("DarkArchives", server.ExportSubjectPublicKeyInfo()), ServerName = "DarkArchives", GlobalIdentityPublicKey = server.ExportSubjectPublicKeyInfo() };
-        var metadataTranscript = KeyAgreement.Transcript(metadataHello, metadataServer, []);
-        Check(!KeyAgreement.Equals(metadataTranscript, KeyAgreement.Transcript(metadataHello, metadataServer with
-        {
-            ServerName = "OtherServer"
-        }, [])),
-            "Server folder names are authenticated in the handshake transcript");
-        Check(!KeyAgreement.Equals(metadataTranscript, KeyAgreement.Transcript(metadataHello, metadataServer with
-        {
-            ServerId = ServerIdentityNaming.Id("DarkArchives", wrong.ExportSubjectPublicKeyInfo())
-        }, [])),
-            "Persistent server IDs are authenticated in the handshake transcript");
-        Check(!KeyAgreement.Equals(metadataTranscript, KeyAgreement.Transcript(metadataHello, metadataServer with
-        {
-            GlobalIdentityPublicKey = wrong.ExportSubjectPublicKeyInfo()
-        }, [])),
-            "The public key defining the server ID is authenticated in the handshake transcript");
-        Check(!System.Text.Encoding.UTF8.GetString(Wire.Encode(legacyHello)).Contains("serverIdentityMetadata", StringComparison.Ordinal),
-            "Default server metadata flags are omitted consistently");
-        Check(!System.Text.Encoding.UTF8.GetString(Wire.Encode(metadataHello)).Contains("inviteEnrollment", StringComparison.Ordinal),
-            "Ordinary handshakes omit invite enrollment to preserve existing transcript compatibility");
-        var inviteHello = metadataHello with
-        {
-            InviteEnrollment = true
-        };
-        var inviteTranscript = KeyAgreement.Transcript(inviteHello, metadataServer with
-        {
-            InviteEnrollment = true
-        }, []);
-        Check(!KeyAgreement.Equals(inviteTranscript, KeyAgreement.Transcript(inviteHello, metadataServer, [])),
-            "Invite support acknowledgement is bound to the authenticated transcript");
         using (var encryptedInvite = new MemoryStream())
         {
             const string bearerCode = "aBcdEfgHijkLmnOpqRstUvwxYz012345";

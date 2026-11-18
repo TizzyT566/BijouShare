@@ -44,6 +44,7 @@ public sealed class SecureTransport : IDisposable
     {
         get; internal set;
     }
+    public byte[]? RemoteServerMlKemPublicKey { get; internal set; }
     public SecureTransport(Stream stream, byte[] material, bool server, bool binaryPayloads = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -140,12 +141,12 @@ public sealed class SecureTransport : IDisposable
     public static async Task WritePlainAsync<T>(Stream stream, T value, CancellationToken token)
     {
         var bytes = Wire.Encode(value);
-        if (bytes.Length > 8192)
+        if (bytes.Length > Wire.MaxHandshakeFrame)
             throw new InvalidDataException("Handshake message too large.");
         await WriteFrameAsync(stream, bytes, token);
     }
     public static async Task<T> ReadPlainAsync<T>(Stream stream, CancellationToken token) =>
-        Wire.Decode<T>(await ReadFrameAsync(stream, 8192, token));
+        Wire.Decode<T>(await ReadFrameAsync(stream, Wire.MaxHandshakeFrame, token));
     private static async Task WriteFrameAsync(Stream stream, byte[] bytes, CancellationToken token)
     {
         var length = new byte[4];

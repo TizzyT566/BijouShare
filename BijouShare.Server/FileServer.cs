@@ -25,21 +25,43 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
         {
             while (!store.IsInitialized)
                 await Task.Delay(TimeSpan.FromMilliseconds(250), stoppingToken);
-            await ListenAsync(stoppingToken);
+            var retryDelay = TimeSpan.FromSeconds(2);
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await ListenAsync(stoppingToken);
+                    return;
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.AddressNotAvailable
+                    or SocketError.NetworkDown or SocketError.NetworkReset)
+                {
+                    logger.LogWarning("File listener {Address}:{Port} is unavailable ({Reason}). Retrying in {Seconds} seconds.",
+                        options.ListenAddress, options.Port, ex.SocketErrorCode, retryDelay.TotalSeconds);
+                    await Task.Delay(retryDelay, stoppingToken);
+                    retryDelay = TimeSpan.FromSeconds(Math.Min(30, retryDelay.TotalSeconds * 2));
+                }
+            }
         }
         catch when (!stoppingToken.IsCancellationRequested) { Environment.ExitCode = 1; throw; }
     }
     private async Task ListenAsync(CancellationToken stoppingToken)
     {
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        var listener = new TcpListener(IPAddress.Parse(options.ListenAddress), options.Port);
+        using var listener = new TcpListener(IPAddress.Parse(options.ListenAddress), options.Port);
         listener.Start();
         logger.LogInformation("Encrypted file server listening on {Address}:{Port}", options.ListenAddress, options.Port);
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                var client = await listener.AcceptTcpClientAsync(lifetime.Token);
+                TcpClient client;
+                try { client = await listener.AcceptTcpClientAsync(lifetime.Token); }
+                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted)
+                {
+                    // Windows can report a peer that disappeared before accept completed.
+                    continue;
+                }
                 if (connections.Count >= options.MaxConnections)
                 {
                     client.Dispose();
@@ -76,105 +98,80 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 var hello = await SecureTransport.ReadPlainAsync<ClientHello>(stream, timeout.Token);
                 if (hello.Version != Wire.Version || hello.CryptoSuite != Wire.CryptoSuite ||
                     hello.MlKemPublicKey is not { Length: HybridKem.PublicKeySize } ||
+                    hello.IdentityMlKemPublicKey is not { Length: HybridKem.PublicKeySize } ||
                     hello.Nonce is not { Length: 32 } || hello.EphemeralPublicKey is not { Length: >= 64 and <= 160 } ||
-                    !Guid.TryParse(hello.DeviceId, out var deviceId))
+                    hello.ClientPublicKey is not { Length: > 0 and <= 256 } || hello.DeviceId is not { Length: 64 } ||
+                    hello.MlKemPublicKey.AsSpan().SequenceEqual(hello.IdentityMlKemPublicKey))
                     throw new UnauthorizedAccessException();
-                var registration = hello.ClientPublicKey is not null || hello.DeviceName is not null;
-                if (hello.InviteEnrollment && (!registration || !hello.ServerIdentityMetadata))
+                var registration = hello.DeviceName is not null;
+                if (hello.InviteEnrollment && !registration)
                     throw new UnauthorizedAccessException();
-                if (registration && (string.IsNullOrWhiteSpace(hello.DeviceName) || hello.DeviceName.Length > 100 ||
-                    hello.DeviceName != hello.DeviceName.Trim() || hello.DeviceName.Any(char.IsControl) ||
-                    hello.ClientPublicKey is not { Length: > 0 and <= 256 } || deviceId == Guid.Empty))
+                if (hello.DeviceName is { } name && (string.IsNullOrWhiteSpace(name) || name.Length > 100 ||
+                    name != name.Trim() || name.Any(char.IsControl)))
                     throw new UnauthorizedAccessException();
-                var registered = registration ? store.FindRegisteredDevice(deviceId) : store.Identity(deviceId);
-                var clientPublic = Convert.FromBase64String(registration ? hello.ClientPublicKey! : registered!.ClientPublicKey);
-                using (KeyAgreement.ImportPublic(clientPublic))
-                {
-                }
-                if (registered is not null && !KeyAgreement.Equals(Convert.FromBase64String(registered.ClientPublicKey), clientPublic))
-                    throw new UnauthorizedAccessException("The device ID belongs to a different public key.");
+                var clientPublic = Convert.FromBase64String(hello.ClientPublicKey);
+                var publicIdentity = DeviceIdentity.Id(clientPublic, hello.IdentityMlKemPublicKey);
+                if (!string.Equals(hello.DeviceId, publicIdentity, StringComparison.Ordinal) ||
+                    Convert.ToBase64String(clientPublic) != hello.ClientPublicKey || clientPublic.AsSpan().SequenceEqual(hello.EphemeralPublicKey))
+                    throw new UnauthorizedAccessException("The device ID does not match its public keys.");
+                var kemPublicText = Convert.ToBase64String(hello.IdentityMlKemPublicKey);
+                var registered = store.FindRegisteredDevice(publicIdentity);
                 var pending = registered is null;
+                if ((!registration && pending) || (registered is not null &&
+                    (registered.ClientPublicKey != hello.ClientPublicKey || registered.ClientMlKemPublicKey != kemPublicText)))
+                    throw new UnauthorizedAccessException();
                 byte[] material;
+                using (var ephemeral = KeyAgreement.NewKey())
+                using (var secrets = new HandshakeSecrets())
                 {
-                    using var ephemeral = KeyAgreement.NewKey();
-                    byte[] serverIdentity;
-                    byte[] identitySecret;
-                    if (pending)
+                    var metadata = store.Read(state => (state.ServerId, state.ServerName, state.ServerPublicKey, state.ServerMlKemPublicKey,
+                        state.ProtectedServerPrivateKey, state.ProtectedServerMlKemSeed));
+                    var ephemeralEc = secrets.Keep(KeyAgreement.Agree(ephemeral, hello.EphemeralPublicKey));
+                    var ephemeralChallenge = HybridKem.Encapsulate(hello.MlKemPublicKey);
+                    secrets.Keep(ephemeralChallenge.Secret);
+                    var clientChallenge = HybridKem.Encapsulate(hello.IdentityMlKemPublicKey);
+                    secrets.Keep(clientChallenge.Secret);
+                    var response = new ServerHello(RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
                     {
-                        serverIdentity = ephemeral.ExportSubjectPublicKeyInfo();
-                        identitySecret = KeyAgreement.Agree(ephemeral, clientPublic);
-                    }
-                    else
-                    {
-                        serverIdentity = Convert.FromBase64String(registered!.ServerPublicKey);
-                        var privateKey = PrivateStorage.Unprotect(registered.ProtectedServerPrivateKey);
-                        try
-                        {
-                            using var identity = KeyAgreement.ImportPrivate(privateKey);
-                            identitySecret = KeyAgreement.Agree(identity, clientPublic);
-                        }
-                        finally { CryptographicOperations.ZeroMemory(privateKey); }
-                    }
-                    byte[]? ephemeralSecret = null;
-                    byte[]? kemSecret = null;
+                        Version = Wire.Version,
+                        CryptoSuite = Wire.CryptoSuite,
+                        ServerId = metadata.ServerId,
+                        ServerName = metadata.ServerName,
+                        GlobalIdentityPublicKey = Convert.FromBase64String(metadata.ServerPublicKey),
+                        ServerMlKemPublicKey = Convert.FromBase64String(metadata.ServerMlKemPublicKey),
+                        MlKemCiphertext = ephemeralChallenge.Ciphertext,
+                        IdentityMlKemCiphertext = clientChallenge.Ciphertext,
+                        PendingApproval = pending,
+                        InviteEnrollment = hello.InviteEnrollment
+                    };
+                    await SecureTransport.WritePlainAsync(stream, response, timeout.Token);
+                    var exchange = await SecureTransport.ReadPlainAsync<ClientKeyExchange>(stream, timeout.Token);
+                    if (exchange.MlKemCiphertext is not { Length: HybridKem.CiphertextSize })
+                        throw new UnauthorizedAccessException();
+                    byte[] serverKem;
+                    var kemSeed = PrivateStorage.Unprotect(metadata.ProtectedServerMlKemSeed);
                     try
                     {
-                        ephemeralSecret = KeyAgreement.Agree(ephemeral, hello.EphemeralPublicKey);
-                        var encapsulation = HybridKem.Encapsulate(hello.MlKemPublicKey);
-                        kemSecret = encapsulation.Secret;
-                        var serverMetadata = hello.ServerIdentityMetadata
-                            ? store.Read(state => (Id: state.ServerId, Name: state.ServerName, PublicKey: state.ServerPublicKey, ProtectedPrivateKey: state.ProtectedServerPrivateKey))
-                            : ((string Id, string Name, string PublicKey, byte[] ProtectedPrivateKey)?)null;
-                        var response = new ServerHello(RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo(), [])
-                        {
-                            Version = Wire.Version,
-                            CryptoSuite = Wire.CryptoSuite,
-                            MlKemCiphertext = encapsulation.Ciphertext,
-                            InviteEnrollment = hello.InviteEnrollment,
-                            ServerId = serverMetadata?.Id,
-                            ServerName = serverMetadata?.Name,
-                            GlobalIdentityPublicKey = serverMetadata is { } metadata ? Convert.FromBase64String(metadata.PublicKey) : null,
-                            IdentityPublicKey = registration ? serverIdentity : null,
-                            PendingApproval = pending
-                        };
-                        var transcript = KeyAgreement.Transcript(hello, response, serverIdentity);
-                        response = response with
-                        {
-                            Proof = KeyAgreement.HybridProof(identitySecret, ephemeralSecret, kemSecret, transcript, "server")
-                        };
-                        if (hello.ServerIdentityMetadata)
-                        {
-                            var globalPrivate = PrivateStorage.Unprotect(serverMetadata!.Value.ProtectedPrivateKey);
-                            try
-                            {
-                                using var globalIdentity = KeyAgreement.ImportPrivate(globalPrivate);
-                                var globalSecret = KeyAgreement.Agree(globalIdentity, clientPublic);
-                                try
-                                {
-                                    response = response with
-                                    {
-                                        ServerIdentityProof = KeyAgreement.HybridProof(globalSecret, ephemeralSecret, kemSecret, transcript, "server-identity")
-                                    };
-                                }
-                                finally { CryptographicOperations.ZeroMemory(globalSecret); }
-                            }
-                            finally { CryptographicOperations.ZeroMemory(globalPrivate); }
-                        }
-                        await SecureTransport.WritePlainAsync(stream, response, timeout.Token);
-                        var proof = await SecureTransport.ReadPlainAsync<ClientProof>(stream, timeout.Token);
-                        if (proof.Proof is not { Length: 32 } || !KeyAgreement.Equals(KeyAgreement.HybridProof(identitySecret, ephemeralSecret, kemSecret, transcript, "client"), proof.Proof))
-                            throw new UnauthorizedAccessException();
-                        material = KeyAgreement.SessionMaterial(identitySecret, ephemeralSecret, kemSecret, transcript);
+                        using var identityKem = HybridKem.ImportPrivateSeed(kemSeed);
+                        serverKem = secrets.Keep(identityKem.Decapsulate(exchange.MlKemCiphertext));
                     }
-                    finally
+                    finally { CryptographicOperations.ZeroMemory(kemSeed); }
+                    byte[] staticEc;
+                    var ecPrivate = PrivateStorage.Unprotect(metadata.ProtectedServerPrivateKey);
+                    try
                     {
-                        CryptographicOperations.ZeroMemory(identitySecret);
-                        if (ephemeralSecret is not null)
-                            CryptographicOperations.ZeroMemory(ephemeralSecret);
-                        if (kemSecret is not null)
-                            CryptographicOperations.ZeroMemory(kemSecret);
+                        using var identity = KeyAgreement.ImportPrivate(ecPrivate);
+                        staticEc = secrets.Keep(KeyAgreement.Agree(identity, clientPublic));
                     }
-                } // Dispose the ECDHE private key before entering the long-lived file session.
+                    finally { CryptographicOperations.ZeroMemory(ecPrivate); }
+                    var secret = secrets.Keep(KeyAgreement.SessionSecret(staticEc, ephemeralEc, clientChallenge.Secret, serverKem, ephemeralChallenge.Secret));
+                    var transcript = KeyAgreement.Transcript(hello, response, exchange);
+                    await SecureTransport.WritePlainAsync(stream, new ServerProof(KeyAgreement.Proof(secret, transcript, "server")), timeout.Token);
+                    var proof = await SecureTransport.ReadPlainAsync<ClientProof>(stream, timeout.Token);
+                    if (!KeyAgreement.Equals(KeyAgreement.Proof(secret, transcript, "client"), proof.Proof))
+                        throw new UnauthorizedAccessException();
+                    material = KeyAgreement.SessionMaterial(secret, transcript);
+                }
                 SecureTransport secure;
                 try
                 {
@@ -182,7 +179,6 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 }
                 finally { CryptographicOperations.ZeroMemory(material); }
                 using var transport = secure;
-                string? enrollmentPublicKey = null;
                 if (hello.InviteEnrollment)
                 {
                     // The bearer code is sent only inside the mutually authenticated AES session.
@@ -193,9 +189,8 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                             throw new RemoteException("InvalidInvite");
                         if (pending)
                         {
-                            registered = store.RedeemInvite(new EnrollmentRequest(hello.DeviceId, hello.DeviceName!, hello.ClientPublicKey!), enrollment.InviteCode);
-                            enrollmentPublicKey = registered.ServerPublicKey;
-                            audit.Write(registered.Name, "DeviceInviteApproved", deviceId.ToString());
+                            registered = store.RedeemInvite(new EnrollmentRequest(publicIdentity, hello.DeviceName!, hello.ClientPublicKey, kemPublicText), enrollment.InviteCode);
+                            audit.Write(registered.Name, "DeviceInviteApproved", publicIdentity);
                         }
                     }
                     catch (RemoteException ex)
@@ -208,22 +203,23 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 if (registered is null)
                 {
                     var result = "PendingApproval";
-                    var prior = store.FindPendingDevice(deviceId);
+                    var prior = store.FindPendingDevice(publicIdentity);
                     try
                     {
                         // Only proven possession can add a request to the administrator's queue.
-                        store.QueueRegistration(new EnrollmentRequest(hello.DeviceId, hello.DeviceName!, hello.ClientPublicKey!));
+                        store.QueueRegistration(new EnrollmentRequest(publicIdentity, hello.DeviceName!, hello.ClientPublicKey, kemPublicText));
                         if (prior is null)
-                            audit.Write(hello.DeviceName!, "DeviceRequested", deviceId.ToString());
+                            audit.Write(hello.DeviceName!, "DeviceRequested", publicIdentity);
                         else if (prior.Name != hello.DeviceName)
-                            audit.Write(hello.DeviceName!, "DeviceRenamed", deviceId.ToString());
+                            audit.Write(hello.DeviceName!, "DeviceRenamed", publicIdentity);
                     }
-                    catch (UnauthorizedAccessException) { result = store.FindPendingDevice(deviceId)?.Rejected == true ? "DeviceRejected" : "DeviceBlocked"; }
+                    catch (UnauthorizedAccessException) { result = store.FindPendingDevice(publicIdentity)?.Rejected == true ? "DeviceRejected" : "DeviceBlocked"; }
                     catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException) { result = "DeviceBlocked"; }
                     await transport.SendAsync(RpcResponse.Fail(result), timeout.Token);
                     return;
                 }
                 var device = registered!;
+                var deviceId = device.Id;
                 if (!device.Enabled)
                 {
                     await transport.SendAsync(RpcResponse.Fail("DeviceBlocked"), timeout.Token);
@@ -232,19 +228,18 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 var readyIdentity = registration
                     ? store.UpdateAuthenticatedDeviceName(device, hello.DeviceName!)
                     : store.Identity(deviceId);
-                if (!SameIdentity(readyIdentity, device))
+                if (!readyIdentity.HasSameIdentity(device))
                     throw new UnauthorizedAccessException();
                 if (readyIdentity.Name != device.Name)
-                    audit.Write(readyIdentity.Name, "DeviceRenamed", deviceId.ToString());
+                    audit.Write(readyIdentity.Name, "DeviceRenamed", publicIdentity);
                 await transport.SendAsync(new RpcResponse
                 {
                     DeviceName = readyIdentity.Name,
-                    UserName = registration ? null : readyIdentity.Name,
-                    EnrollmentServerPublicKey = enrollmentPublicKey
+                    UserName = registration ? null : readyIdentity.Name
                 }, timeout.Token);
                 actor = readyIdentity.Name;
                 authenticated = true;
-                audit.Write(actor, "Connect", deviceId.ToString());
+                audit.Write(actor, "Connect", publicIdentity);
                 if (hello.BinaryPayloads)
                 {
                     await ServePipelinedAsync(transport, session, deviceId, device, actor, stoppingToken);
@@ -254,22 +249,12 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 {
                     timeout.CancelAfter(TimeSpan.FromSeconds(90));
                     var request = await transport.ReceiveAsync<RpcRequest>(timeout.Token);
-                    RpcResponse result;
-                    try
-                    {
-                        request.Validate();
-                        result = files.Execute(session, deviceId, request, device);
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-                    {
-                        result = RpcResponse.Fail(FileService.ErrorCode(ex));
-                        audit.Write(actor, request.Operation, request.Path, result.Error!);
-                    }
+                    var result = ExecuteFileRequest(session, device, actor, request);
                     await transport.SendAsync(result, timeout.Token);
                     try
                     {
                         var current = store.Identity(deviceId);
-                        if (!SameIdentity(current, device))
+                        if (!current.HasSameIdentity(device))
                             break;
                     }
                     catch (UnauthorizedAccessException) { break; }
@@ -287,8 +272,27 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             finally { files.ReleaseSession(session); if (authenticated) audit.Write(actor, "Disconnect", session.ToString()); }
         }
     }
-    private static bool SameIdentity(Device current, Device authenticated) => current.Id == authenticated.Id &&
-        current.ClientPublicKey == authenticated.ClientPublicKey && current.ServerPublicKey == authenticated.ServerPublicKey;
+    private RpcResponse ExecuteFileRequest(Guid session, Device device, string actor, RpcRequest request)
+    {
+        try
+        {
+            request.Validate();
+            return files.Execute(session, device.Id, request, device);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            var code = FileService.ErrorCode(ex);
+            var detail = ex switch
+            {
+                FileAccessDenial or FileSharingConflict => ex.Message,
+                IOException when code == "SharingViolation" => "Windows reported a sharing or lock conflict on the backing storage.",
+                _ => null
+            };
+            audit.Write(actor, request.Operation, request.Path, code, detail);
+            return RpcResponse.Fail(code);
+        }
+    }
+
     private async Task ServePipelinedAsync(SecureTransport transport, Guid session, Guid deviceId, Device device,
         string actor, CancellationToken stoppingToken)
     {
@@ -322,25 +326,16 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                     {
                         await dependencies;
                         lifetime.Token.ThrowIfCancellationRequested();
-                        try
+                        response = ExecuteFileRequest(session, device, actor, request with
                         {
-                            request.Validate();
-                            response = files.Execute(session, deviceId, request with
-                            {
-                                BorrowReadBuffer = true
-                            }, device);
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-                        {
-                            response = RpcResponse.Fail(FileService.ErrorCode(ex));
-                            audit.Write(actor, request.Operation, request.Path, response.Error!);
-                        }
+                            BorrowReadBuffer = true
+                        });
                         await transport.SendAsync(response with
                         {
                             RequestId = request.RequestId
                         }, lifetime.Token);
                         var current = store.Identity(deviceId);
-                        if (!SameIdentity(current, device))
+                        if (!current.HasSameIdentity(device))
                             lifetime.Cancel();
                     }
                     catch { lifetime.Cancel(); throw; }

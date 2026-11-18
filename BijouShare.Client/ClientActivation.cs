@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -10,25 +11,63 @@ using BijouShare.Shared;
 namespace BijouShare.Client;
 
 // A protocol launch forwards one bounded request to the service, rather than opening another drive.
-public sealed class ClientActivation(ClientSettings settings, ClientManagement management, ILogger<ClientActivation> logger) : BackgroundService
+public sealed class ClientActivation(ClientSettings settings, ClientManagement management, ClientManagementAccess access, ILogger<ClientActivation> logger) : BackgroundService
 {
     private const int MaximumBytes = 4096;
 
-    internal static string PipeName(string directory) => "BijouShare.Client." + Convert.ToHexString(SHA256.HashData(
+    internal static string PipeName(string directory) => "BijouShare.Client." + Convert.ToHexString(SHA3_256.HashData(
         Encoding.UTF8.GetBytes(Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar).ToUpperInvariant())))[..24];
 
-    public static async Task<bool> TryForwardAsync(string directory, string uri, CancellationToken token = default)
+    internal static async Task DeliverProtocolLinkAsync(string directory, WadUri link, Action<ProcessStartInfo>? startClient = null, CancellationToken token = default)
     {
-        _ = WadUri.Parse(uri);
-        var bytes = Encoding.UTF8.GetBytes(uri);
-        if (bytes.Length > MaximumBytes)
-            throw new ArgumentException("The server link is too long.");
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(3));
-        using var pipe = new NamedPipeClientStream(".", PipeName(directory), PipeDirection.InOut, PipeOptions.Asynchronous);
+        var uri = link.ToStringWithInvite();
+        if (await TryForwardAsync(directory, uri, token, connectTimeoutMs: 350))
+            return;
+
+        var options = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "BijouShare.Client.exe"))
+        {
+            WorkingDirectory = AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        if (startClient is null)
+        {
+            try
+            {
+                using var process = Process.Start(options) ?? throw new IOException("Could not start the installed BijouShare client.");
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                throw new IOException("Could not start the installed BijouShare client.", ex);
+            }
+        }
+        else
+            startClient(options);
+
+        // A concurrent launcher or service may win the profile lease and become the pipe
+        // owner. Deliver to whichever authenticated instance acknowledges the saved link.
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
+        startup.CancelAfter(TimeSpan.FromSeconds(30));
         try
         {
-            await pipe.ConnectAsync(timeout.Token);
+            while (!await TryForwardAsync(directory, uri, startup.Token, connectTimeoutMs: 500))
+                await Task.Delay(100, startup.Token);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw new IOException("The client did not acknowledge the connection link. Open BijouShare.Client.exe to check startup.");
+        }
+    }
+
+    public static async Task<bool> TryForwardAsync(string directory, string uri, CancellationToken token = default, int connectTimeoutMs = 3000)
+    {
+        _ = WadUri.Parse(uri);
+        if (Encoding.UTF8.GetByteCount(uri) > MaximumBytes)
+            throw new ArgumentException("The server link is too long.");
+        using var pipe = new NamedPipeClientStream(".", PipeName(directory), PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try
+        {
+            await pipe.ConnectAsync(connectTimeoutMs, token);
         }
         catch (Exception exception) when (exception is TimeoutException or OperationCanceledException or IOException)
         {
@@ -36,8 +75,15 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
             return false;
         }
         VerifyServerExecutable(pipe);
-        await pipe.WriteAsync(BitConverter.GetBytes(bytes.Length), timeout.Token);
-        await pipe.WriteAsync(bytes, timeout.Token);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var bytes = Encoding.UTF8.GetBytes(uri);
+        try
+        {
+            await pipe.WriteAsync(BitConverter.GetBytes(bytes.Length), timeout.Token);
+            await pipe.WriteAsync(bytes, timeout.Token);
+        }
+        finally { CryptographicOperations.ZeroMemory(bytes); }
         await pipe.FlushAsync(timeout.Token);
         var reply = new byte[1];
         await pipe.ReadExactlyAsync(reply, timeout.Token);
@@ -46,11 +92,45 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
         return true;
     }
 
-    public static async Task<string?> TryGetManagementUrlAsync(string directory, CancellationToken token = default)
+    internal sealed class RunningClient(string managementUrl, int processId)
+    {
+        public string ManagementUrl { get; } = managementUrl;
+        public int ProcessId { get; } = processId;
+    }
+
+    public static async Task<string?> TryGetManagementUrlAsync(string directory, CancellationToken token = default) =>
+        (await TryGetRunningClientAsync(directory, token))?.ManagementUrl;
+
+    internal static async Task OpenManagementAsync(string directory, Action<string> openBrowser, CancellationToken token = default)
+    {
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
+        startup.CancelAfter(TimeSpan.FromSeconds(30));
+        string? url = null;
+        try
+        {
+            while (url is null)
+            {
+                try { url = await TryGetManagementUrlAsync(directory, startup.Token); }
+                // A worker may have created its pipe before Kestrel has published the port,
+                // or an upgrade may close the old worker's pipe during the handoff.
+                catch (OperationCanceledException) when (!startup.IsCancellationRequested) { }
+                catch (IOException ex) when (ex is EndOfStreamException || (ex.HResult & 0xffff) is 109 or 232 or 233) { }
+                if (url is null) await Task.Delay(250, startup.Token);
+            }
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw new IOException("The client console did not become ready. Check that the BijouShare.Client service is running, then click its tray icon.");
+        }
+        token.ThrowIfCancellationRequested();
+        openBrowser(url);
+    }
+
+    internal static async Task<RunningClient?> TryGetRunningClientAsync(string directory, CancellationToken token = default)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
         timeout.CancelAfter(TimeSpan.FromSeconds(2));
-        using var pipe = new NamedPipeClientStream(".", PipeName(directory), PipeDirection.InOut, PipeOptions.Asynchronous);
+        using var pipe = new NamedPipeClientStream(".", PipeName(directory), PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
         try
         {
             await pipe.ConnectAsync(timeout.Token);
@@ -60,7 +140,7 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
             token.ThrowIfCancellationRequested();
             return null;
         }
-        VerifyServerExecutable(pipe);
+        var processId = VerifyServerExecutable(pipe);
         await pipe.WriteAsync(new byte[4], timeout.Token);
         var header = new byte[4];
         await pipe.ReadExactlyAsync(header, timeout.Token);
@@ -71,9 +151,9 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
         await pipe.ReadExactlyAsync(bytes, timeout.Token);
         var result = Encoding.UTF8.GetString(bytes);
         if (!System.Uri.TryCreate(result, UriKind.Absolute, out var url) || url.Scheme != "http" ||
-            url.Host != "127.0.0.1" || url.AbsolutePath != "/" || url.Query.Length != 0 || url.Fragment.Length != 0)
+            url.Host != "127.0.0.1" || url.UserInfo.Length != 0 || url.AbsolutePath != "/" || url.Query.Length != 0 || url.Fragment.Length != 72 || !url.Fragment.StartsWith("#access=", StringComparison.Ordinal) || !url.Fragment[8..].All(Uri.IsHexDigit))
             throw new IOException("The running client returned an invalid management address.");
-        return result;
+        return new(result, processId);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -92,7 +172,7 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
                 var count = BitConverter.ToInt32(header);
                 if (count == 0)
                 {
-                    var address = Encoding.UTF8.GetBytes($"http://127.0.0.1:{settings.ManagementPort}/");
+                    var address = Encoding.UTF8.GetBytes(await access.LaunchUrl(timeout.Token));
                     await pipe.WriteAsync(BitConverter.GetBytes(address.Length), timeout.Token);
                     await pipe.WriteAsync(address, timeout.Token);
                     continue;
@@ -110,9 +190,9 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
                 finally { CryptographicOperations.ZeroMemory(bytes); }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
-            catch (Exception exception) when (exception is IOException or ArgumentException or UnauthorizedAccessException or CryptographicException or OperationCanceledException)
+            catch (Exception exception) when (exception is IOException or InvalidDataException or ArgumentException or UnauthorizedAccessException or CryptographicException or OperationCanceledException)
             {
-                // Never log the URI: its path can contain an enrollment secret.
+                // The URI fragment may contain a bearer credential.
                 logger.LogWarning("A protocol launch could not be applied ({Reason}).", exception.GetType().Name);
                 if (pipe.IsConnected)
                 {
@@ -126,7 +206,7 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
         }
     }
 
-    private static void VerifyServerExecutable(NamedPipeClientStream pipe)
+    private static int VerifyServerExecutable(NamedPipeClientStream pipe)
     {
         if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var processId))
             throw new IOException("Cannot verify the running client process.");
@@ -136,6 +216,7 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
         if (process.IsInvalid || !QueryFullProcessImageName(process, 0, path, ref length) ||
             !string.Equals(Path.GetFullPath(path.ToString()), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase))
             throw new UnauthorizedAccessException("The client activation channel belongs to another executable. Open the installed client to manage connections.");
+        return checked((int)processId);
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -151,15 +232,11 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
     {
         var security = new PipeSecurity();
         security.SetAccessRuleProtection(true, false);
-        // Block network logons before granting local machine users the AddServer-only channel.
+        using var identity = WindowsIdentity.GetCurrent();
+        security.SetOwner(identity.User!);
         security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null),
             PipeAccessRights.FullControl, AccessControlType.Deny));
-        security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-            PipeAccessRights.ReadWrite, AccessControlType.Allow));
-        using var identity = WindowsIdentity.GetCurrent();
-        foreach (var sid in new[] { identity.User!, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null) }.Distinct())
-            security.AddAccessRule(new PipeAccessRule(sid, PipeAccessRights.FullControl, AccessControlType.Allow));
+        security.AddAccessRule(new PipeAccessRule(identity.User!, PipeAccessRights.FullControl, AccessControlType.Allow));
         return NamedPipeServerStreamAcl.Create(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous, MaximumBytes, MaximumBytes, security, HandleInheritability.None);
     }

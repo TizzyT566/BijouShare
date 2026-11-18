@@ -23,7 +23,9 @@ internal static class DeviceApprovalSelfTests
         using var wrongIdentity = KeyAgreement.NewKey();
         var privateKey = identity.ExportPkcs8PrivateKey();
         var wrongPrivateKey = wrongIdentity.ExportPkcs8PrivateKey();
-        var id = Guid.NewGuid();
+        using var identityKem = HybridKem.Generate();
+        var digest = DeviceIdentity.Id(identity.ExportSubjectPublicKeyInfo(), identityKem.ExportPublicKey());
+        var id = TestRegistration.RecordId(digest);
         var name = "My custom workstation";
         var publicKey = Convert.ToBase64String(identity.ExportSubjectPublicKeyInfo());
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
@@ -32,13 +34,13 @@ internal static class DeviceApprovalSelfTests
         using var server = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance);
         await server.StartAsync(deadline.Token);
 
-        async Task<SecureTransport> Connect(byte[]? pin = null, byte[]? clientKey = null, string? deviceName = null)
+        async Task<SecureTransport> Connect(string? pin = null, byte[]? clientKey = null, string? deviceName = null)
         {
             var socket = new TcpClient();
             try
             {
                 return await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
-                    id.ToString(), deviceName ?? name, clientKey ?? privateKey, pin, deadline.Token);
+                    digest, deviceName ?? name, clientKey ?? privateKey, identityKem, deadline.Token, pin ?? store.ServerId);
             }
             catch { socket.Dispose(); throw; }
         }
@@ -52,30 +54,53 @@ internal static class DeviceApprovalSelfTests
             catch (RemoteException exception) when (exception.Code == expected) { Check(true, "Automatic connection reports " + expected); }
         }
 
-        try
+        async Task RejectWrongPersistentKem(bool pending)
         {
-            // Merely advertising someone else's public identity cannot fill or overwrite the queue.
+            var revisionBefore = store.Revision;
             using (var socket = new TcpClient())
             using (var ephemeral = KeyAgreement.NewKey())
             using (var kem = HybridKem.Generate())
             {
                 await socket.ConnectAsync("127.0.0.1", options.Port, deadline.Token);
-                var hello = new ClientHello(Wire.Version, id.ToString(), RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
+                var hello = new ClientHello(Wire.Version, digest, RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
                 {
                     CryptoSuite = Wire.CryptoSuite,
                     MlKemPublicKey = kem.ExportPublicKey(),
+                    IdentityMlKemPublicKey = identityKem.ExportPublicKey(),
                     BinaryPayloads = true,
-                    DeviceName = name,
+                    DeviceName = "Unproven rename",
                     ClientPublicKey = publicKey
                 };
                 await SecureTransport.WritePlainAsync(socket.GetStream(), hello, deadline.Token);
                 var challenge = await SecureTransport.ReadPlainAsync<ServerHello>(socket.GetStream(), deadline.Token);
-                Check(challenge.PendingApproval && challenge.IdentityPublicKey is { } pendingKey &&
-                    KeyAgreement.Equals(pendingKey, challenge.EphemeralPublicKey), "Unapproved devices receive only an ephemeral registration challenge");
-                await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientProof(new byte[32]), deadline.Token);
+                var serverEc = challenge.GlobalIdentityPublicKey ?? throw new InvalidDataException("Missing server identity");
+                Check(challenge.PendingApproval == pending && ServerIdentityNaming.Id(serverEc, challenge.ServerMlKemPublicKey!) == store.ServerId,
+                    pending ? "Enrollment presents the same global fingerprint as ordinary connections"
+                        : "Approved reconnects authenticate against the link's global server keypair");
+                using var sensitive = new HandshakeSecrets();
+                var serverKem = HybridKem.Encapsulate(challenge.ServerMlKemPublicKey!);
+                sensitive.Keep(serverKem.Secret);
+                var exchange = new ClientKeyExchange(serverKem.Ciphertext);
+                await SecureTransport.WritePlainAsync(socket.GetStream(), exchange, deadline.Token);
+                await SecureTransport.ReadPlainAsync<ServerProof>(socket.GetStream(), deadline.Token);
+                var transcript = KeyAgreement.Transcript(hello, challenge, exchange);
+                using var unrelatedKem = HybridKem.Generate();
+                var wrongSecret = sensitive.Keep(KeyAgreement.SessionSecret(
+                    sensitive.Keep(KeyAgreement.Agree(identity, serverEc)),
+                    sensitive.Keep(KeyAgreement.Agree(ephemeral, challenge.EphemeralPublicKey)),
+                    sensitive.Keep(unrelatedKem.Decapsulate(challenge.IdentityMlKemCiphertext!)), serverKem.Secret,
+                    sensitive.Keep(kem.Decapsulate(challenge.MlKemCiphertext!))));
+                await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientProof(KeyAgreement.Proof(wrongSecret, transcript, "client")), deadline.Token);
                 var end = await socket.GetStream().ReadAsync(new byte[1], deadline.Token);
-                Check(end == 0 && store.FindPendingDevice(id) is null, "A device is not queued without proof of its static private key");
+                Check(end == 0 && store.Revision == revisionBefore && store.FindPendingDevice(id) is null,
+                    pending ? "Enrollment requires the persistent ML-KEM private key even with all other secrets"
+                        : "An approved client cannot start a session or rename its device without the persistent ML-KEM private key");
             }
+        }
+
+        try
+        {
+            await RejectWrongPersistentKem(pending: true);
             await ExpectStatus("PendingApproval");
             Check(store.FindPendingDevice(id) is { } pending && pending.Name == name && pending.ClientPublicKey == publicKey &&
                 store.FindRegisteredDevice(id) is null, "A proven unknown device queues exactly its public identity and remains unapproved");
@@ -107,15 +132,15 @@ internal static class DeviceApprovalSelfTests
             Check(store.FindPendingDevice(id) is { Rejected: true } rejected && rejected.Name == name && store.Revision == revision,
                 "A reconnect cannot rename or resurrect a rejected request");
 
-            var approved = store.ApproveDevice(id, [], KeyAgreement.Fingerprint(publicKey));
-            var pin = Convert.FromBase64String(approved.ServerPublicKey);
-            Check(approved.ServerPublicKey != fixtureDevice.ServerPublicKey && store.FindPendingDevice(id) is null,
-                "Approval consumes the request and creates a distinct permanent server key pair for this device");
+            var approved = store.ApproveDevice(id, [], digest);
+            var pin = store.ServerId;
+            Check(approved.PublicIdentity == digest && store.FindPendingDevice(id) is null,
+                "Approval consumes the request and preserves the device identity");
             using (var transport = await Connect())
             using (var rpc = new RpcClientSession(transport))
             {
-                Check(transport.RemoteIdentityPublicKey is { } remote && KeyAgreement.Equals(remote, pin) && transport.RemoteDeviceName == name,
-                    "The first approved connection returns the permanent identity for client pinning");
+                Check(transport.RemoteServerId == pin && transport.RemoteServerMlKemPublicKey is { Length: HybridKem.PublicKeySize } && transport.RemoteDeviceName == name,
+                    "The first approved connection authenticates both public keys from the link fingerprint");
                 var hidden = await rpc.CallAsync(new()
                 {
                     Operation = "List"
@@ -132,7 +157,7 @@ internal static class DeviceApprovalSelfTests
             using (var rpc = new RpcClientSession(transport))
             {
                 await rpc.CallAsync(new(), deadline.Token);
-                Check(KeyAgreement.Equals(transport.RemoteIdentityPublicKey!, pin) && store.FindRegisteredDevice(id)!.ServerPublicKey == approved.ServerPublicKey,
+                Check(transport.RemoteServerId == pin && store.FindRegisteredDevice(id)!.PublicIdentity == digest,
                     "Subsequent connections reuse and verify the same permanent server identity");
             }
             var beforeRename = store.FindRegisteredDevice(id)!;
@@ -142,8 +167,7 @@ internal static class DeviceApprovalSelfTests
                 var renamed = store.FindRegisteredDevice(id)!;
                 Check(transport.RemoteDeviceName == name && renamed.Name == name && renamed.Enabled &&
                     renamed.GroupIds.SequenceEqual(beforeRename.GroupIds) && renamed.ClientPublicKey == beforeRename.ClientPublicKey &&
-                    renamed.ServerPublicKey == beforeRename.ServerPublicKey &&
-                    renamed.ProtectedServerPrivateKey.SequenceEqual(beforeRename.ProtectedServerPrivateKey) &&
+                    renamed.ClientMlKemPublicKey == beforeRename.ClientMlKemPublicKey &&
                     new StateStore(options).FindRegisteredDevice(id)!.Name == name,
                     "An authenticated approved client name change persists while retaining groups, keys, and approval");
             }
@@ -151,29 +175,10 @@ internal static class DeviceApprovalSelfTests
             using (var transport = await Connect(pin))
                 Check(store.Revision == revision && transport.RemoteDeviceName == name,
                     "An unchanged approved name reconnects without rewriting server state");
-            using (var socket = new TcpClient())
-            using (var ephemeral = KeyAgreement.NewKey())
-            using (var kem = HybridKem.Generate())
-            {
-                await socket.ConnectAsync("127.0.0.1", options.Port, deadline.Token);
-                var hello = new ClientHello(Wire.Version, id.ToString(), RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
-                {
-                    CryptoSuite = Wire.CryptoSuite,
-                    MlKemPublicKey = kem.ExportPublicKey(),
-                    BinaryPayloads = true,
-                    DeviceName = "Unproven rename",
-                    ClientPublicKey = publicKey
-                };
-                await SecureTransport.WritePlainAsync(socket.GetStream(), hello, deadline.Token);
-                _ = await SecureTransport.ReadPlainAsync<ServerHello>(socket.GetStream(), deadline.Token);
-                await SecureTransport.WritePlainAsync(socket.GetStream(), new ClientProof(new byte[32]), deadline.Token);
-                var end = await socket.GetStream().ReadAsync(new byte[1], deadline.Token);
-                Check(end == 0 && store.Revision == revision && store.FindRegisteredDevice(id)!.Name == name,
-                    "Advertising an approved public identity without its private-key proof cannot rename the device");
-            }
+            await RejectWrongPersistentKem(pending: false);
             try
             {
-                using var transport = await Connect(wrongIdentity.ExportSubjectPublicKeyInfo());
+                using var transport = await Connect(new string('f', 64));
                 throw new InvalidOperationException("Accepted a mismatched server pin.");
             }
             catch (ServerIdentityMismatchException) { Check(true, "A changed pinned server identity fails closed"); }
@@ -190,7 +195,7 @@ internal static class DeviceApprovalSelfTests
             store.Update(state => { var index = state.Devices.FindIndex(device => device.Id == id); state.Devices[index] = state.Devices[index] with { Enabled = false }; return true; });
             revision = store.Revision;
             await ExpectStatus("DeviceBlocked", "Blocked rename");
-            Check(store.FindRegisteredDevice(id)!.ServerPublicKey == approved.ServerPublicKey &&
+            Check(store.FindRegisteredDevice(id)!.PublicIdentity == digest &&
                 store.FindRegisteredDevice(id)!.Name == name && store.FindPendingDevice(id) is null && store.Revision == revision,
                 "Blocking an approved device retains its name and keys without adding another pending request");
             store.Update(state => { var index = state.Devices.FindIndex(device => device.Id == id); state.Devices[index] = state.Devices[index] with { Enabled = true }; return true; });

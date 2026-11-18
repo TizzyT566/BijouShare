@@ -2,7 +2,7 @@ using System.Security.Cryptography;
 
 namespace BijouShare.Shared;
 
-/// <summary>Ephemeral ML-KEM-768 key establishment through the Windows native CNG provider.</summary>
+/// <summary>ML-KEM-768 key generation, encapsulation and decapsulation through Windows CNG.</summary>
 public sealed class HybridKem : IDisposable
 {
     public const int PublicKeySize = 1184;
@@ -18,8 +18,17 @@ public sealed class HybridKem : IDisposable
     public static HybridKem Generate()
     {
         EnsureSupported();
-        // The ephemeral decapsulation key remains in the native provider and is never exported.
         return new(MLKem.GenerateKey(MLKemAlgorithm.MLKem768));
+    }
+
+    public byte[] ExportPrivateSeed() => key.ExportPrivateSeed();
+
+    public static HybridKem ImportPrivateSeed(byte[] seed)
+    {
+        EnsureSupported();
+        if (seed is not { Length: 64 })
+            throw new CryptographicException("Expected a 64-byte ML-KEM-768 private seed.");
+        return new(MLKem.ImportPrivateSeed(MLKemAlgorithm.MLKem768, seed));
     }
 
     public byte[] ExportPublicKey()

@@ -22,9 +22,10 @@ public enum Permission
 
 public static class Wire
 {
-    public const int Version = 3;
-    public const string ProtocolName = "BijouShare-v3";
-    public const string CryptoSuite = "P256-MLKEM768-HKDFSHA256-AES256GCM";
+    public const int Version = 6;
+    public const string ProtocolName = "BijouShare-v6";
+    public const string CryptoSuite = "P256-MLKEM768-SHA3-256-AES256GCM";
+    public const int MaxHandshakeFrame = 16 * 1024;
     public const int LegacyMaxChunk = 256 * 1024;
     public const int MaxChunk = 1024 * 1024;
     public const int MaxFrame = 2 * 1024 * 1024;
@@ -41,94 +42,34 @@ public static class Wire
     public static byte[] Encode<T>(T value) => JsonSerializer.SerializeToUtf8Bytes(value, Json);
 }
 
-public sealed record EnrollmentRequest(string DeviceId, string DeviceName, string ClientPublicKey);
-public sealed record EnrollmentBundle(string DeviceId, string UserName, string Host, int Port, string ServerPublicKey);
+public sealed record EnrollmentRequest(string DeviceId, string DeviceName, string ClientPublicKey, string ClientMlKemPublicKey);
 public sealed record ClientHello(int Version, string DeviceId, byte[] Nonce, byte[] EphemeralPublicKey)
 {
-    public string? CryptoSuite
-    {
-        get; init;
-    }
-    public byte[]? MlKemPublicKey
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool InviteEnrollment
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool ServerIdentityMetadata
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? DeviceName
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? ClientPublicKey
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool BinaryPayloads
-    {
-        get; init;
-    }
+    public string? CryptoSuite { get; init; }
+    public byte[]? MlKemPublicKey { get; init; }
+    public byte[]? IdentityMlKemPublicKey { get; init; }
+    public string? ClientPublicKey { get; init; }
+    public string? DeviceName { get; init; }
+    public bool InviteEnrollment { get; init; }
+    public bool BinaryPayloads { get; init; }
 }
-public sealed record ServerHello(byte[] Nonce, byte[] EphemeralPublicKey, byte[] Proof)
+
+public sealed record ServerHello(byte[] Nonce, byte[] EphemeralPublicKey)
 {
-    public int Version
-    {
-        get; init;
-    }
-    public string? CryptoSuite
-    {
-        get; init;
-    }
-    public byte[]? MlKemCiphertext
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool InviteEnrollment
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? ServerId
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? ServerName
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public byte[]? GlobalIdentityPublicKey
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public byte[]? ServerIdentityProof
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public byte[]? IdentityPublicKey
-    {
-        get; init;
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool PendingApproval
-    {
-        get; init;
-    }
+    public int Version { get; init; }
+    public string? CryptoSuite { get; init; }
+    public string? ServerId { get; init; }
+    public string? ServerName { get; init; }
+    public byte[]? GlobalIdentityPublicKey { get; init; }
+    public byte[]? ServerMlKemPublicKey { get; init; }
+    public byte[]? MlKemCiphertext { get; init; }
+    public byte[]? IdentityMlKemCiphertext { get; init; }
+    public bool InviteEnrollment { get; init; }
+    public bool PendingApproval { get; init; }
 }
+
+public sealed record ClientKeyExchange(byte[] MlKemCiphertext);
+public sealed record ServerProof(byte[] Proof);
 public sealed record ClientProof(byte[] Proof);
 
 // The server derives group permissions from the authenticated device. RPCs cannot select an identity.
@@ -263,11 +204,6 @@ public sealed record RemoteEntry(string Name, FileAttributes Attributes, long Le
 
 public sealed record RpcResponse
 {
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? EnrollmentServerPublicKey
-    {
-        get; init;
-    }
     [JsonIgnore] internal int BorrowedCount { get; init; } = -1;
     [JsonIgnore]
     internal bool OwnsData
@@ -346,7 +282,6 @@ public sealed class RemoteException(string code) : IOException(code)
     public string Code { get; } = code;
 }
 
-// Windows FILE_ACCESS_MASK values, independent of the client-side Dokan package.
 public static class AccessMask
 {
     public const uint ReadData = 0x1, WriteData = 0x2, AppendData = 0x4;

@@ -54,24 +54,22 @@ public static class BackendSelfTests
 
         using var client = KeyAgreement.NewKey();
         var publicKey = Convert.ToBase64String(client.ExportSubjectPublicKeyInfo());
-        var device = store.Enroll(new(Guid.NewGuid().ToString(), "Backend device", publicKey), [group.Id]);
+        var device = store.Enroll(TestRegistration.Create("Backend device", publicKey), [group.Id]);
         Reject(() => store.Update(s => { s.Devices[0] = device with { GroupIds = null! }; return true; }), "Null device group memberships fail validation without corrupting state");
         Check(store.Read(s => s.Devices[0].GroupIds.SequenceEqual(new[] { group.Id })), "A rejected update leaves live device membership intact");
-        Reject(() => store.Enroll(new(Guid.NewGuid().ToString(), "Alias device", "\n" + publicKey + "\n"), [group.Id]), "Equivalent encodings cannot enroll the same device public key twice");
+        Reject(() => store.Enroll(TestRegistration.Create("Alias device", "\n" + publicKey + "\n"), [group.Id]), "Equivalent encodings cannot enroll the same device public key twice");
         using var unknownUserKey = KeyAgreement.NewKey();
-        Reject(() => store.Enroll(new(Guid.NewGuid().ToString(), "Unknown group device", Convert.ToBase64String(unknownUserKey.ExportSubjectPublicKeyInfo())), [Guid.NewGuid()]), "Approval cannot bind an unknown group");
+        Reject(() => store.Enroll(TestRegistration.Create("Unknown group device", Convert.ToBase64String(unknownUserKey.ExportSubjectPublicKeyInfo())), [Guid.NewGuid()]), "Approval cannot bind an unknown group");
         var loaded = new StateStore(options);
-        Check(loaded.Identity(device.Id).ServerPublicKey == device.ServerPublicKey, "Device key pairs survive validated state reloads");
+        Check(loaded.Identity(device.Id).HasSameIdentity(device), "Device key pairs survive validated state reloads");
         DeviceStateSelfTests.Run(root, Check);
 
         using var replacement = KeyAgreement.NewKey();
         var badRoot = Path.Combine(root, "mismatched-state");
         PrivateStorage.SecureDirectory(badRoot);
         var badState = Wire.Decode<ServerState>(Wire.Encode(store.Read(s => s)));
-        badState.Devices[0] = device with
-        {
-            ServerPublicKey = Convert.ToBase64String(replacement.ExportSubjectPublicKeyInfo())
-        };
+        badState.ServerPublicKey = Convert.ToBase64String(replacement.ExportSubjectPublicKeyInfo());
+        badState.ServerId = ServerIdentityNaming.Id(replacement.ExportSubjectPublicKeyInfo(), Convert.FromBase64String(badState.ServerMlKemPublicKey));
         PrivateStorage.AtomicWrite(Path.Combine(badRoot, "state.json"), Wire.Encode(badState));
         Reject(() => _ = new StateStore(new ServerOptions { DataDirectory = badRoot }), "Reload rejects a server private/public key mismatch");
 

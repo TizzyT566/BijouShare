@@ -122,56 +122,107 @@ public static class KeyAgreement
     public static byte[] Agree(ECDiffieHellman local, byte[] remote)
     {
         using var other = ImportPublic(remote);
-        return local.DeriveKeyFromHash(other.PublicKey, HashAlgorithmName.SHA256);
+        return local.DeriveRawSecretAgreement(other.PublicKey);
     }
-    public static byte[] Transcript(ClientHello client, ServerHello server, byte[] serverIdentity) =>
-        SHA256.HashData(Wire.Encode(new
-        {
-            protocol = Wire.ProtocolName,
-            client,
-            server.Version,
-            server.CryptoSuite,
-            server.Nonce,
-            server.EphemeralPublicKey,
-            server.MlKemCiphertext,
-            serverIdentity,
-            server.IdentityPublicKey,
-            server.PendingApproval,
-            server.ServerId,
-            server.ServerName,
-            server.GlobalIdentityPublicKey,
-            server.InviteEnrollment
-        }));
-    public static byte[] Proof(byte[] secret, byte[] transcript, string role) =>
-        HMACSHA256.HashData(secret, (byte[])[.. transcript, .. System.Text.Encoding.UTF8.GetBytes(role)]);
-    public static byte[] HybridProof(byte[] identitySecret, byte[] ephemeralSecret, byte[] kemSecret, byte[] transcript, string role)
-    {
-        if (role is not ("server" or "client" or "server-identity"))
-            throw new ArgumentException("Unknown handshake proof role.", nameof(role));
-        var key = HybridMaterial(identitySecret, ephemeralSecret, kemSecret, transcript, 32, "authentication " + role);
-        try
-        {
-            return Proof(key, transcript, role);
-        }
-        finally { CryptographicOperations.ZeroMemory(key); }
-    }
-    public static byte[] SessionMaterial(byte[] identitySecret, byte[] ephemeralSecret, byte[] kemSecret, byte[] transcript) =>
-        HybridMaterial(identitySecret, ephemeralSecret, kemSecret, transcript, 72, "transport");
 
-    private static byte[] HybridMaterial(byte[] identitySecret, byte[] ephemeralSecret, byte[] kemSecret, byte[] transcript,
-        int outputLength, string purpose)
+    public static byte[] Transcript(ClientHello client, ServerHello server, ClientKeyExchange exchange) =>
+        SHA3_256.HashData(Wire.Encode(new { protocol = Wire.ProtocolName, client, server, exchange }));
+
+    public static byte[] SessionSecret(byte[] staticEc, byte[] ephemeralEc, byte[] clientKem, byte[] serverKem, byte[] ephemeralKem)
     {
-        if (identitySecret is not { Length: 32 } || ephemeralSecret is not { Length: 32 } || kemSecret is not { Length: 32 } || transcript is not { Length: 32 })
-            throw new ArgumentException("Hybrid key derivation requires three 32-byte secrets and a 32-byte transcript hash.");
-        byte[] input = [.. identitySecret, .. ephemeralSecret, .. kemSecret];
+        // Mix the independently generated KEM secrets in their fixed protocol order.
+        // Both sides must know both static private keys on their side and the fresh session keys.
+        Span<byte> hybridInputs = stackalloc byte[64];
+        Span<byte> ecInputs = stackalloc byte[64];
+        Span<byte> kemInputs = stackalloc byte[96];
         try
         {
-            return HKDF.DeriveKey(HashAlgorithmName.SHA256, input, outputLength,
-                transcript, System.Text.Encoding.UTF8.GetBytes(Wire.ProtocolName + " " + Wire.CryptoSuite + " " + purpose));
+            CopySecret(staticEc, ecInputs[..32]);
+            CopySecret(ephemeralEc, ecInputs[32..]);
+            CopySecret(clientKem, kemInputs[..32]);
+            CopySecret(serverKem, kemInputs[32..64]);
+            CopySecret(ephemeralKem, kemInputs[64..]);
+            SHA3_256.HashData(ecInputs, hybridInputs[..32]);
+            SHA3_256.HashData(kemInputs, hybridInputs[32..]);
+            return SHA3_256.HashData(hybridInputs);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(hybridInputs);
+            CryptographicOperations.ZeroMemory(ecInputs);
+            CryptographicOperations.ZeroMemory(kemInputs);
+        }
+    }
+
+    private static void CopySecret(byte[] secret, Span<byte> destination)
+    {
+        if (secret is not { Length: 32 })
+            throw new CryptographicException("Expected a 32-byte key agreement result.");
+        secret.CopyTo(destination);
+    }
+
+    public static byte[] Proof(byte[] secret, byte[] transcript, string role) =>
+        role switch
+        {
+            "server" => Derive(secret, transcript, "server proof"u8),
+            "client" => Derive(secret, transcript, "client proof"u8),
+            _ => throw new ArgumentException("Unknown key confirmation role.", nameof(role))
+        };
+
+    public static byte[] SessionMaterial(byte[] secret, byte[] transcript)
+    {
+        var result = new byte[72];
+        Span<byte> nonces = stackalloc byte[32];
+        Derive(secret, transcript, "client traffic key"u8, result.AsSpan(0, 32));
+        Derive(secret, transcript, "server traffic key"u8, result.AsSpan(32, 32));
+        Derive(secret, transcript, "nonce prefixes"u8, nonces);
+        nonces[..8].CopyTo(result.AsSpan(64));
+        CryptographicOperations.ZeroMemory(nonces);
+        return result;
+    }
+
+    private static byte[] Derive(byte[] secret, byte[] transcript, ReadOnlySpan<byte> purpose)
+    {
+        var output = new byte[32];
+        Derive(secret, transcript, purpose, output);
+        return output;
+    }
+
+    private static void Derive(byte[] secret, byte[] transcript, ReadOnlySpan<byte> purpose, Span<byte> output)
+    {
+        if (secret is not { Length: 32 } || transcript is not { Length: 32 })
+            throw new CryptographicException("Invalid v6 hybrid secret or transcript.");
+        // SP 800-56C Rev. 2 one-step KDF, hash option, one 256-bit output block.
+        ReadOnlySpan<byte> domain = "BijouShare-v6/key-schedule/"u8;
+        Span<byte> input = stackalloc byte[4 + 32 + domain.Length + purpose.Length + 32];
+        try
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(input, 1);
+            secret.CopyTo(input[4..]);
+            domain.CopyTo(input[36..]);
+            purpose.CopyTo(input[(36 + domain.Length)..]);
+            transcript.CopyTo(input[^32..]);
+            SHA3_256.HashData(input, output);
         }
         finally { CryptographicOperations.ZeroMemory(input); }
     }
     public static bool Equals(byte[] expected, byte[]? actual) =>
         actual is not null && CryptographicOperations.FixedTimeEquals(expected, actual);
-    public static string Fingerprint(string publicKey) => Convert.ToHexString(SHA256.HashData(Convert.FromBase64String(publicKey)));
+}
+
+// Own every managed copy of a handshake secret until authentication succeeds or aborts.
+internal sealed class HandshakeSecrets : IDisposable
+{
+    private readonly List<byte[]> secrets = [];
+    public byte[] Keep(byte[] secret)
+    {
+        secrets.Add(secret);
+        return secret;
+    }
+    public void Dispose()
+    {
+        foreach (var secret in secrets)
+            CryptographicOperations.ZeroMemory(secret);
+        secrets.Clear();
+    }
 }

@@ -34,28 +34,36 @@ internal static class ClientSelfTests
         }
         await MultiServerSelfTests.RunAsync(Check);
         ClientSetupSelfTests.Run(Check);
+        await ClientSetupSelfTests.ActivationHandoff(Check);
+        ClientProfileSelfTests.Run(Check);
         await ClientManagementSelfTests.RunAsync(Check);
 
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--data-dir", "--probe"]), "A missing CLI value cannot consume the next command");
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--data-dir", "-h"]), "A missing CLI value cannot consume a short help option");
-        Reject<ArgumentException>(() => ClientCommandLine.Parse(["--probe", "--create-device"]), "Conflicting client commands are rejected");
+        Reject<ArgumentException>(() => ClientCommandLine.Parse(["--probe", "--self-test"]), "Conflicting client commands are rejected");
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--unknown"]), "Unknown client options fail clearly");
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--server", "fileserver", "--server-name", "ClientOverride"]),
             "Client setup cannot override the server-owned folder name");
+        Reject<ArgumentException>(() => ClientCommandLine.Parse(["wad://fileserver:7443", "--skip-server-verification"]),
+            "A URI activation cannot disable server identity binding");
         Check(ClientSettings.NormalizeMountPoint("n:") == "N:\\", "Drive letters normalize consistently");
 
         var settings = ClientSettings.Create("Self-test device");
         settings.Validate();
-        Check(!settings.IsConfigured, "A new persistent device needs only its server address before requesting approval");
+        Check(!settings.IsConfigured, "A new persistent device starts without a server");
         Reject<InvalidDataException>(() => settings.Validate(true), "An unconfigured device cannot start a connection");
-        var pendingSettings = Wire.Decode<ClientSettings>(Wire.Encode(settings));
-        pendingSettings.Host = "fileserver";
-        pendingSettings.Validate(true);
-        Check(pendingSettings.IsConfigured && !pendingSettings.IsEnrolled, "A configured device can request approval without an imported bundle or server pin");
         var copy = Wire.Decode<ClientSettings>(Wire.Encode(settings));
         var other = ClientSettings.Create("Another device");
+        Check(other.DeviceId != settings.DeviceId && other.MlKemPublicKey != settings.MlKemPublicKey,
+            "Distinct client profiles generate independent ML-KEM key pairs and device IDs");
         copy.PublicKey = other.PublicKey;
         Reject<InvalidDataException>(() => copy.Validate(), "Mismatched public/private client identity is rejected");
+        copy = Wire.Decode<ClientSettings>(Wire.Encode(settings));
+        copy.ProtectedMlKemPrivateSeed = other.ProtectedMlKemPrivateSeed;
+        Reject<InvalidDataException>(() => copy.Validate(), "A different protected ML-KEM seed cannot impersonate the saved identity");
+        copy = Wire.Decode<ClientSettings>(Wire.Encode(settings));
+        copy.DeviceId = other.DeviceId;
+        Reject<InvalidDataException>(() => copy.Validate(), "Changing the public device ID without changing the keys is rejected");
         copy = Wire.Decode<ClientSettings>(Wire.Encode(settings));
         copy.RequestTimeoutSeconds = 0;
         Reject<InvalidDataException>(() => copy.Validate(), "Invalid request timeout is rejected before mounting");
@@ -63,14 +71,8 @@ internal static class ClientSelfTests
         copy.DeviceName = " ambiguous device ";
         Reject<InvalidDataException>(() => copy.Validate(), "Device names reject surrounding whitespace before enrollment export");
         using var serverKey = KeyAgreement.NewKey();
-        var bundle = new EnrollmentBundle(settings.DeviceId, "test-user", "fileserver", 7443,
-            Convert.ToBase64String(serverKey.ExportSubjectPublicKeyInfo()));
-        Reject<ArgumentException>(() => settings.Enroll(bundle with { DeviceId = Guid.NewGuid().ToString() }), "Enrollment for a different device is rejected");
-        Reject<InvalidDataException>(() => settings.Enroll(bundle with { Host = "http://fileserver/path" }), "Enrollment rejects URL-shaped server addresses");
-        settings.Enroll(bundle);
-        settings.Validate(true);
-        Check(settings.IsEnrolled, "A matching enrollment bundle validates successfully");
-        await MultiServerSettings(Check);
+        Reject<ArgumentException>(() => ClientCommandLine.Parse(["--import-enrollment", "old.json"]), "A classical enrollment bundle cannot establish a v6 server identity");
+        MultiServerSettings(Check);
         Reject<ArgumentException>(() => StorageLease.Acquire("relative-data-directory").Dispose(), "A relative state directory is rejected before changing filesystem permissions");
 
         var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -78,9 +80,8 @@ internal static class ClientSelfTests
         try
         {
             var waitingSettings = Wire.Decode<ClientSettings>(Wire.Encode(settings));
-            waitingSettings.Host = "127.0.0.1";
-            waitingSettings.Port = ((IPEndPoint)listener.LocalEndpoint).Port;
-            using var connection = new RemoteConnection(waitingSettings, NullLogger<RemoteConnection>.Instance);
+            var endpoint = waitingSettings.AddServer("127.0.0.1", ((IPEndPoint)listener.LocalEndpoint).Port, null, trustedServerId: new string('a', 64));
+            using var connection = new RemoteConnection(waitingSettings.ForServer(endpoint), NullLogger<RemoteConnection>.Instance);
             var pending = connection.CallAsync(new()
             {
                 Operation = "Ping"
@@ -99,7 +100,6 @@ internal static class ClientSelfTests
         }
         finally { listener.Stop(); }
         await QueuedCancellation(settings, serverKey, Check);
-        await GlobalIdentityProofTampering(settings, serverKey, Check);
 
         var temp = Path.Combine(Path.GetTempPath(), "BijouShare-client-tests", Guid.NewGuid().ToString("N"));
         try
@@ -116,12 +116,25 @@ internal static class ClientSelfTests
 
         var remote = new ScriptedConnection();
         var operations = new DriveOperations(remote, NullLogger<DriveOperations>.Instance);
-        var info = new MockDokanFileInfo();
+        var info = new MockDokanFileInfo { WhatGetRequestorShouldReturn = System.Security.Principal.WindowsIdentity.GetCurrent() };
         var handle = Guid.NewGuid();
-        remote.Respond = _ => new() { Handle = handle, Entry = Entry("test.bin") };
+        using var anonymous = System.Security.Principal.WindowsIdentity.GetAnonymous();
+        Check(operations.CreateFile("\\", DokanNet.FileAccess.GenericRead, FileShare.ReadWrite,
+            FileMode.Open, FileOptions.None, FileAttributes.Directory, new MockDokanFileInfo { WhatGetRequestorShouldReturn = anonymous }) == NtStatus.AccessDenied && remote.Last is null,
+            "An open without the mount owner's SID cannot reach the server");
         Check(operations.CreateFile("\\Team\\secret.bin", DokanNet.FileAccess.GenericWrite, FileShare.ReadWrite,
             FileMode.CreateNew, FileOptions.Encrypted, FileAttributes.Normal, new MockDokanFileInfo()) == unchecked((NtStatus)0xC00000BB) && remote.Last is null,
             "Unsupported EFS requests fail before creating an unencrypted file");
+        remote.Respond = _ => throw new RemoteException("AccessDenied");
+        NtStatus DeniedOpen(DokanNet.FileAccess desired) => operations.CreateFile("\\Team\\New folder", desired,
+            FileShare.Read, FileMode.Open, FileOptions.None, FileAttributes.Directory,
+            new MockDokanFileInfo { IsDirectory = true, WhatGetRequestorShouldReturn = System.Security.Principal.WindowsIdentity.GetCurrent() });
+        Check(DeniedOpen(DokanNet.FileAccess.Delete | DokanNet.FileAccess.ReadAttributes) == NtStatus.CannotDelete &&
+            DeniedOpen(DokanNet.FileAccess.GenericAll) == NtStatus.CannotDelete,
+            "A denied delete-access open ends on the child without invoking Dokany's parent-open fallback");
+        Check(DeniedOpen(DokanNet.FileAccess.ReadAttributes) == NtStatus.AccessDenied,
+            "Ordinary denied attribute opens retain their access-denied status");
+        remote.Respond = _ => new() { Handle = handle, Entry = Entry("test.bin") };
         Check(operations.CreateFile("\\Team\\test.bin", DokanNet.FileAccess.GenericWrite, FileShare.ReadWrite,
             FileMode.Open, FileOptions.WriteThrough, FileAttributes.Normal, info) == NtStatus.Success && remote.Last!.WriteThrough,
             "Native write-through opens retain their durability request");
@@ -207,6 +220,14 @@ internal static class ClientSelfTests
         Check(operations.GetFileSecurity("\\Team", out security, AccessControlSections.Access, directoryInfo) == NtStatus.Success &&
             (Granted(security) & (FileSystemRights.CreateFiles | FileSystemRights.CreateDirectories)) != 0,
             "Directory security descriptors retain the correct create rights");
+        remote.Respond = _ => new() { Permissions = Permission.ListDirectory | Permission.ReadPermissions };
+        Check(operations.GetFileSecurity("\\", out security, AccessControlSections.Access, directoryInfo) == NtStatus.Success &&
+            Granted(security).HasFlag(FileSystemRights.Traverse), "Explorer can traverse a listable virtual root");
+        Check(operations.GetFileSecurity("\\Team\\test.bin", out security, AccessControlSections.Access, info) == NtStatus.Success &&
+            !Granted(security).HasFlag(FileSystemRights.ExecuteFile), "Directory listing does not grant execute access to files");
+        remote.Respond = _ => new() { Permissions = Permission.ReadData | Permission.ReadPermissions };
+        Check(operations.GetFileSecurity("\\Team\\test.bin", out security, AccessControlSections.Access, info) == NtStatus.Success &&
+            Granted(security).HasFlag(FileSystemRights.ExecuteFile), "The file descriptor matches the server's read and execute check");
         remote.Respond = _ => new() { Permissions = Permission.Rename | Permission.ReadPermissions };
         Check(operations.GetFileSecurity("\\Team\\test.bin", out security, AccessControlSections.Access, info) == NtStatus.Success &&
             (Granted(security) & FileSystemRights.Delete) != 0,
@@ -233,7 +254,7 @@ internal static class ClientSelfTests
         return 0;
     }
 
-    private static async Task MultiServerSettings(Action<bool, string> check)
+    private static void MultiServerSettings(Action<bool, string> check)
     {
         var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "BijouShare-client-settings-tests"));
         var directory = Path.Combine(root, Guid.NewGuid().ToString("N"));
@@ -241,96 +262,63 @@ internal static class ClientSelfTests
         var path = Path.Combine(directory, "client.json");
         try
         {
-            var original = ClientSettings.Create("Shared device identity");
-            using var firstKey = KeyAgreement.NewKey();
-            var firstPublic = firstKey.ExportSubjectPublicKeyInfo();
-            PrivateStorage.AtomicWrite(path, Wire.Encode(new
-            {
-                original.DeviceId,
-                original.DeviceName,
-                original.ProtectedPrivateKey,
-                original.PublicKey,
-                host = "first-server",
-                port = 7443,
-                serverPublicKey = Convert.ToBase64String(firstPublic),
-                mountPoint = "N:\\",
-                requestTimeoutSeconds = 30
-            }));
-            var migrated = ClientSettings.Load(path);
-            check(migrated.Servers.Count == 1 && migrated.Servers[0].Host == "first-server" &&
-                migrated.DeviceId == original.DeviceId && migrated.PublicKey == original.PublicKey &&
-                migrated.Servers[0].ServerPublicKey == Convert.ToBase64String(firstPublic),
-                "Legacy client configuration migrates to one server without changing identity or trust");
-            var first = migrated.Servers[0];
-            var second = migrated.UpsertServer("second-server", 7444, "Media");
-            var third = migrated.UpsertServer("third-server", 7445, "Backups");
-            migrated.Save(path);
-            using var secondKey = KeyAgreement.NewKey();
-            using var thirdKey = KeyAgreement.NewKey();
-            var secondView = migrated.ForServer(second);
-            var thirdView = migrated.ForServer(third);
-            var secondId = ServerIdentityNaming.Id("DarkArchives", secondKey.ExportSubjectPublicKeyInfo());
-            var thirdId = ServerIdentityNaming.Id("Backups", thirdKey.ExportSubjectPublicKeyInfo());
-            await Task.WhenAll(Task.Run(() => secondView.TrustApprovedServer(secondKey.ExportSubjectPublicKeyInfo(), secondId, "DarkArchives", secondKey.ExportSubjectPublicKeyInfo())),
-                Task.Run(() => thirdView.TrustApprovedServer(thirdKey.ExportSubjectPublicKeyInfo(), thirdId, "Backups", thirdKey.ExportSubjectPublicKeyInfo())));
-            var loaded = ClientSettings.Load(path);
-            check(loaded.Servers.Count == 3 && loaded.Servers[0].ServerPublicKey == first.ServerPublicKey &&
-                loaded.Servers[1].ServerPublicKey == second.ServerPublicKey && loaded.Servers[2].ServerPublicKey == third.ServerPublicKey,
-                "Concurrent approved-server pins persist atomically without losing sibling trust");
-            check(loaded.Servers[1].FolderName == "DarkArchives_" + secondId[..16] &&
-                loaded.Servers[2].FolderName == "Backups_" + thirdId[..16] && loaded.Servers[1].ServerId == secondId,
-                "Drive folders use the first 16 name-bound server-ID characters while retaining the full hash");
-            check(secondView.DeviceId == thirdView.DeviceId && secondView.PublicKey == thirdView.PublicKey &&
-                secondView.ProtectedPrivateKey.SequenceEqual(thirdView.ProtectedPrivateKey) && secondView.MountPoint == thirdView.MountPoint,
-                "All server connections reuse one device identity and one mount point");
-            var rejected = false;
+            var original = ClientSettings.Create("Shared device");
+            original.AddDrive("N:");
+            original.AddDrive("P:");
+            using var ec = KeyAgreement.NewKey();
+            using var kem = HybridKem.Generate();
+            var serverEc = ec.ExportSubjectPublicKeyInfo();
+            var serverKem = kem.ExportPublicKey();
+            var id = ServerIdentityNaming.Id(serverEc, serverKem);
+            var code = new string('x', 32);
+            original.AddServer("archive", 7443, code, "N:", new string('f', 64));
+            original.AddServer("archive", 7443, code, "P:", new string('f', 64));
+            var legacy = System.Text.Json.Nodes.JsonNode.Parse(Wire.Encode(original))!.AsObject();
+            legacy.Remove("identityFormat");
+            var previous = System.Text.Encoding.UTF8.GetBytes(legacy.ToJsonString());
+            File.WriteAllBytes(path, previous);
             try
             {
-                secondView.TrustApprovedServer(firstPublic);
+                ClientSettings.Load(path);
+                throw new InvalidOperationException("Accepted obsolete client settings.");
             }
-            catch (ServerIdentityMismatchException) { rejected = true; }
-            check(rejected && ClientSettings.Load(path).Servers[1].ServerPublicKey == second.ServerPublicKey,
-                "A changed server key cannot replace an existing endpoint pin");
-            rejected = false;
-            var sameDisplayDifferentId = secondId[..16] + new string(secondId[16] == '0' ? '1' : '0', 48);
+            catch (InvalidDataException)
+            {
+                check(File.ReadAllBytes(path).SequenceEqual(previous), "An existing obsolete profile fails closed with its contents intact");
+            }
+            File.Delete(path);
+            var current = ClientSettings.Create("Device");
+            current.AddDrive("N:");
+            current.AddDrive("P:");
+            current.Save(path);
+            var endpoint = current.AddServer("archive", 7443, null, "N:", id);
+            var otherDrive = current.AddServer("archive", 7443, null, "P:", id);
+            var view = current.ForServer(endpoint);
+            view.RememberServerIdentity(id, "Archive", serverEc, serverKem);
+            var saved = ClientSettings.Load(path);
+            check(saved.Servers.All(e => e.ServerId == id && e.FolderName == "Archive_" + id[..16] &&
+                e.ServerIdentityPublicKey == Convert.ToBase64String(serverEc) && e.ServerMlKemPublicKey == Convert.ToBase64String(serverKem)),
+                "Authenticated connections save the expected identity and both persistent server public keys across drives");
+            var alias = current.AddServer("archive-alias", 7443, null, "N:", id);
+            var unproven = current.AddServer("unseen-alias", 7443, null, "N:", id);
+            current.ForServer(alias).RememberServerIdentity(id, "Archive", serverEc, serverKem);
+            view.RememberServerIdentity(id, "Archive-New", serverEc, serverKem);
+            var renamed = ClientSettings.Load(path);
+            check(otherDrive.FolderName == "Archive-New_" + id[..16] && alias.FolderName == otherDrive.FolderName &&
+                renamed.Servers.Single(s => s.Host == alias.Host).FolderName == otherDrive.FolderName &&
+                unproven.FolderName is null && unproven.ServerIdentityPublicKey is null && unproven.ServerMlKemPublicKey is null,
+                "A rename propagates to every proven alias while an unobserved address with the same expected ID stays unverified");
+            using var differentKem = HybridKem.Generate();
             try
             {
-                secondView.TrustApprovedServer(secondKey.ExportSubjectPublicKeyInfo(), sameDisplayDifferentId, "DarkArchives", secondKey.ExportSubjectPublicKeyInfo());
+                view.RememberServerIdentity(id, "Archive-New", serverEc, differentKem.ExportPublicKey());
+                throw new InvalidOperationException("Accepted a replacement server ML-KEM key.");
             }
-            catch (CryptographicException) { rejected = true; }
-            check(rejected && ClientSettings.Load(path).Servers[1].ServerId == secondId,
-                "The complete name-bound hash is validated even when another ID has the same 16-character display prefix");
-            rejected = false;
-            try
-            {
-                secondView.TrustApprovedServer(secondKey.ExportSubjectPublicKeyInfo(), ServerIdentityNaming.Id("DarkArchives", thirdKey.ExportSubjectPublicKeyInfo()), "DarkArchives", thirdKey.ExportSubjectPublicKeyInfo());
-            }
-            catch (ServerIdentityMismatchException) { rejected = true; }
-            check(rejected && ClientSettings.Load(path).Servers[1].ServerKeyFingerprint == ServerIdentityNaming.KeyFingerprint(secondKey.ExportSubjectPublicKeyInfo()),
-                "A changed global public key cannot replace the stable server trust anchor");
-            var renamedId = ServerIdentityNaming.Id("DarkArchives-New", secondKey.ExportSubjectPublicKeyInfo());
-            secondView.TrustApprovedServer(secondKey.ExportSubjectPublicKeyInfo(), renamedId, "DarkArchives-New", secondKey.ExportSubjectPublicKeyInfo());
-            check(ClientSettings.Load(path).Servers[1].FolderName == "DarkArchives-New_" + renamedId[..16] && renamedId != secondId &&
-                ClientSettings.Load(path).Servers[1].ServerKeyFingerprint == ServerIdentityNaming.KeyFingerprint(secondKey.ExportSubjectPublicKeyInfo()),
-                "An authenticated rename updates its name-bound ID while preserving the server-wide key trust anchor");
-            foreach (var invalidName in new[] { "two words", "has_underscore", "döt", "", new string('x', 101) })
-            {
-                rejected = false;
-                try
-                {
-                    secondView.TrustApprovedServer(secondKey.ExportSubjectPublicKeyInfo(), renamedId, invalidName, secondKey.ExportSubjectPublicKeyInfo());
-                }
-                catch (ArgumentException) { rejected = true; }
-                check(rejected, "Invalid authenticated server names are rejected: " + (invalidName.Length == 0 ? "empty" : invalidName[..Math.Min(20, invalidName.Length)]));
-            }
-            rejected = false;
-            try
-            {
-                migrated.UpsertServer("other-server", 7443, "media");
-            }
-            catch (ArgumentException) { rejected = true; }
-            check(rejected && migrated.UpsertServer("SECOND-SERVER", 7444) == second && migrated.Servers.Count == 3,
-                "Server aliases are unique and repeated host/port configuration reuses the endpoint");
+            catch (ServerIdentityMismatchException) { check(ClientSettings.Load(path).Servers[0].ServerMlKemPublicKey == Convert.ToBase64String(serverKem),
+                "A changed ML-KEM key cannot replace an existing pin or its saved keys"); }
+            current.RemoveServer("archive", 7443, "N:");
+            check(!view.IsVerificationCurrent && current.Servers.All(s => s.TrustedServerId == id),
+                "Removing one drive entry invalidates its active view and preserves the other drive's expected fingerprint");
         }
         finally
         {
@@ -349,15 +337,31 @@ internal static class ClientSelfTests
         var full = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var localSettings = Wire.Decode<ClientSettings>(Wire.Encode(settings));
-        localSettings.Host = "127.0.0.1";
-        localSettings.Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var serverKem = HybridKem.Generate();
+        var kemPublic = serverKem.ExportPublicKey();
+        var identityPublic = serverKey.ExportSubjectPublicKeyInfo();
+        var fingerprint = ServerIdentityNaming.Id(identityPublic, kemPublic);
+        var localRoot = Wire.Decode<ClientSettings>(Wire.Encode(settings));
+        var directory = Path.Combine(Path.GetTempPath(), "BijouShare-handshake-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var profilePath = Path.Combine(directory, "client.json");
+        localRoot.AttachPath(profilePath);
+        var server = localRoot.AddServer("127.0.0.1", ((IPEndPoint)listener.LocalEndpoint).Port, null, trustedServerId: fingerprint);
+        var localSettings = localRoot.ForServer(server);
         var peer = ServePeerAsync();
         using var connection = new RemoteConnection(localSettings, NullLogger<RemoteConnection>.Instance);
         try
         {
-            var established = await connection.CallAsync(new(), token: deadline.Token);
-            var pending = Enumerable.Range(0, 16).Select(_ => connection.CallAsync(new(), token: deadline.Token)).ToArray();
+            var established = await connection.CallAsync(new() { Operation = "Write" }, token: deadline.Token);
+            check(server.TrustedServerId == fingerprint && server.PresentedServerId == fingerprint &&
+                server.ServerMlKemPublicKey == Convert.ToBase64String(kemPublic), "The first authorized write can use the pinned server without another verification step");
+            try
+            {
+                await connection.CallForIdentityAsync(new(), null, new string('f', 64), deadline.Token);
+                throw new InvalidOperationException("Forwarded an RPC to the wrong server identity.");
+            }
+            catch (RemoteException ex) when (ex.Code == "InvalidHandle") { check(true, "A stale folder route cannot send an RPC to a different server"); }
+            var pending = Enumerable.Range(0, 16).Select(i => connection.CallAsync(new(), token: deadline.Token)).ToArray();
             await full.Task.WaitAsync(deadline.Token);
             using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(30));
             try
@@ -385,6 +389,8 @@ internal static class ClientSelfTests
                 await peer;
             }
             catch (Exception ex) when (ex is IOException or OperationCanceledException or SocketException) { }
+            File.Delete(profilePath);
+            Directory.Delete(directory);
         }
 
         async Task ServePeerAsync()
@@ -392,39 +398,42 @@ internal static class ClientSelfTests
             using var socket = await listener.AcceptTcpClientAsync(deadline.Token);
             var stream = socket.GetStream();
             var hello = await SecureTransport.ReadPlainAsync<ClientHello>(stream, deadline.Token);
-            var identitySecret = KeyAgreement.Agree(serverKey, Convert.FromBase64String(settings.PublicKey));
-            var (ciphertext, kemSecret) = HybridKem.Encapsulate(hello.MlKemPublicKey!);
+            using var ephemeral = KeyAgreement.NewKey();
+            var staticEc = KeyAgreement.Agree(serverKey, Convert.FromBase64String(hello.ClientPublicKey!));
+            var ephemeralEc = KeyAgreement.Agree(ephemeral, hello.EphemeralPublicKey);
+            var (ciphertext, ephemeralKem) = HybridKem.Encapsulate(hello.MlKemPublicKey!);
+            var (identityCiphertext, clientKem) = HybridKem.Encapsulate(hello.IdentityMlKemPublicKey!);
             byte[] material;
             try
             {
-                using var ephemeral = KeyAgreement.NewKey();
-                var secret = KeyAgreement.Agree(ephemeral, hello.EphemeralPublicKey);
+                var challenge = new ServerHello(RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo())
+                {
+                    Version = Wire.Version, CryptoSuite = Wire.CryptoSuite, ServerName = "TestServer", ServerId = fingerprint,
+                    GlobalIdentityPublicKey = identityPublic, ServerMlKemPublicKey = kemPublic,
+                    MlKemCiphertext = ciphertext, IdentityMlKemCiphertext = identityCiphertext
+                };
+                await SecureTransport.WritePlainAsync(stream, challenge, deadline.Token);
+                var exchange = await SecureTransport.ReadPlainAsync<ClientKeyExchange>(stream, deadline.Token);
+                var serverSecret = serverKem.Decapsulate(exchange.MlKemCiphertext);
+                var secret = KeyAgreement.SessionSecret(staticEc, ephemeralEc, clientKem, serverSecret, ephemeralKem);
                 try
                 {
-                    var challenge = new ServerHello(RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo(), [])
-                    {
-                        Version = Wire.Version,
-                        CryptoSuite = Wire.CryptoSuite,
-                        MlKemCiphertext = ciphertext,
-                        IdentityPublicKey = hello.ClientPublicKey is null ? null : serverKey.ExportSubjectPublicKeyInfo(),
-                        ServerId = hello.ServerIdentityMetadata ? ServerIdentityNaming.Id("TestServer", serverKey.ExportSubjectPublicKeyInfo()) : null,
-                        ServerName = hello.ServerIdentityMetadata ? "TestServer" : null,
-                        GlobalIdentityPublicKey = hello.ServerIdentityMetadata ? serverKey.ExportSubjectPublicKeyInfo() : null
-                    };
-                    var transcript = KeyAgreement.Transcript(hello, challenge, serverKey.ExportSubjectPublicKeyInfo());
-                    await SecureTransport.WritePlainAsync(stream, challenge with
-                    {
-                        Proof = KeyAgreement.HybridProof(identitySecret, secret, kemSecret, transcript, "server"),
-                        ServerIdentityProof = hello.ServerIdentityMetadata ? KeyAgreement.HybridProof(identitySecret, secret, kemSecret, transcript, "server-identity") : null
-                    }, deadline.Token);
+                    var transcript = KeyAgreement.Transcript(hello, challenge, exchange);
+                    await SecureTransport.WritePlainAsync(stream, new ServerProof(KeyAgreement.Proof(secret, transcript, "server")), deadline.Token);
                     var proof = await SecureTransport.ReadPlainAsync<ClientProof>(stream, deadline.Token);
-                    if (!KeyAgreement.Equals(KeyAgreement.HybridProof(identitySecret, secret, kemSecret, transcript, "client"), proof.Proof))
-                        throw new CryptographicException("Invalid test peer proof.");
-                    material = KeyAgreement.SessionMaterial(identitySecret, secret, kemSecret, transcript);
+                    if (!KeyAgreement.Equals(KeyAgreement.Proof(secret, transcript, "client"), proof.Proof))
+                        throw new CryptographicException("Invalid mock client proof.");
+                    material = KeyAgreement.SessionMaterial(secret, transcript);
                 }
-                finally { CryptographicOperations.ZeroMemory(secret); }
+                finally { CryptographicOperations.ZeroMemory(secret); CryptographicOperations.ZeroMemory(serverSecret); }
             }
-            finally { CryptographicOperations.ZeroMemory(identitySecret); CryptographicOperations.ZeroMemory(kemSecret); }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(staticEc);
+                CryptographicOperations.ZeroMemory(ephemeralEc);
+                CryptographicOperations.ZeroMemory(ephemeralKem);
+                CryptographicOperations.ZeroMemory(clientKem);
+            }
             SecureTransport secure;
             try
             {
@@ -437,6 +446,8 @@ internal static class ClientSelfTests
                 var first = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
                 try
                 {
+                    check(first.Operation == "Write",
+                        "A pinned connection delivers the authorized file operation");
                     await secure.SendAsync(new RpcResponse { RequestId = first.RequestId }, deadline.Token);
                 }
                 finally { first.ReleasePayload(); }
@@ -458,78 +469,6 @@ internal static class ClientSelfTests
                 }
                 finally { last.ReleasePayload(); }
                 await finished.Task.WaitAsync(deadline.Token);
-            }
-        }
-    }
-
-    private static async Task GlobalIdentityProofTampering(ClientSettings settings, ECDiffieHellman deviceServerKey, Action<bool, string> check)
-    {
-        using var globalKey = KeyAgreement.NewKey();
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        var peer = ServeAsync();
-        var privateKey = PrivateStorage.Unprotect(settings.ProtectedPrivateKey);
-        try
-        {
-            using var socket = new TcpClient();
-            try
-            {
-                using var unexpected = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", ((IPEndPoint)listener.LocalEndpoint).Port,
-                    settings.DeviceId, settings.DeviceName, privateKey, deviceServerKey.ExportSubjectPublicKeyInfo(), deadline.Token);
-                throw new InvalidOperationException("Accepted a forged global identity proof.");
-            }
-            catch (CryptographicException ex)
-            {
-                check(ex.Message.Contains("global identity authentication", StringComparison.Ordinal),
-                    "A valid per-device proof cannot substitute for possession of the server-wide identity private key");
-            }
-            await peer;
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(privateKey);
-            listener.Stop();
-        }
-
-        async Task ServeAsync()
-        {
-            using var socket = await listener.AcceptTcpClientAsync(deadline.Token);
-            socket.NoDelay = true;
-            var stream = socket.GetStream();
-            var hello = await SecureTransport.ReadPlainAsync<ClientHello>(stream, deadline.Token);
-            using var ephemeral = KeyAgreement.NewKey();
-            var (ciphertext, kemSecret) = HybridKem.Encapsulate(hello.MlKemPublicKey!);
-            var ephemeralSecret = KeyAgreement.Agree(ephemeral, hello.EphemeralPublicKey);
-            var response = new ServerHello(RandomNumberGenerator.GetBytes(32), ephemeral.ExportSubjectPublicKeyInfo(), [])
-            {
-                Version = Wire.Version,
-                CryptoSuite = Wire.CryptoSuite,
-                MlKemCiphertext = ciphertext,
-                IdentityPublicKey = deviceServerKey.ExportSubjectPublicKeyInfo(),
-                GlobalIdentityPublicKey = globalKey.ExportSubjectPublicKeyInfo(),
-                ServerId = ServerIdentityNaming.Id("DarkArchives", globalKey.ExportSubjectPublicKeyInfo()),
-                ServerName = "DarkArchives"
-            };
-            var transcript = KeyAgreement.Transcript(hello, response, response.IdentityPublicKey);
-            var identitySecret = KeyAgreement.Agree(deviceServerKey, Convert.FromBase64String(hello.ClientPublicKey!));
-            var globalSecret = KeyAgreement.Agree(globalKey, Convert.FromBase64String(hello.ClientPublicKey!));
-            try
-            {
-                var corruptProof = KeyAgreement.HybridProof(globalSecret, ephemeralSecret, kemSecret, transcript, "server-identity");
-                corruptProof[0] ^= 1;
-                await SecureTransport.WritePlainAsync(stream, response with
-                {
-                    Proof = KeyAgreement.HybridProof(identitySecret, ephemeralSecret, kemSecret, transcript, "server"),
-                    ServerIdentityProof = corruptProof
-                }, deadline.Token);
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(identitySecret);
-                CryptographicOperations.ZeroMemory(globalSecret);
-                CryptographicOperations.ZeroMemory(ephemeralSecret);
-                CryptographicOperations.ZeroMemory(kemSecret);
             }
         }
     }

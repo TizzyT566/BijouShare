@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Hosting.WindowsServices;
@@ -7,8 +6,8 @@ using BijouShare.Shared;
 
 try
 {
-    args = WadProtocol.NormalizeActivationArguments(args);
-    var commandLine = ClientCommandLine.Parse(args);
+    var protocolLink = WadProtocol.ParseActivation(args);
+    var commandLine = ClientCommandLine.Parse(protocolLink is null ? args : []);
     if (commandLine.Command == ClientCommand.Help)
     {
         Console.WriteLine(ClientCommandLine.Help);
@@ -19,14 +18,36 @@ try
         throw new PlatformNotSupportedException("BijouShare requires Windows.");
     if (commandLine.Command == ClientCommand.SelfTest)
         return await ClientSelfTests.RunAsync();
+    if (commandLine.Command == ClientCommand.OpenManagement)
+    {
+        await ClientActivation.OpenManagementAsync(UserProfileStorage.Resolve(null), ClientTray.OpenBrowser);
+        return 0;
+    }
 
-    var directory = commandLine["--data-dir"] ?? PrivateStorage.DefaultDirectory("Client");
-    if (!Path.IsPathFullyQualified(directory))
-        throw new ArgumentException("--data-dir must be an absolute directory path.");
-    directory = Path.GetFullPath(directory);
+    if (WindowsServiceHelpers.IsWindowsService())
+    {
+        var service = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+        {
+            Args = [],
+            ContentRootPath = AppContext.BaseDirectory
+        });
+        service.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Client");
+        service.Services.AddHostedService(provider => new UserSessionLauncher(
+            provider.GetRequiredService<ILogger<UserSessionLauncher>>(), commandLine.NoBrowser));
+        using var broker = service.Build();
+        await broker.RunAsync();
+        return 0;
+    }
+
+    var directory = UserProfileStorage.Resolve(commandLine["--data-dir"]);
+    if (protocolLink is not null)
+    {
+        await ClientActivation.DeliverProtocolLinkAsync(directory, protocolLink);
+        return 0;
+    }
     if (commandLine.RegisterProtocol)
     {
-        WadProtocol.RegisterForCurrentUser(directory);
+        WadProtocol.RegisterForCurrentUser();
         Console.WriteLine("Registered wad links for this Windows user.");
         return 0;
     }
@@ -37,49 +58,25 @@ try
         return 0;
     }
     if (commandLine.Command == ClientCommand.Run && commandLine.Link is null && commandLine["--server"] is null &&
-        commandLine["--name"] is null && commandLine["--mount"] is null && commandLine["--management-port"] is null && !commandLine.ResetServerTrust)
+        commandLine["--name"] is null && commandLine["--mount"] is null && commandLine["--management-port"] is null)
     {
-        var runningUrl = await ClientActivation.TryGetManagementUrlAsync(directory);
-        if (runningUrl is not null)
+        var running = await ClientActivation.TryGetRunningClientAsync(directory);
+        if (running is not null)
         {
-            if (!commandLine.NoBrowser)
-            {
-                WadProtocol.RegisterForCurrentUser(directory);
-                OpenManagementBrowser(runningUrl);
-            }
-            Console.WriteLine($"Client management: {runningUrl}");
+            WadProtocol.RegisterOnLaunch(commandLine);
+            await ClientTray.AttachAsync(directory, running, commandLine);
             return 0;
         }
     }
-    using var lease = StorageLease.Acquire(directory);
+    using var lease = UserProfileStorage.Acquire(directory);
     var path = Path.Combine(directory, "client.json");
 
-    if (commandLine.Command == ClientCommand.CreateDevice)
-    {
-        var output = Path.GetFullPath(commandLine["--out"] ?? "device-request.json");
-        if (output.Equals(path, StringComparison.OrdinalIgnoreCase) ||
-            output.Equals(Path.Combine(directory, ".instance.lock"), StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("The public request output cannot overwrite client settings or the instance lock.");
-
-        var identity = File.Exists(path) ? ClientSettings.Load(path) : ClientSettings.Create(commandLine["--name"] ?? Environment.MachineName);
-        if (commandLine["--name"] is { } exportName)
-            identity.DeviceName = exportName;
-        identity.Save(path);
-        PrivateStorage.AtomicWrite(output, Wire.Encode(new EnrollmentRequest(identity.DeviceId, identity.DeviceName, identity.PublicKey)));
-        Console.WriteLine($"Public device request: {output}");
-        Console.WriteLine($"Device SHA-256 fingerprint: {KeyAgreement.Fingerprint(identity.PublicKey)}");
-        return 0;
-    }
-
     var existing = File.Exists(path);
-    if (!existing && commandLine.Command == ClientCommand.ImportEnrollment)
-        throw new InvalidOperationException("Configure this device before importing legacy enrollment.");
-    var settings = existing ? ClientSettings.Load(path) : ClientSettings.Create(commandLine["--name"] ?? Environment.MachineName);
+    var settings = existing ? ClientSettings.Load(path) : ClientSettings.Create(commandLine["--name"] ?? Environment.UserName);
     settings.AttachPath(path);
     if (!existing && commandLine.Command == ClientCommand.Run && commandLine["--server"] is null)
         settings.SetupComplete = false;
     var changed = !existing;
-    ServerEndpoint? selectedServer = null;
     if (commandLine["--management-port"] is { } managementPort)
     {
         if (!int.TryParse(managementPort, out var parsed) || parsed is < 1024 or > 65535)
@@ -92,9 +89,23 @@ try
         settings.DeviceName = deviceName;
         changed = true;
     }
+    string? targetDrive = null;
+    if (commandLine["--mount"] is { } mount)
+    {
+        targetDrive = ClientSettings.NormalizeMountPoint(mount);
+        if (!settings.DriveSnapshot().Contains(targetDrive))
+        {
+            if (!settings.SetupComplete)
+                throw new ArgumentException("Complete device setup before adding a drive.");
+            if (!ClientManagement.AvailableDriveLetters().Contains(targetDrive))
+                throw new ArgumentException("That drive letter is already in use.");
+            settings.AddDrive(targetDrive);
+            changed = true;
+        }
+    }
     if (commandLine.Link is { } link)
     {
-        selectedServer = settings.AddServer(link.Host, link.Port, link.InviteCode);
+        settings.AddServer(link.Host, link.Port, link.InviteCode, targetDrive, link.TrustedServerId);
         changed = true;
     }
     if (commandLine["--server"] is { } server)
@@ -106,38 +117,12 @@ try
                 throw new ArgumentException("--port must be between 1 and 65535.");
             serverPort = parsed;
         }
-        selectedServer = settings.UpsertServer(server, serverPort);
+        settings.AddServer(server, serverPort, null, targetDrive, commandLine["--server-id"], preserveInvite: true);
         changed = true;
-    }
-    if (commandLine["--mount"] is { } mount)
-    {
-        settings.MountPoint = ClientSettings.NormalizeMountPoint(mount);
-        changed = true;
-    }
-    if (commandLine.ResetServerTrust)
-    {
-        selectedServer ??= settings.Servers.Count == 1 ? settings.Servers[0] : null;
-        if (selectedServer is null)
-            throw new ArgumentException("Select the server to reset with --server and --port.");
-        settings.ResetServerTrust(selectedServer);
-        changed = true;
-    }
-
-    if (commandLine.Command == ClientCommand.ImportEnrollment)
-    {
-        var bundlePath = commandLine["--import-enrollment"]!;
-        if (new FileInfo(bundlePath).Length > 8192)
-            throw new InvalidDataException("The enrollment bundle exceeds 8 KB.");
-        var bundle = Wire.Decode<EnrollmentBundle>(File.ReadAllBytes(bundlePath));
-        settings.Enroll(bundle);
-        settings.Save(path);
-        Console.WriteLine($"Imported existing identity trust for {settings.Host}:{settings.Port}; drive {settings.MountPoint}");
-        Console.WriteLine($"Server SHA-256 fingerprint: {KeyAgreement.Fingerprint(settings.ServerPublicKey)}");
-        return 0;
     }
 
     settings.Validate(requireEnrollment: commandLine.Command == ClientCommand.Probe);
-    if (changed && settings.SetupComplete)
+    if (changed)
         settings.Save(path);
     if (commandLine.Command == ClientCommand.Probe)
     {
@@ -157,7 +142,9 @@ try
                         Offset = offset
                     })).Response;
                     if (offset == 0)
+                    {
                         Console.WriteLine($"{endpoint.FolderName ?? endpoint.Host}: authenticated device {connection.DeviceName}. Visible shares:");
+                    }
                     foreach (var entry in response.Entries ?? throw new InvalidDataException("Server returned an invalid share listing."))
                     {
                         Console.WriteLine($"  {endpoint.FolderName ?? endpoint.Host}\\{entry.Name} ({entry.Permissions})");
@@ -196,26 +183,27 @@ try
     var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = [], ContentRootPath = AppContext.BaseDirectory });
     builder.WebHost.UseUrls($"http://127.0.0.1:{settings.ManagementPort}");
     builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 8192);
-    builder.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Client");
+    var managementAccess = new ClientManagementAccess();
+    builder.Services.AddSingleton(managementAccess);
     builder.Services.AddSingleton(settings);
     builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(directory, "web-keys")))
-        .ProtectKeysWithDpapi(true).SetApplicationName("BijouShare.Client");
-    builder.Services.AddSingleton<MultiServerConnection>();
-    builder.Services.AddSingleton<IRemoteConnection>(services => services.GetRequiredService<MultiServerConnection>());
-    builder.Services.AddSingleton<DriveOperations>();
+        .ProtectKeysWithDpapi(false).SetApplicationName("BijouShare.Client");
+    builder.Services.AddSingleton<DriveConnections>();
     builder.Services.AddHostedService<DriveWorker>();
     ClientManagementWeb.AddServices(builder.Services);
     using var host = builder.Build();
+    managementAccess.RequireOwner(host);
     ClientManagementWeb.Map(host);
-    var managementUrl = $"http://127.0.0.1:{settings.ManagementPort}";
-    Console.WriteLine($"Client management: {managementUrl}");
-    var interactive = !WindowsServiceHelpers.IsWindowsService();
-    if (interactive && !commandLine.NoBrowser && (args.Length == 0 || !settings.SetupComplete || commandLine.Link is not null))
-    {
-        WadProtocol.RegisterForCurrentUser(directory);
-        host.Lifetime.ApplicationStarted.Register(() => OpenManagementBrowser(managementUrl));
-    }
-    await host.RunAsync();
+    using var trayPresence = commandLine.NoBrowser ? null : ClientTray.ClaimSession(directory, Environment.ProcessId);
+    await host.StartAsync();
+    var address = host.Urls.Single();
+    managementAccess.Listen(address);
+    Console.WriteLine($"Client management: {address}");
+    WadProtocol.RegisterOnLaunch(commandLine);
+    using var tray = trayPresence is null ? null : ClientTray.Start(
+        () => managementAccess.LaunchUrl(host.Lifetime.ApplicationStopping).GetAwaiter().GetResult(),
+        commandLine.SessionWorker ? null : host.Lifetime.StopApplication);
+    await host.WaitForShutdownAsync();
     return Environment.ExitCode;
 }
 
@@ -226,21 +214,9 @@ catch (RemoteException ex) when (ex.Code is "PendingApproval" or "DeviceRejected
         : "This device was rejected or blocked by the server administrator. It stays blocked until explicitly approved or enabled.");
     return ex.Code == "PendingApproval" ? 2 : 3;
 }
-catch (Exception ex) when (!args.Contains("--self-test") && ex is IOException or UnauthorizedAccessException or
+catch (Exception ex) when (!args.Contains("--self-test") && ex is IOException or InvalidDataException or OperationCanceledException or UnauthorizedAccessException or
     ArgumentException or InvalidOperationException or CryptographicException or System.Text.Json.JsonException or PlatformNotSupportedException)
 {
     Console.Error.WriteLine($"BijouShare client: {ex.Message}");
     return 1;
-}
-
-static void OpenManagementBrowser(string url)
-{
-    try
-    {
-        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-    }
-    catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-    {
-        Console.WriteLine($"Open the client management UI in your browser: {url}");
-    }
 }

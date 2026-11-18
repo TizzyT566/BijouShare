@@ -12,6 +12,11 @@ public sealed class StorageLease : IDisposable
         if (string.IsNullOrWhiteSpace(directory) || !Path.IsPathFullyQualified(directory))
             throw new ArgumentException("The private data directory must be an absolute path.", nameof(directory));
         PrivateStorage.SecureDirectory(directory, includeLocalService);
+        return LockDirectory(directory);
+    }
+
+    internal static StorageLease LockDirectory(string directory)
+    {
         var path = Path.Combine(directory, ".instance.lock");
         try
         {

@@ -18,7 +18,7 @@ public sealed partial class StateStore
             throw new ArgumentException("Enter the same password in both password fields.");
         var salt = RandomNumberGenerator.GetBytes(32);
         // Hashing must not block file authorization or another setup request's state inspection.
-        var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 600_000, HashAlgorithmName.SHA256, 32);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 600_000, HashAlgorithmName.SHA3_256, 32);
         var committed = false;
         try
         {
@@ -28,7 +28,6 @@ public sealed partial class StateStore
                     throw new SetupAlreadyCompletedException();
                 s.Admin = new(adminName!, salt, hash);
                 s.ServerName = serverName!;
-                s.ServerId = ServerIdentityNaming.Id(serverName!, Convert.FromBase64String(s.ServerPublicKey));
                 return true;
             });
             committed = true;

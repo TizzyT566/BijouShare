@@ -3,6 +3,7 @@
 .vs/
 .firecrawl/
 artifacts/
+Installer/
 *.user
 *.suo
 *.enrollment.json

@@ -1,6 +1,3 @@
-using System.Security.Cryptography;
-using System.Text.Json;
-using System.Text.Json.Nodes;
 using BijouShare.Shared;
 
 namespace BijouShare.Server;
@@ -37,10 +34,10 @@ internal static class DeviceStateSelfTests
         });
         using var key = KeyAgreement.NewKey();
         using var otherKey = KeyAgreement.NewKey();
-        var request = new EnrollmentRequest(Guid.NewGuid().ToString(), "Pending workstation", Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()));
+        var request = TestRegistration.Create("Pending workstation", Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()));
         check(!store.QueueRegistration(request) && store.Read(state => state.Devices.Count == 0 && state.PendingDevices.Count == 1),
             "An unknown identity queues public approval information without gaining file access");
-        var id = Guid.Parse(request.DeviceId);
+        var id = TestRegistration.RecordId(request.DeviceId);
         Denied(() => store.Identity(id), "A pending device cannot authenticate as an approved device");
         var revision = store.Revision;
         check(!store.QueueRegistration(request) && store.Revision == revision,
@@ -59,6 +56,14 @@ internal static class DeviceStateSelfTests
             "A pending device ID cannot be replaced by a different public key");
         Denied(() => store.QueueRegistration(request with { DeviceId = Guid.NewGuid().ToString() }),
             "A public key cannot be queued under a second device ID");
+        var replacement = TestRegistration.Create("Replaced identity key", request.ClientPublicKey);
+        Denied(() => store.QueueRegistration(replacement), "A new ML-KEM key cannot replace one bound to a pending ECDH key");
+        var otherEc = otherKey.ExportSubjectPublicKeyInfo();
+        var reusedKemId = DeviceIdentity.Id(otherEc, Convert.FromBase64String(request.ClientMlKemPublicKey!));
+        Denied(() => store.QueueRegistration(request with { DeviceId = reusedKemId, ClientPublicKey = Convert.ToBase64String(otherEc) }),
+            "A new ECDH key cannot claim an already-bound ML-KEM key");
+        var samePrefix = request.DeviceId[..32] + new string(request.DeviceId[32] == '0' ? '1' : '0', 32);
+        check(store.FindPendingDevice(samePrefix) is null, "Pending lookups require the entire client identity digest");
         store.RejectDevice(id);
         store = new StateStore(options);
         revision = store.Revision;
@@ -67,9 +72,11 @@ internal static class DeviceStateSelfTests
         check(store.Revision == revision && store.FindPendingDevice(id) is { Rejected: true } rejected && rejected.Name == request.DeviceName,
             "A rejected request cannot change its name or clear the administrator's decision");
         Denied(() => store.ApproveDevice(id, [allow.Id], new string('0', 64)), "Approval is bound to the pending public-key fingerprint");
-        Denied(() => store.ApproveDevice(id, [Guid.NewGuid()], KeyAgreement.Fingerprint(request.ClientPublicKey)),
+        Denied(() => store.ApproveDevice(id, [Guid.NewGuid()], request.DeviceId),
             "Approval rejects unknown groups without consuming a pending request");
-        var device = store.ApproveDevice(id, [allow.Id, deny.Id], KeyAgreement.Fingerprint(request.ClientPublicKey));
+        var device = store.ApproveDevice(id, [allow.Id, deny.Id], request.DeviceId);
+        check(store.FindRegisteredDevice(samePrefix) is null && store.FindRegisteredDevice(request.DeviceId)?.Id == id,
+            "Approved device lookup requires the full digest even when the GUID prefix matches");
         check(store.FindPendingDevice(id) is null && device.GroupIds.SequenceEqual(new[] { allow.Id, deny.Id }),
             "Explicit approval consumes a blocked request and attaches groups directly to the device");
         check((store.Permissions(device, share.Id, "child.txt") & Permission.ReadData) == 0 &&
@@ -81,12 +88,11 @@ internal static class DeviceStateSelfTests
         }, share.Id, "child.txt") == Permission.None,
             "A device with no group grants has no access");
         revision = store.Revision;
-        check(store.QueueRegistration(request) && store.Revision == revision && store.FindRegisteredDevice(id)!.ServerPublicKey == device.ServerPublicKey,
-            "Known devices reuse their approved identity and permanent server key pair");
+        check(store.QueueRegistration(request) && store.Revision == revision && store.FindRegisteredDevice(id)!.HasSameIdentity(device),
+            "Known devices reuse their approved hybrid identity");
         var renamedDevice = store.UpdateAuthenticatedDeviceName(device, "Home laptop");
         check(renamedDevice.Name == "Home laptop" && renamedDevice.GroupIds.SequenceEqual(device.GroupIds) &&
-            renamedDevice.ClientPublicKey == device.ClientPublicKey && renamedDevice.ServerPublicKey == device.ServerPublicKey &&
-            renamedDevice.ProtectedServerPrivateKey.SequenceEqual(device.ProtectedServerPrivateKey) && renamedDevice.Enabled &&
+            renamedDevice.HasSameIdentity(device) && renamedDevice.Enabled &&
             new StateStore(options).FindRegisteredDevice(id)!.Name == "Home laptop",
             "An authenticated device rename persists without changing groups, identity keys, or enabled status");
         revision = store.Revision;
@@ -94,8 +100,8 @@ internal static class DeviceStateSelfTests
         check(store.Revision == revision, "An unchanged approved device name does not rewrite state");
         Denied(() => store.UpdateAuthenticatedDeviceName(device with { ClientPublicKey = Convert.ToBase64String(otherKey.ExportSubjectPublicKeyInfo()) }, "Impostor"),
             "A different client public key cannot rename an approved device");
-        Denied(() => store.UpdateAuthenticatedDeviceName(device with { ServerPublicKey = Convert.ToBase64String(otherKey.ExportSubjectPublicKeyInfo()) }, "Stale identity"),
-            "A stale per-device server identity cannot rename an approved device");
+        Denied(() => store.UpdateAuthenticatedDeviceName(device with { ClientMlKemPublicKey = replacement.ClientMlKemPublicKey! }, "Stale identity"),
+            "A different ML-KEM identity cannot rename an approved device");
         Denied(() => store.UpdateAuthenticatedDeviceName(device, " ambiguous "), "Device renames reject invalid names before changing state");
         device = renamedDevice;
         store.Update(state => { state.Devices[0] = device with { Enabled = false }; return true; });
@@ -108,9 +114,9 @@ internal static class DeviceStateSelfTests
             "Blocking an approved device preserves its identity without creating a new approval request");
         store.Update(state => { state.Devices[0] = device; return true; });
 
-        var refreshRequest = new EnrollmentRequest(Guid.NewGuid().ToString(), "Seen again", Convert.ToBase64String(otherKey.ExportSubjectPublicKeyInfo()));
+        var refreshRequest = TestRegistration.Create("Seen again", Convert.ToBase64String(otherKey.ExportSubjectPublicKeyInfo()));
         store.QueueRegistration(refreshRequest);
-        var refreshId = Guid.Parse(refreshRequest.DeviceId);
+        var refreshId = TestRegistration.RecordId(refreshRequest.DeviceId);
         var old = DateTime.UtcNow.AddMinutes(-10);
         store.Update(state => { state.PendingDevices[0] = state.PendingDevices[0] with { FirstSeenUtc = old, LastSeenUtc = old }; return true; });
         store.QueueRegistration(refreshRequest);
@@ -124,7 +130,9 @@ internal static class DeviceStateSelfTests
             {
                 using var identity = KeyAgreement.NewKey();
                 var now = DateTime.UtcNow;
-                state.PendingDevices.Add(new(Guid.NewGuid(), "Fixture " + index, Convert.ToBase64String(identity.ExportSubjectPublicKeyInfo()), now, now));
+                var fixture = TestRegistration.Create("Fixture " + index, Convert.ToBase64String(identity.ExportSubjectPublicKeyInfo()));
+                state.PendingDevices.Add(new(TestRegistration.RecordId(fixture.DeviceId), fixture.DeviceName, fixture.ClientPublicKey,
+                    now, now, false, fixture.DeviceId, fixture.ClientMlKemPublicKey!));
             }
             return true;
         });
@@ -132,71 +140,19 @@ internal static class DeviceStateSelfTests
         queue.Update(state => { state.PendingDevices = state.PendingDevices.Select(device => device with { Rejected = true }).ToList(); return true; });
         check(!queue.QueueRegistration(request) && queue.FindPendingDevice(id) is { Rejected: false },
             "Blocked identity records do not consume the waiting-for-approval capacity");
-        Migration(root, check, Denied);
+        Denied(() => store.Update(s => s.Groups.RemoveAll(group => group.Id == StateStore.AdministratorGroupId)),
+            "The permanent Administrator group cannot be deleted");
+        Denied(() => store.Update(s =>
+        {
+            var index = s.Groups.FindIndex(group => group.Id == StateStore.AdministratorGroupId);
+            s.Groups[index] = s.Groups[index] with { Name = "Renamed" };
+            return true;
+        }), "The permanent Administrator group cannot be renamed");
+        Denied(() => store.Update(s =>
+        {
+            s.Rules.Add(s.Rules[0] with { Id = Guid.NewGuid(), Path = "nested" });
+            return true;
+        }), "Duplicate group and share assignments are rejected even for distinct rule paths");
         ServerIdentitySelfTests.Run(root, check);
-    }
-
-    private static void Migration(string root, Action<bool, string> check, Action<Action, string> denied)
-    {
-        var data = Path.Combine(root, "legacy-migration");
-        var store = new StateStore(new ServerOptions { DataDirectory = data });
-        var group = new AppGroup(Guid.NewGuid(), "Migrated group");
-        store.Update(state => { state.Groups.Add(group); return true; });
-        using var first = KeyAgreement.NewKey();
-        using var second = KeyAgreement.NewKey();
-        using var third = KeyAgreement.NewKey();
-        var devices = new[]
-        {
-            store.Enroll(new(Guid.NewGuid().ToString(), "Active", Convert.ToBase64String(first.ExportSubjectPublicKeyInfo())), [group.Id]),
-            store.Enroll(new(Guid.NewGuid().ToString(), "Disabled account", Convert.ToBase64String(second.ExportSubjectPublicKeyInfo())), [group.Id]),
-            store.Enroll(new(Guid.NewGuid().ToString(), "Disabled device", Convert.ToBase64String(third.ExportSubjectPublicKeyInfo())), [group.Id])
-        };
-        var active = Guid.NewGuid();
-        var disabled = Guid.NewGuid();
-        var bytes = Wire.Encode(new
-        {
-            admin = store.Read(state => state.Admin),
-            users = new[] { new { id = active, name = "Legacy active", enabled = true, groupIds = new[] { group.Id } },
-                new { id = disabled, name = "Legacy disabled", enabled = false, groupIds = new[] { group.Id } } },
-            groups = new[] { group },
-            shares = Array.Empty<ExportShare>(),
-            rules = Array.Empty<AccessRule>(),
-            devices = devices.Select((device, index) => new
-            {
-                device.Id,
-                device.Name,
-                userId = index == 1 ? disabled : active,
-                device.ClientPublicKey,
-                device.ProtectedServerPrivateKey,
-                device.ServerPublicKey,
-                enabled = index != 2
-            }).ToArray()
-        });
-        var statePath = Path.Combine(data, "state.json");
-        PrivateStorage.AtomicWrite(statePath, bytes);
-        var migrated = new StateStore(new ServerOptions { DataDirectory = data });
-        check(migrated.MigrationBackupPath is { } backup && Path.GetDirectoryName(backup) == data && File.ReadAllBytes(backup).SequenceEqual(bytes),
-            "Legacy migration preserves an exact rollback copy inside the protected server data directory");
-        check(migrated.Read(state => state.Devices.All(device => device.GroupIds.SequenceEqual(new[] { group.Id }))) &&
-            migrated.Identity(devices[0].Id).ServerPublicKey == devices[0].ServerPublicKey &&
-            migrated.Read(state => state.Devices.All(device => device.ProtectedServerPrivateKey.SequenceEqual(devices.Single(oldDevice => oldDevice.Id == device.Id).ProtectedServerPrivateKey))),
-            "Migration preserves device keys and copies legacy user memberships directly onto devices");
-        denied(() => migrated.Identity(devices[1].Id), "A disabled legacy account produces a blocked device after migration");
-        denied(() => migrated.Identity(devices[2].Id), "A disabled legacy device remains blocked after migration");
-        using var document = JsonDocument.Parse(File.ReadAllBytes(statePath));
-        check(document.RootElement.GetProperty("schemaVersion").GetInt32() == 3 && !document.RootElement.TryGetProperty("users", out _),
-            "Migrated state persists the device/group schema without user entities");
-        var reloaded = new StateStore(new ServerOptions { DataDirectory = data });
-        check(reloaded.MigrationBackupPath is null && Directory.EnumerateFiles(data, "*.before-device-groups-*.bak").Count() == 1,
-            "The schema migration runs only once and never overwrites its rollback copy");
-        var corrupt = Path.Combine(root, "invalid-legacy-migration");
-        PrivateStorage.SecureDirectory(corrupt);
-        var node = JsonNode.Parse(bytes)!;
-        node["devices"]![0]!["userId"] = Guid.NewGuid().ToString();
-        var corruptBytes = System.Text.Encoding.UTF8.GetBytes(node.ToJsonString(Wire.Json));
-        var corruptPath = Path.Combine(corrupt, "state.json");
-        PrivateStorage.AtomicWrite(corruptPath, corruptBytes);
-        denied(() => _ = new StateStore(new ServerOptions { DataDirectory = corrupt }), "Migration fails closed for a missing legacy device owner");
-        check(File.ReadAllBytes(corruptPath).SequenceEqual(corruptBytes), "A rejected legacy migration leaves the original state untouched");
     }
 }

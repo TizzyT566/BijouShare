@@ -2,6 +2,25 @@
   <PropertyGroup>
     <RootNamespace>BijouShare.Server</RootNamespace>
   </PropertyGroup>
+  <!-- The installed desktop companion shares this project's published service and runtime. -->
+  <PropertyGroup Condition="'$(TrayServerAssembly)' != ''">
+    <AssemblyName>BijouShare.Server.Tray</AssemblyName>
+    <AssemblyTitle>BijouShare Server Tray</AssemblyTitle>
+    <OutputType>WinExe</OutputType>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TrayServerAssembly)' == ''">
+    <Compile Remove="TrayProgram.cs" />
+    <InternalsVisibleTo Include="BijouShare.Server.Tray" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TrayServerAssembly)' != ''">
+    <Compile Remove="@(Compile)" />
+    <Content Remove="@(Content)" />
+    <Compile Include="TrayProgram.cs" />
+    <Reference Include="BijouShare.Server" HintPath="$(TrayServerAssembly)" />
+  </ItemGroup>
   <ItemGroup>
     <Content Update="wwwroot/**" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0" />

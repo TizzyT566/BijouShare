@@ -21,15 +21,31 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         public ServerConnectionStatus Status = new(label, false, "Waiting");
         public long FreeBytes;
         public long TotalBytes;
-        public ServerEndpoint? Endpoint;
+        public ServerEndpoint? Endpoint { get; init; }
+        public Func<Target>? Reconnect { get; init; }
+        public CancellationToken VerificationToken { get; init; }
         public int Removed;
         public long FailureRevision;
+    }
+
+    private static Target CreateTarget(ClientSettings settings, ServerEndpoint endpoint, ILoggerFactory loggerFactory)
+    {
+        var view = settings.ForServer(endpoint);
+        var connection = new RemoteConnection(view, loggerFactory.CreateLogger<RemoteConnection>());
+        return new Target(endpoint.Host + ":" + endpoint.Port, connection, () => endpoint.FolderName,
+            () => endpoint.PresentedServerId)
+        {
+            Endpoint = endpoint,
+            Reconnect = () => CreateTarget(settings, endpoint, loggerFactory),
+            VerificationToken = view.VerificationToken
+        };
     }
     private sealed record Handle(Target Server, Guid RemoteHandle, long Generation, string FolderName, string? Identity);
     private sealed record Route(Target Server, string Name, string? Identity);
     private sealed record RouteStamp(string? Name, string? Identity, bool Connected);
     private sealed record RouteTable(Dictionary<string, Route> Names, HashSet<string> Conflicts, Route[] Entries);
     private Target[] targets;
+    private readonly string? mountPoint;
     private readonly object routeGate = new();
     private RouteStamp[] routeStamps = [];
     private RouteTable routes = new(new(StringComparer.OrdinalIgnoreCase), new(StringComparer.OrdinalIgnoreCase), []);
@@ -40,9 +56,16 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     private const Permission NamespacePermissions = Permission.ListDirectory | Permission.ReadAttributes | Permission.ReadPermissions;
 
     public MultiServerConnection(ClientSettings settings, ILoggerFactory loggerFactory)
+        : this(settings, loggerFactory, settings.MountPoint)
+    {
+    }
+
+    internal MultiServerConnection(ClientSettings settings, ILoggerFactory loggerFactory, string mountPoint)
         : this(Array.Empty<(string, IRemoteConnection, Func<string?>, Func<string?>)>())
     {
-        Synchronize(settings, loggerFactory);
+        this.mountPoint = mountPoint;
+        if (settings.SetupComplete)
+            Synchronize(settings, loggerFactory);
     }
 
     internal MultiServerConnection(IEnumerable<(string Name, IRemoteConnection Connection)> servers)
@@ -65,17 +88,13 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
             var existing = Volatile.Read(ref targets);
-            var next = settings.ServerSnapshot().Select(server =>
+            var next = settings.ServerSnapshot(mountPoint).Select(server =>
             {
                 var retained = existing.SingleOrDefault(target => ReferenceEquals(target.Endpoint, server));
-                if (retained is not null && !reconnectAll && !ReferenceEquals(reconnect, server))
+                if (retained is not null && !retained.VerificationToken.IsCancellationRequested &&
+                    !reconnectAll && !ReferenceEquals(reconnect, server))
                     return retained;
-                return new Target(server.Host + ":" + server.Port,
-                    new RemoteConnection(settings.ForServer(server), loggerFactory.CreateLogger<RemoteConnection>()),
-                    () => server.FolderName, () => server.ServerKeyFingerprint)
-                {
-                    Endpoint = server
-                };
+                return CreateTarget(settings, server, loggerFactory);
             }).ToArray();
             removed.AddRange(existing.Except(next));
             foreach (var target in removed)
@@ -179,20 +198,31 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         }
     }
 
-    // Probe every endpoint independently. A slow/offline endpoint cannot delay mounting a healthy one.
-    public async Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token)
+    internal void RequestRefresh() => StartProbes(queue: true);
+
+    private List<Task> StartProbes(bool queue = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
-        var probes = Volatile.Read(ref targets).Select(target =>
+        // Rebuild endpoints invalidated by a settings change.
+        foreach (var target in Volatile.Read(ref targets))
+            if (target.VerificationToken.IsCancellationRequested)
+                ReplaceConnection(target);
+        return Volatile.Read(ref targets).Select(target =>
         {
             lock (target.Gate)
             {
                 if (target.Probe is null || target.Probe.IsCompleted)
-                    target.Probe = ProbeAsync(target);
+                    target.Probe = queue ? Task.Run(() => ProbeAsync(target)) : ProbeAsync(target);
                 return target.Probe;
             }
         }).ToList();
+    }
+
+    // Probe every endpoint independently. A slow/offline endpoint cannot delay mounting a healthy one.
+    public async Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+        var probes = StartProbes();
         var pause = Task.Delay(TimeSpan.FromSeconds(1), linked.Token);
         while (probes.Count > 0)
         {
@@ -206,6 +236,51 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 break;
         }
         return Statuses;
+    }
+
+    internal Task<IReadOnlyList<ServerConnectionStatus>> RecoverAfterResumeAsync(CancellationToken token)
+    {
+        // An unfinished handshake can be stuck on the pre-sleep adapter. Established
+        // sessions use the regular RPC deadline so a queued probe cannot cut off a writer.
+        foreach (var target in Volatile.Read(ref targets))
+        {
+            token.ThrowIfCancellationRequested();
+            if (!Volatile.Read(ref target.Status).Connected)
+                ReplaceConnection(target);
+        }
+        return RefreshAsync(token);
+    }
+
+    internal void ResetAfterUnmount()
+    {
+        // Windows has abandoned the mount's handles. Closing each session releases server-side writer leases.
+        foreach (var target in Volatile.Read(ref targets))
+            ReplaceConnection(target);
+    }
+
+    private void ReplaceConnection(Target target)
+    {
+        if (target.Reconnect is not { } reconnect)
+            return;
+        lock (routeGate)
+        {
+            var current = Volatile.Read(ref targets);
+            var index = Array.IndexOf(current, target);
+            if (index < 0 || Volatile.Read(ref disposed) != 0)
+                return;
+            var next = (Target[])current.Clone();
+            // The profile may have removed this endpoint while its heartbeat was queued.
+            try { next[index] = reconnect(); }
+            catch (ArgumentException) when (target.VerificationToken.IsCancellationRequested) { return; }
+            Volatile.Write(ref target.Removed, 1);
+            Volatile.Write(ref targets, next);
+            routeStamps = [];
+            RefreshRoutes();
+            foreach (var handle in handles.Where(pair => pair.Value.Server == target))
+                handles.TryRemove(handle.Key, out _);
+        }
+        // Close old sockets and cancel any handshakes started before the adapter came back.
+        (target.Connection as IDisposable)?.Dispose();
     }
 
     private async Task ProbeAsync(Target target)
@@ -237,6 +312,10 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     RefreshRoutes();
                 }
             }
+        }
+        catch (RemoteException ex) when (ex.Code == "Timeout" && Volatile.Read(ref target.Status).Connected)
+        {
+            // A timeout before transmission says nothing about the authenticated connection.
         }
         catch (RemoteException ex) { MarkUnavailable(target, ex.Code); }
         catch (ServerIdentityMismatchException) { MarkUnavailable(target, "ServerIdentityChanged"); }
@@ -272,37 +351,42 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
-        (Target? Server, string Path) route;
+        (Target? Server, string Path, string? Identity) route;
         Handle? mapped = null;
         if (request.Handle != Guid.Empty)
         {
-            if (!handles.TryGetValue(request.Handle, out mapped) || expectedGeneration != mapped.Generation)
+            if (request.Operation == "Open" || !handles.TryGetValue(request.Handle, out mapped) || expectedGeneration != mapped.Generation)
                 throw new RemoteException("InvalidHandle");
             var parts = NormalizePath(request.Path);
             if (Volatile.Read(ref mapped.Server.Removed) != 0 || mapped.Identity != mapped.Server.Identity || parts.Length > 0 &&
                 !parts[0].Equals(mapped.FolderName, StringComparison.OrdinalIgnoreCase) &&
                 !parts[0].Equals(mapped.Server.FolderName, StringComparison.OrdinalIgnoreCase))
                 throw new RemoteException("InvalidHandle");
-            route = (mapped.Server, parts.Length <= 1 ? "/" : "/" + string.Join('/', parts.Skip(1)));
+            route = (mapped.Server, parts.Length <= 1 ? "/" : "/" + string.Join('/', parts.Skip(1)), mapped.Identity);
         }
         else
             route = Parse(request.Path);
-        if (mapped is null && (route.Server is null || route.Path == "/"))
+        if (mapped?.RemoteHandle == Guid.Empty && route.Path != "/")
+            throw new RemoteException("InvalidHandle");
+        if ((mapped is null || mapped.RemoteHandle == Guid.Empty) && (route.Server is null || route.Path == "/"))
         {
             if (request.Operation == "List" && route.Server is not null)
                 return await Forward(route.Server, request with
                 {
-                    Path = "/"
-                }, null, linked.Token);
-            return new(Namespace(request, route.Server), 0);
+                    Path = "/", Handle = Guid.Empty
+                }, null, route.Identity, linked.Token);
+            var result = new RemoteReply(Namespace(request, route.Server), 0);
+            if (mapped is not null && request.Operation == "Close")
+                handles.TryRemove(request.Handle, out _);
+            return request.Operation == "Open" && route.Server is not null
+                ? RetainHandle(route.Server, route.Identity, request.Path, result) : result;
         }
         var target = route.Server ?? throw new RemoteException("InvalidHandle");
         var destination = request.Destination;
         if (destination is not null)
         {
             var other = Parse(destination);
-            if (other.Server != target && (other.Server?.Identity is null || other.Server.Identity != target.Identity ||
-                !string.Equals(other.Server.FolderName, target.FolderName, StringComparison.OrdinalIgnoreCase)))
+            if (other.Identity != route.Identity || other.Server != target)
                 throw new RemoteException("NotSameDevice");
             if (other.Path == "/")
                 throw new RemoteException("AccessDenied");
@@ -316,39 +400,42 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         };
         if (mapped is not null && request.Operation == "Close")
             handles.TryRemove(request.Handle, out _);
-        var reply = await Forward(target, forwarded, mapped?.Generation, linked.Token);
-        if (request.Operation == "Open" && reply.Response.Handle != Guid.Empty)
-        {
-            var local = Guid.NewGuid();
-            lock (routeGate)
-            {
-                if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0)
-                    throw new RemoteException("InvalidHandle");
-                if (!handles.TryAdd(local, new(target, reply.Response.Handle, reply.Generation, NormalizePath(request.Path)[0], target.Identity)))
-                    throw new IOException("Cannot retain remote file handle.");
-            }
-            return new(reply.Response with
-            {
-                Handle = local
-            }, reply.Generation);
-        }
-        return reply;
+        var reply = await Forward(target, forwarded, mapped?.Generation, route.Identity, linked.Token);
+        return request.Operation == "Open" && reply.Response.Handle != Guid.Empty
+            ? RetainHandle(target, route.Identity, request.Path, reply) : reply;
     }
 
-    private async Task<RemoteReply> Forward(Target target, RpcRequest request, long? generation, CancellationToken token)
+    private RemoteReply RetainHandle(Target target, string? identity, string path, RemoteReply reply)
     {
-        if (Volatile.Read(ref target.Removed) != 0)
+        var local = Guid.NewGuid();
+        lock (routeGate)
+        {
+            if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0 ||
+                target.Identity != identity)
+                throw new RemoteException("InvalidHandle");
+            if (!handles.TryAdd(local, new(target, reply.Response.Handle, reply.Generation, NormalizePath(path)[0], identity)))
+                throw new IOException("Cannot retain file handle.");
+        }
+        return new(reply.Response with { Handle = local }, reply.Generation);
+    }
+
+    private async Task<RemoteReply> Forward(Target target, RpcRequest request, long? generation, string? routeIdentity, CancellationToken token)
+    {
+        if (Volatile.Read(ref target.Removed) != 0 || target.Identity != routeIdentity)
             throw new RemoteException("InvalidHandle");
         try
         {
-            var result = await target.Connection.CallAsync(request, generation, token);
-            if (Volatile.Read(ref target.Removed) != 0)
+            // The socket may reconnect to a different identity while this request is queued.
+            var result = target.Connection is RemoteConnection remote
+                ? await remote.CallForIdentityAsync(request, generation, routeIdentity, token)
+                : await target.Connection.CallAsync(request, generation, token);
+            if (Volatile.Read(ref target.Removed) != 0 || target.Identity != routeIdentity)
                 throw new RemoteException("InvalidHandle");
             // Existing IO can complete after another request detects a disconnect.
             // Only a fresh successful probe may restore an offline root folder.
             return result;
         }
-        catch (RemoteException ex) when (ex.Code is "Disconnected" or "DeviceBlocked" or "DeviceRejected" or "PendingApproval" or "InvalidInvite" or "InviteUnsupported" or "HybridUnavailable")
+        catch (RemoteException ex) when (ex.Code is "Disconnected" or "DeviceBlocked" or "DeviceRejected" or "PendingApproval" or "InvalidInvite" or "InviteUnsupported" or "HybridUnavailable" or "ServerLinkRequired")
         {
             MarkUnavailable(target, ex.Code);
             throw;
@@ -387,7 +474,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     throw new RemoteException("Exists");
                 const uint writable = AccessMask.GenericWrite | AccessMask.GenericAll | AccessMask.WriteData | AccessMask.AppendData |
                     AccessMask.WriteEa | AccessMask.WriteAttributes | AccessMask.Delete | AccessMask.DeleteChild | AccessMask.WriteDac | AccessMask.WriteOwner;
-                if (request.Mode is not (FileMode.Open or FileMode.OpenOrCreate) || (request.Access & writable) != 0)
+                if (request.DeleteOnClose || request.Mode is not (FileMode.Open or FileMode.OpenOrCreate) || (request.Access & writable) != 0)
                     throw new RemoteException("AccessDenied");
                 return new()
                 {
@@ -420,6 +507,8 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     TotalBytes = total
                 };
             case "Cleanup" or "Close":
+                if (request.DeleteOnClose)
+                    throw new RemoteException("AccessDenied");
                 return new();
             case "Read" or "Write":
                 throw new RemoteException("IsDirectory");
@@ -429,18 +518,20 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     }
 
     private static long AddSaturated(long left, long right) => right > long.MaxValue - left ? long.MaxValue : left + right;
-    private static RemoteEntry DirectoryEntry(string name) => new(name, FileAttributes.Directory, 0, NamespaceTime, NamespaceTime, NamespaceTime, NamespacePermissions);
-    private (Target? Server, string Path) Parse(string path)
+    private static RemoteEntry DirectoryEntry(string name) => new(name, FileAttributes.Directory,
+        0, NamespaceTime, NamespaceTime, NamespaceTime, NamespacePermissions);
+
+    private (Target? Server, string Path, string? Identity) Parse(string path)
     {
         var parts = NormalizePath(path);
         if (parts.Length == 0)
-            return (null, "/");
+            return (null, "/", null);
         var snapshot = Volatile.Read(ref routes);
         if (snapshot.Conflicts.Contains(parts[0]))
             throw new RemoteException("ServerIdentityConflict");
         if (!snapshot.Names.TryGetValue(parts[0], out var route))
             throw new RemoteException("NotFound");
-        return (route.Server, parts.Length == 1 ? "/" : "/" + string.Join('/', parts.Skip(1)));
+        return (route.Server, parts.Length == 1 ? "/" : "/" + string.Join('/', parts.Skip(1)), route.Identity);
     }
 
     private static string[] NormalizePath(string path)

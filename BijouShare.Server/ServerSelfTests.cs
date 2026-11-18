@@ -14,6 +14,14 @@ namespace BijouShare.Server;
 // Built into the server so the solution remains exactly two projects.
 public static class ServerSelfTests
 {
+    private static AccessRule AddScope(StateStore store, Guid group, Guid share, AccessScope scope) => store.Update(state =>
+    {
+        var index = state.Rules.FindIndex(rule => rule.GroupId == group && rule.ShareId == share);
+        var original = state.Rules[index];
+        state.Rules[index] = original with { AdditionalScopes = [.. original.AdditionalScopes ?? [], scope] };
+        return original;
+    });
+
     public static async Task<int> RunAsync()
     {
         await ProtocolSelfTests.RunAsync();
@@ -24,7 +32,8 @@ public static class ServerSelfTests
         await DeviceApprovalSelfTests.RunAsync();
         await InviteSelfTests.RunAsync();
         var root = Path.GetFullPath(Path.Combine("artifacts", "self-tests", Guid.NewGuid().ToString("N")));
-        var fixture = CreateFixture(root);
+        using var identityKem = HybridKem.Generate();
+        var fixture = CreateFixture(root, identityKem);
         var (store, options, device, key, publicKey) = fixture;
         using var audit = new AuditLog(store, NullLogger<AuditLog>.Instance);
         using var files = new FileService(store, audit);
@@ -36,6 +45,7 @@ public static class ServerSelfTests
             count++;
             Console.WriteLine("PASS: " + label);
         }
+        AdministratorFileSelfTests.Run(root, store, files, Check);
         var session = Guid.NewGuid();
         var second = Guid.NewGuid();
         RpcResponse Call(RpcRequest r, Guid? s = null) => files.Execute(s ?? session, device.Id, r);
@@ -60,8 +70,8 @@ public static class ServerSelfTests
         var group = device.GroupIds.Single();
         var share = store.Read(s => s.Shares.Single(s => s.Name == "Team"));
         using var secondDeviceKey = KeyAgreement.NewKey();
-        var secondDevice = store.Enroll(new(Guid.NewGuid().ToString(), "Second device", Convert.ToBase64String(secondDeviceKey.ExportSubjectPublicKeyInfo())), device.GroupIds);
-        Check(secondDevice.ServerPublicKey != device.ServerPublicKey, "Each device receives a distinct persistent server key pair");
+        var secondDevice = store.Enroll(TestRegistration.Create("Second device", Convert.ToBase64String(secondDeviceKey.ExportSubjectPublicKeyInfo())), device.GroupIds);
+        Check(secondDevice.PublicIdentity != device.PublicIdentity, "Each device retains its own hybrid identity");
         Check(Call(new()
         {
             Operation = "List"
@@ -152,8 +162,7 @@ public static class ServerSelfTests
         writer = Open("/Team/example.txt", full, second);
         Check(writer.Handle != Guid.Empty, "Disconnect releases writer ownership and file handles");
         files.ReleaseSession(second);
-        var deny = new AccessRule(Guid.NewGuid(), group, share.Id, "restricted", Permission.None, Permission.FullControl, true);
-        store.Update(s => { s.Rules.Add(deny); return true; });
+        AddScope(store, group, share.Id, new("restricted", Permission.None, Permission.FullControl, true));
         Check(Call(new()
         {
             Operation = "List",
@@ -171,7 +180,7 @@ public static class ServerSelfTests
             Destination = "/Team/public"
         });
         File.WriteAllText(Path.Combine(root, "share", "scoped.txt"), "scoped");
-        store.Update(s => { s.Rules.Add(new(Guid.NewGuid(), group, share.Id, "scoped.txt", 0, Permission.WriteData, false)); return true; });
+        AddScope(store, group, share.Id, new("scoped.txt", 0, Permission.WriteData, false));
         Fails("AccessDenied", new()
         {
             Operation = "Move",
@@ -190,6 +199,35 @@ public static class ServerSelfTests
         {
             Operation = "Stat",
             Path = "/Private/state.json"
+        });
+        var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        var commonDataShare = new ExportShare(Guid.NewGuid(), "CommonData", programData, true);
+        store.Update(state =>
+        {
+            state.Shares.Add(commonDataShare);
+            state.Rules.Add(new(Guid.NewGuid(), group, commonDataShare.Id, "", Permission.ReadAttributes, Permission.None, true));
+            return true;
+        });
+        foreach (var product in new[] { "BijouShare", "NetworkDrive" })
+            Fails("AccessDenied", new() { Operation = "Stat", Path = $"/CommonData/{product}/self-test-absent" });
+        const string profileSid = "S-1-5-21-1-2-3-1001";
+        var customBase = Path.Combine(root, "share", "client-profiles");
+        var privateDir = Directory.CreateDirectory(Path.Combine(customBase, profileSid));
+        File.WriteAllText(Path.Combine(privateDir.FullName, "client.json"), "{}");
+        Directory.CreateDirectory(Path.Combine(customBase, ".BijouShare", "web-keys"));
+        Fails("AccessDenied", new() { Operation = "Stat", Path = "/Team/client-profiles/.BIJOUSHARE/web-keys" });
+        File.WriteAllText(Path.Combine(customBase, "ordinary.txt"), "visible");
+        var visibleChildren = Call(new() { Operation = "List", Path = "/Team/client-profiles" }).Entries!;
+        Check(visibleChildren.Count == 1 && visibleChildren[0].Name == "ordinary.txt",
+            "An enclosing share lists ordinary files and hides custom per-user client profiles");
+        Fails("AccessDenied", new() { Operation = "Open", Path = $"/Team/client-profiles/{profileSid}/client.json", Mode = FileMode.Open, Access = AccessMask.GenericRead });
+        Fails("AccessDenied", new() { Operation = "Move", Path = "/Team/client-profiles", Destination = "/Team/relocated-profiles" });
+        Fails("AccessDenied", new() { Operation = "Stat", Path = $"/Team/AppData/Local/BijouShare/Client/{profileSid}/web-keys" });
+        store.Update(state =>
+        {
+            state.Rules.RemoveAll(rule => rule.ShareId == commonDataShare.Id);
+            state.Shares.Remove(commonDataShare);
+            return true;
         });
         var created = Open("/Team/new.txt", full, mode: FileMode.CreateNew);
         Call(new()
@@ -248,6 +286,7 @@ public static class ServerSelfTests
             Handle = directory.Handle
         });
         Check(Directory.Exists(Path.Combine(root, "share", "new-folder")), "Folder creation is implemented");
+        DirectorySharingRegressions(root, files, device, Check);
         Fails("NotFound", new()
         {
             Operation = "Open",
@@ -389,10 +428,71 @@ public static class ServerSelfTests
         });
         FileSystemRegressions(root, store, files, device, secondDevice, share, Check);
         ExportVisibilityRegressions(root, store, files, device, group, Check);
-        await NetworkTests(options, store, files, audit, device, key, publicKey, Check);
+        await NetworkTests(options, store, files, audit, device, key, publicKey, identityKem, Check);
         CryptographicOperations.ZeroMemory(key);
         Console.WriteLine($"Server: {count} checks passed. Fixture: {root}");
         return 0;
+    }
+
+    private static void DirectorySharingRegressions(string root, FileService files, Device device, Action<bool, string> check)
+    {
+        const string parent = "/Team/rename-sharing";
+        const string source = parent + "/New folder";
+        const string destination = parent + "/Test";
+        const FileShare all = FileShare.ReadWrite | FileShare.Delete;
+        const uint metadata = AccessMask.ReadAttributes | 0x00100000; // FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        var physical = Path.Combine(root, "share", "rename-sharing");
+        Directory.CreateDirectory(Path.Combine(physical, "New folder", "Child"));
+        var shell = Guid.NewGuid();
+        var observer = Guid.NewGuid();
+        RpcResponse Send(Guid session, RpcRequest request) => files.Execute(session, device.Id, request);
+        RpcRequest Open(string path, uint access, FileShare share) => new()
+        {
+            Operation = "Open", Path = path, Access = access, Share = share, Directory = true
+        };
+        void Conflict(RpcRequest request, string label)
+        {
+            try { Send(shell, request); }
+            catch (IOException ex) when (FileService.ErrorCode(ex) == "SharingViolation") { check(true, label); return; }
+            throw new InvalidOperationException("Expected SharingViolation: " + label);
+        }
+        try
+        {
+            var firstProbe = Send(observer, Open(parent, metadata, FileShare.None)).Handle;
+            var addingFolder = Send(shell, Open(parent, AccessMask.AppendData, all)).Handle;
+            Send(observer, new() { Operation = "Close", Handle = firstProbe });
+            var secondProbe = Send(observer, Open(parent, metadata, FileShare.None)).Handle;
+            check(addingFolder != Guid.Empty && secondProbe != Guid.Empty,
+                "An attributes-only parent probe with no share flags coexists with FILE_ADD_SUBDIRECTORY in either open order");
+            Send(shell, new() { Operation = "Close", Handle = addingFolder });
+            var parentReader = Send(observer, Open(parent, AccessMask.ReadData, FileShare.Read)).Handle;
+            Conflict(Open(parent, AccessMask.AppendData, all), "An active parent directory reader that denies sharing writes blocks FILE_ADD_SUBDIRECTORY");
+            Send(observer, new() { Operation = "Close", Handle = parentReader });
+
+            Send(observer, Open(source + "/Child", metadata, FileShare.None));
+            var childReader = Send(observer, Open(source + "/Child", AccessMask.ReadData, FileShare.ReadWrite)).Handle;
+            var move = new RpcRequest { Operation = "Move", Path = source, Destination = destination };
+            Conflict(move, "An active descendant directory reader without delete sharing blocks rename");
+            Conflict(new() { Operation = "CanDelete", Path = source + "/Child" }, "An active directory reader without delete sharing blocks deletion");
+            check(Directory.Exists(Path.Combine(physical, "New folder", "Child")) && !Directory.Exists(Path.Combine(physical, "Test")),
+                "A sharing violation preserves the original directory tree");
+
+            Send(observer, new() { Operation = "Cleanup", Handle = childReader });
+            Send(observer, Open(source + "/Child", AccessMask.ReadData, all));
+            Send(shell, move);
+            check(Directory.Exists(Path.Combine(physical, "Test", "Child")) && !Directory.Exists(Path.Combine(physical, "New folder")),
+                "Directory rename succeeds with metadata-only, cleaned, and delete-sharing descendant handles");
+            var delete = Send(shell, Open(destination + "/Child", AccessMask.Delete, all)).Handle;
+            Send(shell, new() { Operation = "CanDelete", Handle = delete });
+            Send(shell, new() { Operation = "Cleanup", Handle = delete, DeleteOnClose = true });
+            check(!Directory.Exists(Path.Combine(physical, "Test", "Child")),
+                "Directory deletion succeeds with metadata-only, cleaned, and delete-sharing handles");
+        }
+        finally
+        {
+            files.ReleaseSession(observer);
+            files.ReleaseSession(shell);
+        }
     }
 
     private static void DirectoryCursorRegressions(string root, StateStore store, FileService files,
@@ -436,8 +536,7 @@ public static class ServerSelfTests
             Path = "/Team/paged",
             Count = 7
         });
-        var deny = new AccessRule(Guid.NewGuid(), group, share, "paged", Permission.None, Permission.ReadAttributes, true);
-        store.Update(state => { state.Rules.Add(deny); return true; });
+        var originalRule = AddScope(store, group, share, new("paged", Permission.None, Permission.ReadAttributes, true));
         try
         {
             var hidden = true;
@@ -462,7 +561,7 @@ public static class ServerSelfTests
         }
         finally
         {
-            store.Update(state => { state.Rules.RemoveAll(rule => rule.Id == deny.Id); return true; });
+            store.Update(state => state.Rules[state.Rules.FindIndex(rule => rule.Id == originalRule.Id)] = originalRule);
             files.ReleaseSession(session);
         }
         check(Call(new() { Operation = "List", Path = "/Team/paged", Count = 1 }).Entries is { Count: 1 },
@@ -502,6 +601,34 @@ public static class ServerSelfTests
             }).Entries!;
             check(Visible(listing.Single(entry => entry.Name == "VisibleExport")), "Explicit exports do not inherit physical Hidden/System root flags");
             check(Visible(listing.Single(entry => entry.Name == "VisibleDrive")), "A whole drive appears as a visible virtual share");
+            var unusedDrive = Enumerable.Range('D', 'Z' - 'D' + 1).Select(letter => $"{(char)letter}:\\")
+                .Except(Environment.GetLogicalDrives(), StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+            if (unusedDrive is not null)
+            {
+                var healthy = Call(new() { Operation = "Space" });
+                var offlineId = Guid.NewGuid();
+                store.Update(state =>
+                {
+                    state.Shares.Add(new(offlineId, "OfflineVolume", unusedDrive, true));
+                    state.Rules.Add(new(Guid.NewGuid(), groupId, offlineId, "", Permission.ReadAttributes, Permission.None, true));
+                    return true;
+                });
+                try
+                {
+                    var space = Call(new() { Operation = "Space" });
+                    check(space.TotalBytes > 0 && space.TotalBytes == healthy.TotalBytes,
+                        "An unavailable exported volume leaves healthy drive capacity available to client probes");
+                }
+                finally
+                {
+                    store.Update(state =>
+                    {
+                        state.Rules.RemoveAll(rule => rule.ShareId == offlineId);
+                        state.Shares.RemoveAll(share => share.Id == offlineId);
+                        return true;
+                    });
+                }
+            }
             check(Visible(Call(new()
             {
                 Operation = "Stat",
@@ -721,8 +848,8 @@ public static class ServerSelfTests
         });
         using var creatorKey = KeyAgreement.NewKey();
         using var renamerKey = KeyAgreement.NewKey();
-        var creatorDevice = store.Enroll(new(Guid.NewGuid().ToString(), "Creator device", Convert.ToBase64String(creatorKey.ExportSubjectPublicKeyInfo())), [createGroup]);
-        var renamerDevice = store.Enroll(new(Guid.NewGuid().ToString(), "Renamer device", Convert.ToBase64String(renamerKey.ExportSubjectPublicKeyInfo())), [renameGroup]);
+        var creatorDevice = store.Enroll(TestRegistration.Create("Creator device", Convert.ToBase64String(creatorKey.ExportSubjectPublicKeyInfo())), [createGroup]);
+        var renamerDevice = store.Enroll(TestRegistration.Create("Renamer device", Convert.ToBase64String(renamerKey.ExportSubjectPublicKeyInfo())), [renameGroup]);
         var creatorSession = Guid.NewGuid();
         var creator = files.Execute(creatorSession, creatorDevice.Id, new()
         {
@@ -746,7 +873,47 @@ public static class ServerSelfTests
             throw new InvalidOperationException("CreateDirectories was granted by CreateFiles.");
         }
         catch (UnauthorizedAccessException) { check(true, "CreateFiles does not implicitly grant CreateDirectories"); }
+        const uint synchronize = 0x00100000;
+        var emptyFile = files.Execute(creatorSession, creatorDevice.Id, new()
+        {
+            Operation = "Open", Path = "/Team/empty-from-creator", Access = synchronize,
+            Mode = FileMode.CreateNew, Share = sharing, Attributes = FileAttributes.Temporary
+        });
+        var createdPath = Path.Combine(root, "share", "empty-from-creator");
+        check(!emptyFile.Existed && new FileInfo(createdPath).Length == 0 &&
+            File.GetAttributes(createdPath).HasFlag(FileAttributes.Temporary),
+            "CreateFiles allows creating an empty temporary file with a metadata-only handle");
+        try
+        {
+            files.Execute(creatorSession, creatorDevice.Id, new() { Operation = "Write", Handle = emptyFile.Handle, Data = [42] });
+            throw new InvalidOperationException("CreateFiles allowed writing file data.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            check(new FileInfo(createdPath).Length == 0, "Creating an empty file does not grant WriteData");
+        }
+        try
+        {
+            files.Execute(creatorSession, creatorDevice.Id, new()
+            {
+                Operation = "Open", Directory = true, Path = "/Team/denied-new-directory",
+                Access = synchronize, Mode = FileMode.CreateNew, Share = sharing
+            });
+            throw new InvalidOperationException("File-only creator created a directory.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            check(!Directory.Exists(Path.Combine(root, "share", "denied-new-directory")),
+                "A missing CreateDirectories grant denies folder creation without changing storage");
+        }
         files.ReleaseSession(creatorSession);
+
+        var readCreator = Open("/Team/created-read-handle.txt", AccessMask.ReadData, mode: FileMode.CreateNew);
+        check(Call(new() { Operation = "Read", Handle = readCreator.Handle, Count = 1 }).Data is { Length: 0 },
+            "CreateNew can return an ordinary readable file handle");
+        Reject("AccessDenied", new() { Operation = "Write", Handle = readCreator.Handle, Data = [1] },
+            "A read-only CreateNew handle cannot write even for an authorized writer");
+        Call(new() { Operation = "Close", Handle = readCreator.Handle });
 
         File.WriteAllText(Path.Combine(root, "share", "rename-only.txt"), "rename");
         var renameSession = Guid.NewGuid();
@@ -807,7 +974,7 @@ public static class ServerSelfTests
             Handle = aliasReader.Handle
         }, readerSession);
         File.WriteAllText(Path.Combine(root, "share", "alias-policy.txt"), "policy");
-        store.Update(state => { state.Rules.Add(new(Guid.NewGuid(), aliasReaders, aliasId, "alias-policy.txt", Permission.None, Permission.ReadData, false)); return true; });
+        AddScope(store, aliasReaders, aliasId, new("alias-policy.txt", Permission.None, Permission.ReadData, false));
         Reject("AccessDenied", new()
         {
             Operation = "Move",
@@ -925,7 +1092,7 @@ public static class ServerSelfTests
     private static extern bool SetJunction(SafeFileHandle directory, uint code, byte[] data, int dataSize,
         IntPtr output, int outputSize, out int returned, IntPtr overlapped);
 
-    public static (StateStore Store, ServerOptions Options, Device Device, byte[] Key, byte[] ServerPublicKey) CreateFixture(string root)
+    public static (StateStore Store, ServerOptions Options, Device Device, byte[] Key, byte[] ServerPublicKey) CreateFixture(string root, HybridKem? identityKem = null)
     {
         Directory.CreateDirectory(Path.Combine(root, "share", "restricted"));
         File.WriteAllText(Path.Combine(root, "share", "example.txt"), "example data");
@@ -945,32 +1112,34 @@ public static class ServerSelfTests
         using var client = KeyAgreement.NewKey();
         var key = client.ExportPkcs8PrivateKey();
         var publicKey = Convert.ToBase64String(client.ExportSubjectPublicKeyInfo());
-        var device = store.Enroll(new(Guid.NewGuid().ToString(), "Test workstation", publicKey), [group]);
-        return (store, options, device, key, Convert.FromBase64String(device.ServerPublicKey));
+        var device = store.Enroll(TestRegistration.Create("Test workstation", publicKey, identityKem), [group]);
+        return (store, options, device, key, Convert.FromBase64String(store.ServerPublicKey));
     }
     public static void WriteAcceptanceFixture(string root)
     {
         root = Path.GetFullPath(root);
         if (Directory.Exists(root))
             throw new ArgumentException("Use a new, empty fixture path.");
-        var (store, options, device, key, serverPublic) = CreateFixture(root);
+        using var identityKem = HybridKem.Generate();
+        var (store, _, device, key, _) = CreateFixture(root, identityKem);
         store.InitializeAdmin("admin", "Test-only-password-42!", "Fixture");
         var clientDirectory = Path.Combine(root, "client");
         PrivateStorage.SecureDirectory(clientDirectory);
         PrivateStorage.AtomicWrite(Path.Combine(clientDirectory, "client.json"), Wire.Encode(new
         {
-            deviceId = device.Id.ToString(),
+            identityFormat = 6,
+            setupComplete = true,
+            deviceId = device.PublicIdentity,
+            mlKemPublicKey = device.ClientMlKemPublicKey,
+            protectedMlKemPrivateSeed = ProtectFixtureKey(identityKem.ExportPrivateSeed()),
             deviceName = device.Name,
-            protectedPrivateKey = PrivateStorage.Protect(key),
+            protectedPrivateKey = ProtectFixtureKey(key),
             publicKey = device.ClientPublicKey,
-            serverPublicKey = Convert.ToBase64String(serverPublic),
-            host = "127.0.0.1",
-            port = 17443,
-            userName = device.Name,
+            servers = new[] { new { name = "Fixture", host = "127.0.0.1", port = 17443,
+                trustedServerId = store.ServerId } },
             mountPoint = "N:\\",
             requestTimeoutSeconds = 15
         }));
-        CryptographicOperations.ZeroMemory(key);
         PrivateStorage.AtomicWrite(Path.Combine(root, "share", ".bijoushare-acceptance.json"), Wire.Encode(new
         {
             schema = 1,
@@ -978,6 +1147,12 @@ public static class ServerSelfTests
         }));
         Console.WriteLine($"Fixture created at {root}. Admin: admin / Test-only-password-42!");
     }
+    private static byte[] ProtectFixtureKey(byte[] secret)
+    {
+        try { return ProtectedData.Protect(secret, "BijouShare.Client.UserProfile.v1"u8.ToArray(), DataProtectionScope.CurrentUser); }
+        finally { CryptographicOperations.ZeroMemory(secret); }
+    }
+
     private static int FreePort()
     {
         var l = new TcpListener(IPAddress.Loopback, 0);
@@ -987,7 +1162,7 @@ public static class ServerSelfTests
         return p;
     }
     private static async Task NetworkTests(ServerOptions options, StateStore store, FileService files, AuditLog audit, Device device,
-        byte[] privateKey, byte[] serverPublic, Action<bool, string> check)
+        byte[] privateKey, byte[] serverPublic, HybridKem identityKem, Action<bool, string> check)
     {
         using var service = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance);
         await service.StartAsync(CancellationToken.None);
@@ -995,27 +1170,36 @@ public static class ServerSelfTests
         try
         {
             using var socket = new TcpClient();
-            using var transport = await AuthenticatedClient.ConnectAsync(socket, "127.0.0.1", options.Port, device.Id.ToString(), privateKey, serverPublic, deadline.Token, binaryPayloads: false);
+            using var transport = await AuthenticatedClient.ConnectAsync(socket, "127.0.0.1", options.Port, device.PublicIdentity!, privateKey,
+                identityKem, store.ServerId, deadline.Token, binaryPayloads: false);
             await transport.SendAsync(new RpcRequest { Operation = "List" }, deadline.Token);
             check((await transport.ReceiveAsync<RpcResponse>(deadline.Token)).Entries!.Any(e => e.Name == "Team"), "Real TCP handshake and encrypted file listing succeed");
+            const string deniedPath = "/Team/restricted/secret.txt";
+            await transport.SendAsync(new RpcRequest { Operation = "Stat", Path = deniedPath }, deadline.Token);
+            var denied = await transport.ReceiveAsync<RpcResponse>(deadline.Token);
+            check(denied.Error == "AccessDenied" && audit.Recent().Any(entry => entry.Target == deniedPath &&
+                entry.Result == denied.Error && entry.Detail?.Contains(nameof(Permission.ReadAttributes), StringComparison.Ordinal) == true),
+                "A denied RPC returns AccessDenied and names the missing group permission in the server activity log");
             using var other = KeyAgreement.NewKey();
             using var badSocket = new TcpClient();
             try
             {
-                using var invalid = await AuthenticatedClient.ConnectAsync(badSocket, "127.0.0.1", options.Port, device.Id.ToString(), privateKey, other.ExportSubjectPublicKeyInfo(), deadline.Token);
+                using var invalid = await AuthenticatedClient.ConnectAsync(badSocket, "127.0.0.1", options.Port, device.PublicIdentity!, privateKey,
+                    identityKem, new string('0', 64), deadline.Token);
                 throw new InvalidOperationException("Accepted untrusted server key");
             }
             catch (CryptographicException) { check(true, "Incorrect pinned server identity is rejected"); }
             using var wrongDevice = new TcpClient();
             try
             {
-                using var invalid = await AuthenticatedClient.ConnectAsync(wrongDevice, "127.0.0.1", options.Port, device.Id.ToString(), other.ExportPkcs8PrivateKey(), serverPublic, deadline.Token);
+                using var invalid = await AuthenticatedClient.ConnectAsync(wrongDevice, "127.0.0.1", options.Port, device.PublicIdentity!,
+                    other.ExportPkcs8PrivateKey(), identityKem, store.ServerId, deadline.Token);
                 throw new InvalidOperationException("Accepted wrong device key");
             }
             catch (CryptographicException) { check(true, "Possession of a device ID without its private key is insufficient"); }
             using (var binarySocket = new TcpClient())
             using (var binary = await AuthenticatedClient.ConnectAsync(binarySocket, "127.0.0.1", options.Port,
-                device.Id.ToString(), privateKey, serverPublic, deadline.Token))
+                device.PublicIdentity!, privateKey, identityKem, store.ServerId, deadline.Token))
             using (var rpc = new RpcClientSession(binary))
             {
                 check(binary.BinaryPayloads, "Modern peers authenticate the optimized binary transfer mode");
@@ -1028,6 +1212,15 @@ public static class ServerSelfTests
                     Access = AccessMask.GenericRead | AccessMask.GenericWrite,
                     Share = FileShare.ReadWrite | FileShare.Delete
                 })).Handle;
+                await transport.SendAsync(new RpcRequest
+                {
+                    Operation = "Open", Path = "/Team/pipeline.bin", Access = AccessMask.WriteData,
+                    Share = FileShare.ReadWrite | FileShare.Delete
+                }, deadline.Token);
+                check((await transport.ReceiveAsync<RpcResponse>(deadline.Token)).Error == "SharingViolation" &&
+                    audit.Recent().Any(entry => entry.Result == "SharingViolation" && entry.Target == "/Team/pipeline.bin" &&
+                        entry.Detail?.Contains(device.Name, StringComparison.Ordinal) == true),
+                    "A conflicting writer receives SharingViolation and the server audit identifies the device holding the file");
                 var payload = RandomNumberGenerator.GetBytes(Wire.MaxChunk);
                 await Call(new()
                 {
