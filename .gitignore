@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.vs/
+.firecrawl/
+artifacts/
+*.user
+*.suo
+*.enrollment.json
+*.device.json
+data/
+/scripts/

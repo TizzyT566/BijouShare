@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="BijouShare.Server/BijouShare.Server.csproj" />
+  <Project Path="BijouShare.Client/BijouShare.Client.csproj" />
+</Solution>

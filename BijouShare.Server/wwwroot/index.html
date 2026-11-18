@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BijouShare · Administration</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="crypto-warning" class="global-warning" role="status" hidden>This Windows installation lacks the required native ML-KEM support. Update Windows before connecting devices.</div>
+  <div id="server-loading" class="login-screen" role="status"><div class="brand-icon" aria-hidden="true">B</div><p class="muted loading-message">Opening your server…</p></div>
+  <div id="setup-screen" class="login-screen" hidden>
+    <form id="setup" class="login-card setup-card" aria-labelledby="setup-title" autocomplete="off">
+      <div class="brand-icon" aria-hidden="true">B</div><p class="eyebrow">WELCOME TO BIJOUSHARE</p>
+      <h1 id="setup-title">Set up your server.</h1><p class="muted">Choose the name your clients will see and create your administrator account.</p>
+      <label for="setup-server-name">Server name<input id="setup-server-name" name="serverName" autocomplete="off" required maxlength="100" pattern="[A-Za-z0-9\-]+" spellcheck="false" aria-describedby="setup-server-hint"></label>
+      <p id="setup-server-hint" class="hint">Use 1–100 ASCII letters, digits, or dashes. Spaces are not allowed.</p>
+      <label for="setup-admin-name">Administrator name<input id="setup-admin-name" name="adminName" autocomplete="off" required maxlength="100" spellcheck="false" aria-describedby="setup-admin-hint"></label>
+      <p id="setup-admin-hint" class="hint">You will use this account to manage the server.</p>
+      <div class="setup-passwords">
+        <div><label for="setup-password">Password</label><div class="password-field"><input id="setup-password" name="password" type="password" autocomplete="new-password" required minlength="14" maxlength="1024" aria-describedby="setup-password-hint"><button type="button" class="password-toggle" data-password-toggle="setup-password" aria-controls="setup-password" aria-pressed="false" aria-label="Show password">Show</button></div></div>
+        <div><label for="setup-confirmation">Confirm password</label><div class="password-field"><input id="setup-confirmation" name="confirmPassword" type="password" autocomplete="new-password" required minlength="14" maxlength="1024"><button type="button" class="password-toggle" data-password-toggle="setup-confirmation" aria-controls="setup-confirmation" aria-pressed="false" aria-label="Show password confirmation">Show</button></div></div>
+      </div>
+      <p id="setup-password-hint" class="hint">Use at least 14 characters.</p>
+      <p id="setup-error" class="error" role="alert"></p><button id="setup-submit" type="submit" class="primary">Create server <span>→</span></button>
+    </form><p class="login-footer">Complete setup on this computer. Access through groups.</p>
+  </div>
+  <div id="login-screen" class="login-screen" hidden>
+    <form id="login" class="login-card" aria-labelledby="login-title"><div class="brand-icon" aria-hidden="true">B</div><p class="eyebrow">BIJOUSHARE</p>
+      <h1 id="login-title">Your files.<br>Your permissions.</h1><p class="muted">Sign in to manage your LAN file server.</p>
+      <label for="login-name">Administrator</label><input id="login-name" name="name" autocomplete="username" required maxlength="100">
+      <label for="login-password">Password</label><div class="password-field"><input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="1024"><button type="button" class="password-toggle" data-password-toggle="login-password" aria-controls="login-password" aria-pressed="false" aria-label="Show password">Show</button></div>
+      <button type="submit" class="primary">Sign in <span>→</span></button><p id="login-error" class="error" role="alert"></p>
+      <button type="button" id="retry-session" class="retry-session" hidden>Retry connection</button>
+    </form><p class="login-footer">Encrypted connections. Access through groups.</p>
+  </div>
+  <div id="app" class="shell" hidden>
+    <a class="skip-link" href="#content" id="skip-navigation">Skip to content</a>
+    <aside><a class="brand" href="#overview"><span class="brand-icon small">B</span>BijouShare</a><p class="nav-label">SERVER CONSOLE</p>
+      <nav aria-label="Administration">
+        <a href="#overview" data-tab="overview">Overview</a>
+        <a href="#groups" data-tab="groups">Groups</a><a href="#shares" data-tab="shares">Shares</a>
+        <a href="#permissions" data-tab="permissions">Permissions</a><a href="#devices" data-tab="devices">Devices</a><a href="#invites" data-tab="invites">Invites</a>
+        <a href="#activity" data-tab="activity">Activity</a><a href="#settings" data-tab="settings">Settings</a>
+      </nav><div class="aside-footer"><span class="status-dot"></span> LAN file server<br><small>Group-based access control</small></div>
+    </aside>
+    <main><header><span class="breadcrumb"><span id="server-name">Server</span><span>/</span><strong id="crumb">Overview</strong></span>
+      <div class="header-actions"><span id="admin-name"></span><button id="refresh" class="quiet">Refresh</button><button id="logout" class="quiet">Sign out</button></div></header>
+      <div id="content" tabindex="-1"></div><footer>BijouShare <span>Encrypted file transfers · Access managed by groups</span></footer>
+    </main>
+  </div>
+  <dialog id="editor" aria-labelledby="editor-title"><form id="editor-form"><div class="dialog-heading"><h2 id="editor-title"></h2><button type="button" id="close-editor" class="quiet" aria-label="Close editor">✕</button></div>
+    <div id="editor-fields"></div><p id="editor-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" id="cancel-editor" class="quiet">Cancel</button><button type="submit" id="editor-submit" class="primary">Save changes</button></div>
+  </form></dialog>
+  <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-name confirmation-detail"><form id="confirmation-form">
+    <h2 id="confirmation-title"></h2><p id="confirmation-name" class="confirmation-name"></p><p id="confirmation-detail" class="muted"></p>
+    <p id="confirmation-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" id="cancel-deletion" class="quiet">Cancel</button><button type="button" id="confirm-delete" class="destructive">Delete</button></div>
+  </form></dialog>
+  <dialog id="invite-result" aria-labelledby="invite-result-title" aria-describedby="invite-result-description">
+    <div class="dialog-heading"><h2 id="invite-result-title">Your invite is ready</h2><button type="button" id="close-invite-result" class="quiet" aria-label="Close invite details">✕</button></div>
+    <p id="invite-result-description" class="muted">Copy this code or link now. The code is shown only once. Anyone with it can enroll a device into its selected groups until its limits are reached.</p>
+    <label for="invite-code">Invite code</label><div class="copy-field"><input id="invite-code" class="mono" readonly autocomplete="off" spellcheck="false"><button type="button" data-copy-invite-code>Copy code</button></div>
+    <label for="invite-link-host">Server LAN hostname or IP</label><input id="invite-link-host" maxlength="253" autocomplete="off" spellcheck="false" aria-describedby="invite-host-hint"><p id="invite-host-hint" class="hint">Use an address reachable from the client. The link opens its installed BijouShare application.</p>
+    <p id="invite-local-warning" class="address-warning" role="status" hidden>This address points to the client itself. Enter the server’s LAN address to share this link with another device.</p>
+    <label for="invite-uri">Invite link</label><div class="copy-field"><input id="invite-uri" class="mono" readonly autocomplete="off" spellcheck="false"><button type="button" data-copy-invite-link>Copy link</button></div>
+    <p id="invite-link-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" id="done-invite-result" class="quiet">Done</button><a id="open-invite-link" class="button-link">Open BijouShare</a></div>
+  </dialog><div id="toast" role="status" aria-atomic="true" hidden></div>
+</body></html>
