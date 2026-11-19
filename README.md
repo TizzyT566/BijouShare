@@ -126,3 +126,13 @@ If a device can browse a share but cannot create a folder, check **Activity** in
 2. Open **BijouShare Server → Properties → Log On → This account**. Enter `.\YourAdminUser`, replacing `YourAdminUser` with the local administrator's username. Enter and confirm the account password. Windows Hello PINs cannot be used for service logon.
 3. Click **Apply → OK**. Keep the startup type set to **Automatic**. Once active transfers finish, right-click **BijouShare Server** and select **Restart**.
 4. Open **Shares** in the server web UI. Check that **Windows accesses these paths as** shows the selected account, then retry the operation from the client. Check this setting again after an installer upgrade, which can restore the default `NT AUTHORITY\LocalService` account.
+
+## Build from source
+
+From the repository root on x64 Windows, run the following in 64-bit PowerShell 7.4 or later. The build needs the .NET 10 SDK, the Windows .NET Framework 4.x compiler, and SHA3-256 support for installer checksums.
+
+```powershell
+.\Installer\Build.ps1
+```
+
+The script restores its dependencies, including WiX 5.0.2 and its Util extension, so the first build needs access to NuGet. It publishes the client and server, builds both setup executables, and verifies the files inside each package. The installers and checksums are written to `artifacts\bijoushare\installers\`.

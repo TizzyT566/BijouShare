@@ -3,7 +3,12 @@
 .vs/
 .firecrawl/
 artifacts/
-Installer/
+*.exe
+*.dll
+*.pdb
+*.msi
+*.cab
+*.wixpdb
 *.user
 *.suo
 *.enrollment.json

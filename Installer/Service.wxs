@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <?if $(Role) = Server ?>
+    <?define UpgradeCode = "{E40ACDB5-8674-4E21-9E79-69B1483CDF63}" ?>
+    <?define ServiceDescription = "Serves encrypted BijouShare file shares and the server administration console." ?>
+  <?elseif $(Role) = Client ?>
+    <?define UpgradeCode = "{ED45580C-1C39-4BE1-9DE2-F48B7616C748}" ?>
+    <?define ServiceDescription = "Starts each signed-in user's BijouShare drive and management console." ?>
+  <?else?>
+    <?error Role must be Server or Client ?>
+  <?endif?>
+  <Package Name="BijouShare $(Role)" Manufacturer="BijouShare" Language="1033"
+           Version="$(ProductVersion)" UpgradeCode="$(UpgradeCode)" Scope="perMachine" InstallerVersion="500">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of BijouShare $(Role) is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Icon Id="ProductIcon.ico" SourceFile="$(sys.SOURCEFILEDIR)\..\Shared\Icons\BijouShare.$(Role).ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <?if $(Role) = Server ?>
+      <Property Id="BIJOUSERVICEACCOUNT" Value="NT AUTHORITY\LocalService" Secure="yes" />
+      <Property Id="BIJOUSERVICEPASSWORD" Hidden="yes" Secure="yes" />
+      <CustomAction Id="PrepareServiceStorage" FileRef="ServiceExe" ExeCommand="--prepare-service-storage"
+                    Execute="deferred" Impersonate="no" Return="check" />
+      <InstallExecuteSequence>
+        <Custom Action="PrepareServiceStorage" Before="StartServices" Condition="$ServiceHost=3" />
+      </InstallExecuteSequence>
+    <?endif?>
+
+    <Property Id="EXISTING_SERVICE" Secure="yes">
+      <RegistrySearch Id="ExistingServiceImage" Root="HKLM" Bitness="always64"
+                      Key="SYSTEM\CurrentControlSet\Services\BijouShare.$(Role)" Name="ImagePath" Type="raw" />
+    </Property>
+    <Launch Condition="Installed OR Privileged" Message="Run BijouShare $(Role) Setup as an administrator." />
+    <Launch Condition="Installed OR VersionNT64" Message="BijouShare requires 64-bit Windows." />
+    <Launch Condition="Installed OR WIX_UPGRADE_DETECTED OR WIX_DOWNGRADE_DETECTED OR NOT EXISTING_SERVICE"
+            Message="A BijouShare.$(Role) service is already registered outside this installer. Stop that service and remove its registration before continuing. Keep its configuration and data directories." />
+    <?if $(Role) = Client ?>
+      <Property Id="DOKAN_RUNTIME" Secure="yes">
+        <DirectorySearch Id="DokanSystemDirectory" Path="[System64Folder]" Depth="0">
+          <FileSearch Name="dokan2.dll" MinVersion="2.2.65535.65535" MaxVersion="2.65535.65535.65535" />
+        </DirectorySearch>
+      </Property>
+      <Property Id="DOKAN_DRIVER" Secure="yes">
+        <RegistrySearch Id="DokanDriverService" Root="HKLM" Bitness="always64"
+                        Key="SYSTEM\CurrentControlSet\Services\Dokan2" Name="ImagePath" Type="raw" />
+      </Property>
+      <Property Id="DOKAN_DRIVER_TYPE" Secure="yes">
+        <RegistrySearch Id="DokanDriverType" Root="HKLM" Bitness="always64"
+                        Key="SYSTEM\CurrentControlSet\Services\Dokan2" Name="Type" Type="raw" />
+      </Property>
+      <Property Id="DOKAN_DRIVER_START" Secure="yes">
+        <RegistrySearch Id="DokanDriverStart" Root="HKLM" Bitness="always64"
+                        Key="SYSTEM\CurrentControlSet\Services\Dokan2" Name="Start" Type="raw" />
+      </Property>
+      <Launch Condition="REMOVE~=&quot;ALL&quot; OR UPGRADINGPRODUCTCODE OR (DOKAN_RUNTIME AND DOKAN_DRIVER AND DOKAN_DRIVER_TYPE=&quot;#2&quot; AND (DOKAN_DRIVER_START=&quot;#0&quot; OR DOKAN_DRIVER_START=&quot;#1&quot; OR DOKAN_DRIVER_START=&quot;#2&quot; OR DOKAN_DRIVER_START=&quot;#3&quot;))"
+              Message="Install Dokany 2.3 or newer in the 2.x series, including the x64 driver and runtime, before installing BijouShare Client. The Dokany project is at https://github.com/dokan-dev/dokany." />
+    <?endif?>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="BijouSharePrograms" Name="BijouShare">
+        <Directory Id="ServiceDirectory" Name="$(Role)" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="BijouShareMenu" Name="BijouShare" />
+    </StandardDirectory>
+
+    <Feature Id="ServiceFeature" Title="BijouShare $(Role)" Level="1">
+      <ComponentGroupRef Id="ServicePayload" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <ComponentGroup Id="ServicePayload" Directory="ServiceDirectory">
+      <Files Include="$(PublishDir)\**">
+        <Exclude Files="$(PublishDir)\BijouShare.$(Role).exe" />
+        <Exclude Files="$(PublishDir)\Install-Service.ps1" />
+        <Exclude Files="$(PublishDir)\**\*.pdb" />
+        <?if $(Role) = Server ?>
+          <Exclude Files="$(PublishDir)\appsettings.json" />
+          <Exclude Files="$(PublishDir)\BijouShare.Server.Tray.exe" />
+        <?endif?>
+      </Files>
+      <Component Id="ServiceHost" Guid="*">
+        <File Id="ServiceExe" Source="$(PublishDir)\BijouShare.$(Role).exe" KeyPath="yes">
+          <?if $(Role) = Client ?>
+            <Shortcut Id="ConsoleShortcut" Directory="BijouShareMenu" Name="BijouShare Client"
+                      Advertise="yes" Icon="ProductIcon.ico" WorkingDirectory="ServiceDirectory" Arguments="--open-management" />
+          <?endif?>
+        </File>
+        <RemoveFolder Id="RemoveMenuWhenEmpty" Directory="BijouShareMenu" On="uninstall" />
+        <?if $(Role) = Server ?>
+        <ServiceInstall Id="InstallService" Name="BijouShare.Server" DisplayName="BijouShare Server"
+                        Description="$(ServiceDescription)" Type="ownProcess"
+                        Account="[BIJOUSERVICEACCOUNT]" Password="[BIJOUSERVICEPASSWORD]"
+                        Start="auto" ErrorControl="normal" Vital="yes">
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <?else?>
+        <ServiceInstall Id="InstallService" Name="BijouShare.Client" DisplayName="BijouShare Client"
+                        Description="$(ServiceDescription)" Type="ownProcess" Account="LocalSystem"
+                        Start="auto" ErrorControl="normal" Vital="yes">
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <?endif?>
+        <ServiceControl Id="ManageService" Name="BijouShare.$(Role)" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="ServiceEventLog" Guid="*">
+        <RegistryValue Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\BijouShare.$(Role)"
+                       Name="EventMessageFile" Type="expandable" Value="%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll" KeyPath="yes" />
+      </Component>
+      <?if $(Role) = Server ?>
+        <Component Id="ServerTrayHost" Guid="*">
+          <File Id="ServerTrayExe" Source="$(PublishDir)\BijouShare.Server.Tray.exe" KeyPath="yes">
+            <Shortcut Id="ConsoleShortcut" Directory="BijouShareMenu" Name="BijouShare Server"
+                      Advertise="yes" Icon="ProductIcon.ico" WorkingDirectory="ServiceDirectory" Arguments="--tray-only" />
+          </File>
+        </Component>
+        <!-- User-edited listener settings survive major upgrades and uninstall. -->
+        <Component Id="ServerSettings" Guid="*" NeverOverwrite="yes" Permanent="yes">
+          <File Source="$(PublishDir)\appsettings.json" KeyPath="yes">
+            <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;LS)" />
+          </File>
+        </Component>
+        <Component Id="ServerTrayRun" Guid="*">
+          <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                         Name="BijouShare.Server.Tray" Type="string" Value="&quot;[#ServerTrayExe]&quot; --tray-only" KeyPath="yes" />
+        </Component>
+      <?else?>
+        <Component Id="ClientProtocol" Guid="*">
+          <RegistryKey Root="HKLM" Key="Software\Classes\wad">
+            <RegistryValue Type="string" Value="URL:BijouShare connection" />
+            <RegistryValue Name="URL Protocol" Type="string" Value="" />
+            <RegistryKey Key="DefaultIcon">
+              <RegistryValue Type="string" Value="&quot;[#ServiceExe]&quot;,0" />
+            </RegistryKey>
+            <RegistryKey Key="shell\open\command">
+              <RegistryValue Type="string" Value="&quot;[#ServiceExe]&quot; --open-uri &quot;%1&quot;" KeyPath="yes" />
+            </RegistryKey>
+          </RegistryKey>
+        </Component>
+      <?endif?>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
