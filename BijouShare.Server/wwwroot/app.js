@@ -106,6 +106,8 @@ async function api(path, method = 'GET', body) {
 
 async function session() {
   const result = await api('/session');
+  for (const label of document.querySelectorAll('[data-version]'))
+    label.textContent = result.version ? ' · v' + result.version : '';
   csrf = result.csrfToken;
   $('#crypto-warning').hidden = result.cryptoSupported !== false;
   $('#retry-session').hidden = true;

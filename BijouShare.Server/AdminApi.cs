@@ -23,6 +23,7 @@ public static class AdminApi
     {
         app.MapGet("/api/session", (HttpContext context, IAntiforgery antiforgery, StateStore store) => Results.Ok(new
         {
+            version = typeof(AdminApi).Assembly.GetName().Version!.ToString(3),
             setupRequired = !store.IsInitialized,
             cryptoSuite = Wire.CryptoSuite,
             cryptoProvider = HybridKem.ProviderName,

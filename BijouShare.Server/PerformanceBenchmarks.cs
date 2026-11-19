@@ -152,27 +152,45 @@ public static class PerformanceBenchmarks
                             Count = 4096
                         });
                 });
-                await Measure("directory-list-2048", 0, directoryFiles, async () =>
+                async Task MeasureListing(string label, int pageCount, string? pattern, int addedLatencyMs, int expected)
                 {
-                    long offset = 0;
-                    var count = 0;
-                    do
+                    var pages = 0;
+                    await Measure(label, 0, expected, async () =>
                     {
-                        var response = await Call(new()
+                        long offset = 0;
+                        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        while (true)
                         {
-                            Operation = "List",
-                            Path = "/Team/many-files",
-                            Offset = offset,
-                            Count = 256
-                        });
-                        count += response.Entries!.Count;
-                        if (!response.More)
-                            break;
-                        offset = response.Length;
-                    } while (true);
-                    if (count != directoryFiles)
-                        throw new InvalidDataException("Incomplete benchmark listing.");
-                });
+                            if (addedLatencyMs > 0) await Task.Delay(addedLatencyMs, timeout.Token);
+                            var response = await Call(new()
+                            {
+                                Operation = "List", Path = "/Team/many-files", Offset = offset,
+                                Count = pageCount, SearchPattern = pattern
+                            });
+                            pages++;
+                            foreach (var entry in response.Entries!)
+                                if (!names.Add(entry.Name)) throw new InvalidDataException("Duplicate directory entry.");
+                            if (!response.More) break;
+                            if (response.Length <= offset) throw new InvalidDataException("Directory cursor did not advance.");
+                            offset = response.Length;
+                        }
+                        if (names.Count != expected) throw new InvalidDataException("Incomplete benchmark listing.");
+                    });
+                    Console.WriteLine($"{label}: {pages} listing request(s)");
+                }
+                await MeasureListing("directory-list-2048", 0, "*", 0, directoryFiles);
+                await MeasureListing("directory-legacy-60ms", 256, null, 60, directoryFiles);
+                await MeasureListing("directory-current-60ms", 0, "*", 60, directoryFiles);
+                await MeasureListing("directory-filtered-60ms", 0, "item-000??.txt", 60, 100);
+                var listing = new RpcRequest { Operation = "List", Path = "/Team/many-files", SearchPattern = "*" };
+                var full = await Call(listing);
+                var basic = await Call(listing with { BasicDirectoryInfo = true });
+                if (full.More || basic.More || basic.Entries is not null || basic.Data is not null ||
+                    full.Entries?.Count != directoryFiles || basic.Items?.Count != directoryFiles ||
+                    !full.Entries.Select(DirectoryItem.FromEntry).OrderBy(e => e.Name, StringComparer.Ordinal)
+                        .SequenceEqual(basic.Items.OrderBy(e => e.Name, StringComparer.Ordinal)))
+                    throw new InvalidDataException("Compact listing changed the directory contents.");
+                Console.WriteLine($"Directory listing JSON ({directoryFiles} entries): full {Wire.Encode(full).Length:N0} bytes, Explorer {Wire.Encode(basic).Length:N0} bytes.");
                 await Call(new()
                 {
                     Operation = "Close",

@@ -108,6 +108,11 @@ public sealed record RpcRequest
         get; init;
     }
     public string Operation { get; init; } = "Ping";
+    // Optional directory filter. Older servers ignore it and use their default page size.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SearchPattern { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool BasicDirectoryInfo { get; init; }
     public string Path { get; init; } = "\\";
     public string? Destination
     {
@@ -185,6 +190,8 @@ public sealed record RpcRequest
 
     public void Validate()
     {
+        if (SearchPattern is not null && (Operation != "List" || SearchPattern.Length > 255))
+            throw new ArgumentException("Invalid directory search pattern.");
         if (InviteCode is not null)
             throw new ArgumentException("Enrollment is valid only during connection setup.");
         if (Operation is not ("Ping" or "Space" or "Open" or "Stat" or "List" or "Read" or "Write" or "Flush" or
@@ -200,6 +207,21 @@ public sealed record RemoteEntry(string Name, FileAttributes Attributes, long Le
     DateTime CreationTime, DateTime LastAccessTime, DateTime LastWriteTime, Permission Permissions)
 {
     public bool IsDirectory => (Attributes & FileAttributes.Directory) != 0;
+}
+
+// Explorer needs these WIN32_FIND_DATA fields. The primary timestamp is UTC ticks;
+// omitted creation/access times mean they equal the last-write time.
+public readonly record struct DirectoryItem(
+    [property: JsonPropertyName("n")] string Name,
+    [property: JsonPropertyName("a")] int Attributes,
+    [property: JsonPropertyName("m")] long Modified,
+    [property: JsonPropertyName("s"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] long Size = 0,
+    [property: JsonPropertyName("c"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? Created = null,
+    [property: JsonPropertyName("r"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? Accessed = null)
+{
+    public static DirectoryItem FromEntry(RemoteEntry entry) => new(entry.Name, (int)entry.Attributes, entry.LastWriteTime.Ticks,
+        entry.Length, entry.CreationTime == entry.LastWriteTime ? null : entry.CreationTime.Ticks,
+        entry.LastAccessTime == entry.LastWriteTime ? null : entry.LastAccessTime.Ticks);
 }
 
 public sealed record RpcResponse
@@ -254,6 +276,8 @@ public sealed record RpcResponse
     {
         get; init;
     }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<DirectoryItem>? Items { get; init; }
     public byte[]? Data
     {
         get; init;

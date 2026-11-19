@@ -75,6 +75,7 @@ public static class ClientManagementWeb
         app.UseStaticFiles();
         app.MapGet("/api/session", (HttpContext context, IAntiforgery antiforgery) => Results.Ok(new
         {
+            version = typeof(ClientManagementWeb).Assembly.GetName().Version!.ToString(3),
             csrfToken = antiforgery.GetAndStoreTokens(context).RequestToken
         }));
         app.MapGet("/api/state", (ClientManagement management) => Results.Ok(management.Snapshot()));

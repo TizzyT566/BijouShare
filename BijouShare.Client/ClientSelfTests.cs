@@ -202,8 +202,17 @@ internal static class ClientSelfTests
                 More = false,
                 Length = 258
             };
-        Check(operations.FindFilesWithPattern("\\Team", "*.txt", out var entries, directoryInfo) == NtStatus.Success && entries.Count == 2,
-            "Directory pagination preserves wildcard filtering across pages");
+        Check(operations.FindFilesWithPattern("\\Team", "*.txt", out var entries, directoryInfo) == NtStatus.Success && entries.Count == 2 &&
+            remote.Last is { SearchPattern: "*.txt", Count: 0, BasicDirectoryInfo: true },
+            "Explorer requests server-side pattern matching and filters legacy unfiltered pages");
+        var modified = DateTime.UtcNow;
+        var metadata = new RemoteEntry("Résumé.txt", FileAttributes.ReadOnly, 9876543210L, modified.AddDays(-3), modified, modified, Permission.FullControl);
+        var directoryPage = Wire.Decode<RpcResponse>(Wire.Encode(new RpcResponse { Items = [DirectoryItem.FromEntry(metadata)] }));
+        remote.Respond = _ => directoryPage;
+        Check(operations.FindFiles("\\Team", out entries, directoryInfo) == NtStatus.Success &&
+            entries is [{ FileName: "Résumé.txt", Attributes: FileAttributes.ReadOnly, Length: 9876543210L } item] &&
+            item.CreationTime == metadata.CreationTime.ToLocalTime() && item.LastAccessTime == modified.ToLocalTime() &&
+            item.LastWriteTime == modified.ToLocalTime(), "Compact directory entries preserve names, flags, 64-bit sizes and all Windows timestamps");
         remote.Respond = _ => new() { Entries = [], More = true, Length = 0 };
         Check(operations.FindFiles("\\Team", out _, directoryInfo) == NtStatus.Unsuccessful,
             "A non-advancing directory cursor fails instead of hanging the driver");

@@ -277,7 +277,10 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
         try
         {
             request.Validate();
-            return files.Execute(session, device.Id, request, device);
+            var response = files.Execute(session, device.Id, request, device);
+            if (request.Operation == "List" && request.BasicDirectoryInfo && response.Entries is { } entries)
+                return response with { Entries = null, Items = entries.ConvertAll(DirectoryItem.FromEntry) };
+            return response;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {

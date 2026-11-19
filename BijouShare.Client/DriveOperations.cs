@@ -245,11 +245,29 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                 {
                     Operation = "List",
                     Path = fileName,
-                    Count = 256,
+                    // A zero count selects the server's bounded default. Keep local matching
+                    // for older servers and the synthetic drive root.
+                    SearchPattern = searchPattern.Length <= 255 ? searchPattern : "*",
+                    BasicDirectoryInfo = true,
                     Offset = offset
                 }, info).Response;
-                foreach (var entry in (page.Entries ?? throw new InvalidDataException("Missing directory page.")).Where(e => FileSystemName.MatchesWin32Expression(searchPattern, e.Name, true)))
-                    result.Add(Info(entry));
+                if (page.Items is { } items)
+                {
+                    foreach (var item in items)
+                        if (Matches(item.Name))
+                            result.Add(new FileInformation
+                            {
+                                FileName = item.Name, Attributes = (FileAttributes)item.Attributes, Length = item.Size,
+                                CreationTime = LocalTime(item.Created ?? item.Modified),
+                                LastAccessTime = LocalTime(item.Accessed ?? item.Modified),
+                                LastWriteTime = LocalTime(item.Modified)
+                            });
+                }
+                else
+                {
+                    foreach (var entry in page.Entries ?? throw new InvalidDataException("Missing directory page."))
+                        if (Matches(entry.Name)) result.Add(Info(entry));
+                }
                 if (!page.More)
                     break;
                 if (page.Length <= offset)
@@ -274,6 +292,9 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
         });
         files = result;
         return status;
+
+        bool Matches(string name) => searchPattern == "*" || FileSystemName.MatchesWin32Expression(searchPattern, name, true);
+        static DateTime LocalTime(long ticks) => new DateTime(ticks, DateTimeKind.Utc).ToLocalTime();
     }
     public NtStatus SetFileAttributes(string fileName, FileAttributes attributes, IDokanFileInfo info) =>
         Try(() => Send(new() { Operation = "Attributes", Path = fileName, Attributes = attributes }, info));

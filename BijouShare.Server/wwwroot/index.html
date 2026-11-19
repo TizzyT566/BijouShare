@@ -9,10 +9,10 @@
 </head>
 <body>
   <div id="crypto-warning" class="global-warning" role="status" hidden>BijouShare requires native Windows support for ML-KEM-768 and SHA3-256. Update Windows before connecting devices.</div>
-  <div id="server-loading" class="login-screen" role="status"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console</small></span></div><p class="muted loading-message">Opening your server…</p></div>
+  <div id="server-loading" class="login-screen" role="status"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console<span data-version></span></small></span></div><p class="muted loading-message">Opening your server…</p></div>
   <div id="setup-screen" class="login-screen" hidden>
     <form id="setup" class="login-card setup-card" aria-labelledby="setup-title" autocomplete="off">
-      <div class="entry-identity"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console</small></span></div></div>
+      <div class="entry-identity"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console<span data-version></span></small></span></div></div>
       <h1 id="setup-title">Set up your server</h1><p class="muted">Choose the name your clients will see and create your administrator account.</p>
       <label for="setup-server-name">Server name<input id="setup-server-name" name="serverName" autocomplete="off" required maxlength="100" pattern="[A-Za-z0-9\-]+" spellcheck="false" aria-describedby="setup-server-hint"></label>
       <p id="setup-server-hint" class="hint">Use 1–100 letters, digits, or dashes.</p>
@@ -27,7 +27,7 @@
     </form>
   </div>
   <div id="login-screen" class="login-screen" hidden>
-    <form id="login" class="login-card" aria-labelledby="login-title"><div class="entry-identity"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console</small></span></div></div>
+    <form id="login" class="login-card" aria-labelledby="login-title"><div class="entry-identity"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console<span data-version></span></small></span></div></div>
       <h1 id="login-title">Administrator sign in</h1><p class="muted">Use your server administrator account to continue.</p>
       <label for="login-name">Administrator</label><input id="login-name" name="name" autocomplete="username" required maxlength="100">
       <label for="login-password">Password</label><div class="password-field"><input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="1024"><button type="button" class="password-toggle" data-password-toggle="login-password" aria-controls="login-password" aria-pressed="false" aria-label="Show password">Show</button></div>
@@ -38,7 +38,7 @@
   <div id="app" class="shell" hidden>
     <a class="skip-link" href="#content" id="skip-navigation">Skip to content</a>
     <aside>
-      <div class="rail-brand"><a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console</small></span></a><button type="button" id="nav-toggle" class="quiet" aria-expanded="false" aria-controls="rail-body">Menu <span class="bi bi-chevron" aria-hidden="true"></span></button></div>
+      <div class="rail-brand"><a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true"></span><span class="brand-type"><b>BijouShare</b><small>Server console<span data-version></span></small></span></a><button type="button" id="nav-toggle" class="quiet" aria-expanded="false" aria-controls="rail-body">Menu <span class="bi bi-chevron" aria-hidden="true"></span></button></div>
       <div id="rail-body">
         <nav aria-label="Administration">
           <p class="nav-label">Workspace</p>

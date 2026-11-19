@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using BijouShare.Shared;
@@ -347,7 +348,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         var page = entries.Skip((int)r.Offset).Take(count).ToList();
         return new()
         {
-            Entries = page,
+            Entries = r.SearchPattern is null or "*" ? page :
+                page.Where(entry => FileSystemName.MatchesWin32Expression(r.SearchPattern, entry.Name, true)).ToList(),
             Length = r.Offset + page.Count,
             More = r.Offset + page.Count < entries.Count
         };
@@ -359,7 +361,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             throw new RemoteException("NotADirectory");
         if (request.Offset is < 0 or > int.MaxValue || request.Count is < 0 or > 256)
             throw new ArgumentException("Invalid page.");
-        var count = request.Count == 0 ? 256 : request.Count;
+        // Clients opt in to larger pages by providing a filter and leaving the count at zero.
+        var count = request.Count != 0 ? request.Count : request.SearchPattern is null ? 256 : 4096;
         var result = new List<RemoteEntry>();
         var key = (session, request.Handle, location.Physical);
         if (!directoryCursors.TryGetValue(key, out var cursor) || cursor.Position != request.Offset || request.Offset == 0)
@@ -381,7 +384,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 cursor.Position++;
         }
         var examined = 0;
-        while (examined < count && (cursor.Pending || cursor.Iterator.MoveNext()))
+        var estimatedBytes = 0;
+        // Reserve room for the response envelope and one final 255-character filename.
+        while (examined < count && estimatedBytes < Wire.MaxFrame - 4096 && (cursor.Pending || cursor.Iterator.MoveNext()))
         {
             cursor.Pending = false;
             var entry = cursor.Iterator.Current;
@@ -389,6 +394,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             cursor.Position++;
             try
             {
+                if (request.SearchPattern is { } pattern && pattern != "*" &&
+                    !FileSystemName.MatchesWin32Expression(pattern, entry.Name, true))
+                    continue;
                 if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
                     continue;
                 StateStore.NormalizeRelative(entry.Name);
@@ -396,11 +404,16 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                     Path.Combine(location.Physical, entry.Name));
                 if (IsProtectedExportPath(child.Physical, protectedRoots))
                     continue;
-                Demand(child, principal, Permission.ReadAttributes);
+                var allowed = Effective(child, principal);
+                if ((allowed & Permission.ReadAttributes) == 0)
+                    continue;
                 // FindFirst/FindNext already returns these fields. Reopening/stat-ing every child
                 // discards that metadata and turns one directory page into thousands of system calls.
                 result.Add(new(entry.Name, entry.Attributes, entry is FileInfo file ? file.Length : 0,
-                    entry.CreationTimeUtc, entry.LastAccessTimeUtc, entry.LastWriteTimeUtc, Effective(child, principal)));
+                    entry.CreationTimeUtc, entry.LastAccessTimeUtc, entry.LastWriteTimeUtc, allowed));
+                // JSON can escape a UTF-16 code unit as six bytes. The fixed allowance
+                // covers all metadata fields, timestamps and the longest flag names.
+                estimatedBytes += 768 + 6 * entry.Name.Length;
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or ArgumentException) { }
         }

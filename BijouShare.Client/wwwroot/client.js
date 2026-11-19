@@ -378,7 +378,13 @@ $('#refresh').addEventListener('click', async () => {
 
 async function start() {
   $('#retry-load').hidden = true;
-  try {csrf = (await api('/session')).csrfToken; await reload();}
+  try {
+    const session = await api('/session');
+    csrf = session.csrfToken;
+    for (const label of document.querySelectorAll('[data-version]'))
+      label.textContent = session.version ? ' · v' + session.version : '';
+    await reload();
+  }
   catch (error) {$('#loading-message').textContent = error.message; $('#retry-load').hidden = false;}
 }
 $('#retry-load').addEventListener('click', start);

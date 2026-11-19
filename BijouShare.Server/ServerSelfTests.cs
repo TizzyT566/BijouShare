@@ -332,7 +332,35 @@ public static class ServerSelfTests
             Count = 256
         });
         Check(firstPage.More && !lastPage.More && firstPage.Entries!.Count + lastPage.Entries!.Count == 300, "Large directories use bounded, complete pages");
+        var fastList = new RpcRequest { Operation = "List", Path = "/Team/paged", SearchPattern = "*" };
+        var all = Call(fastList);
+        Check(!all.More && all.Entries!.Count == 300, "An Explorer directory search can return more than 256 entries in one trip");
+        var matches = Call(fastList with { SearchPattern = "FILE-01?.TXT" });
+        Check(!matches.More && matches.Entries!.Count == 10 &&
+            matches.Entries.All(entry => entry.Name.StartsWith("file-01", StringComparison.Ordinal)), "Directory searches match Windows filename patterns on the server");
         DirectoryCursorRegressions(root, store, files, device, group, share.Id, Check);
+        var wideDirectory = Directory.CreateDirectory(Path.Combine(root, "share", "wide")).FullName;
+        var wideNames = new HashSet<string>(StringComparer.Ordinal);
+        var prefix = new string('\u754c', 190);
+        for (var index = 0; index < 1150; index++)
+        {
+            var name = $"{prefix}-{index:D4}.txt";
+            wideNames.Add(name);
+            File.Create(Path.Combine(wideDirectory, name)).Dispose();
+        }
+        var wideRequest = fastList with { Path = "/Team/wide" };
+        var widePage = Call(wideRequest);
+        Check(widePage.More, "Long names split an adaptive listing before the encrypted frame limit");
+        while (true)
+        {
+            Check(Wire.Encode(widePage).Length + 9 + 16 <= Wire.MaxFrame &&
+                widePage.Entries!.All(entry => wideNames.Remove(entry.Name)), "Long-name directory pages fit the wire frame and contain unique names");
+            if (!widePage.More) break;
+            if (widePage.Length <= wideRequest.Offset) throw new InvalidDataException("Directory cursor did not advance.");
+            wideRequest = wideRequest with { Offset = widePage.Length };
+            widePage = Call(wideRequest);
+        }
+        Check(wideNames.Count == 0, "Long-name directory pagination returns every authorized entry");
         var retained = Open("/Team/retained.bin", full, mode: FileMode.CreateNew);
         Call(new()
         {
@@ -548,7 +576,7 @@ public static class ServerSelfTests
                     Operation = "List",
                     Path = "/Team/paged",
                     Offset = offset,
-                    Count = 256
+                    SearchPattern = "*.txt"
                 });
                 hidden &= page.Entries is { Count: 0 };
                 if (!page.More)
