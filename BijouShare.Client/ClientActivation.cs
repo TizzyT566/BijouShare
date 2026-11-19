@@ -101,29 +101,23 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
     public static async Task<string?> TryGetManagementUrlAsync(string directory, CancellationToken token = default) =>
         (await TryGetRunningClientAsync(directory, token))?.ManagementUrl;
 
-    internal static async Task OpenManagementAsync(string directory, Action<string> openBrowser, CancellationToken token = default)
+    internal static async Task<RunningClient> WaitForRunningClientAsync(string directory, CancellationToken token = default)
     {
         using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
         startup.CancelAfter(TimeSpan.FromSeconds(30));
-        string? url = null;
         try
         {
-            while (url is null)
+            while (true)
             {
-                try { url = await TryGetManagementUrlAsync(directory, startup.Token); }
-                // A worker may have created its pipe before Kestrel has published the port,
-                // or an upgrade may close the old worker's pipe during the handoff.
-                catch (OperationCanceledException) when (!startup.IsCancellationRequested) { }
-                catch (IOException ex) when (ex is EndOfStreamException || (ex.HResult & 0xffff) is 109 or 232 or 233) { }
-                if (url is null) await Task.Delay(250, startup.Token);
+                if (await TryGetRunningClientAsync(directory, startup.Token) is { } running)
+                    return running;
+                await Task.Delay(250, startup.Token);
             }
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
             throw new IOException("The client console did not become ready. Check that the BijouShare.Client service is running, then click its tray icon.");
         }
-        token.ThrowIfCancellationRequested();
-        openBrowser(url);
     }
 
     internal static async Task<RunningClient?> TryGetRunningClientAsync(string directory, CancellationToken token = default)
@@ -141,15 +135,23 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
             return null;
         }
         var processId = VerifyServerExecutable(pipe);
-        await pipe.WriteAsync(new byte[4], timeout.Token);
-        var header = new byte[4];
-        await pipe.ReadExactlyAsync(header, timeout.Token);
-        var count = BitConverter.ToInt32(header);
-        if (count is < 1 or > 128)
-            throw new IOException("The running client returned an invalid management address.");
-        var bytes = new byte[count];
-        await pipe.ReadExactlyAsync(bytes, timeout.Token);
-        var result = Encoding.UTF8.GetString(bytes);
+        string result;
+        try
+        {
+            await pipe.WriteAsync(new byte[4], timeout.Token);
+            var header = new byte[4];
+            await pipe.ReadExactlyAsync(header, timeout.Token);
+            var count = BitConverter.ToInt32(header);
+            if (count is < 1 or > 128)
+                throw new IOException("The running client returned an invalid management address.");
+            var bytes = new byte[count];
+            await pipe.ReadExactlyAsync(bytes, timeout.Token);
+            result = Encoding.UTF8.GetString(bytes);
+        }
+        // During startup the pipe can exist before Kestrel publishes its port.
+        // During an upgrade the previous owner can close the pipe mid-reply.
+        catch (OperationCanceledException) when (!token.IsCancellationRequested) { return null; }
+        catch (IOException ex) when (ex is EndOfStreamException || (ex.HResult & 0xffff) is 109 or 232 or 233) { return null; }
         if (!System.Uri.TryCreate(result, UriKind.Absolute, out var url) || url.Scheme != "http" ||
             url.Host != "127.0.0.1" || url.UserInfo.Length != 0 || url.AbsolutePath != "/" || url.Query.Length != 0 || url.Fragment.Length != 72 || !url.Fragment.StartsWith("#access=", StringComparison.Ordinal) || !url.Fragment[8..].All(Uri.IsHexDigit))
             throw new IOException("The running client returned an invalid management address.");

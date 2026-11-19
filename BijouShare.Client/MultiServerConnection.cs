@@ -12,7 +12,8 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
 {
     private sealed class Target(string label, IRemoteConnection connection, Func<string?> folderName, Func<string?> identity)
     {
-        public string Name => FolderName ?? label;
+        public string Address { get; } = label;
+        public string Name => FolderName ?? Address;
         public string? FolderName => folderName();
         public string? Identity => identity();
         public IRemoteConnection Connection { get; } = connection;
@@ -26,13 +27,15 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         public CancellationToken VerificationToken { get; init; }
         public int Removed;
         public long FailureRevision;
+        public bool InviteNoticeSent;
     }
 
     private static Target CreateTarget(ClientSettings settings, ServerEndpoint endpoint, ILoggerFactory loggerFactory)
     {
         var view = settings.ForServer(endpoint);
         var connection = new RemoteConnection(view, loggerFactory.CreateLogger<RemoteConnection>());
-        return new Target(endpoint.Host + ":" + endpoint.Port, connection, () => endpoint.FolderName,
+        var address = endpoint.Host.Contains(':') ? $"[{endpoint.Host}]:{endpoint.Port}" : $"{endpoint.Host}:{endpoint.Port}";
+        return new Target(address, connection, () => endpoint.FolderName,
             () => endpoint.PresentedServerId)
         {
             Endpoint = endpoint,
@@ -52,6 +55,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     private readonly ConcurrentDictionary<Guid, Handle> handles = new();
     private readonly CancellationTokenSource lifetime = new();
     private int disposed;
+    internal event Action<string>? InviteRequired;
     private static readonly DateTime NamespaceTime = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
     private const Permission NamespacePermissions = Permission.ListDirectory | Permission.ReadAttributes | Permission.ReadPermissions;
 
@@ -94,7 +98,10 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 if (retained is not null && !retained.VerificationToken.IsCancellationRequested &&
                     !reconnectAll && !ReferenceEquals(reconnect, server))
                     return retained;
-                return CreateTarget(settings, server, loggerFactory);
+                var replacement = CreateTarget(settings, server, loggerFactory);
+                if (retained is not null && !ReferenceEquals(reconnect, server))
+                    replacement.InviteNoticeSent = retained.InviteNoticeSent;
+                return replacement;
             }).ToArray();
             removed.AddRange(existing.Except(next));
             foreach (var target in removed)
@@ -272,6 +279,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             // The profile may have removed this endpoint while its heartbeat was queued.
             try { next[index] = reconnect(); }
             catch (ArgumentException) when (target.VerificationToken.IsCancellationRequested) { return; }
+            next[index].InviteNoticeSent = target.InviteNoticeSent;
             Volatile.Write(ref target.Removed, 1);
             Volatile.Write(ref targets, next);
             routeStamps = [];
@@ -308,6 +316,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 // A newer IO failure takes precedence over a probe that was already in flight.
                 if (target.FailureRevision == revision && Volatile.Read(ref target.Removed) == 0 && Volatile.Read(ref disposed) == 0)
                 {
+                    target.InviteNoticeSent = false;
                     Volatile.Write(ref target.Status, new(target.Name, true, null));
                     RefreshRoutes();
                 }
@@ -334,14 +343,22 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
 
     private void MarkUnavailable(Target target, string error)
     {
+        var notify = false;
         lock (routeGate)
         {
             if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0)
                 return;
             target.FailureRevision++;
+            if (error == "InviteRequired" && !target.InviteNoticeSent)
+            {
+                target.InviteNoticeSent = true;
+                notify = true;
+            }
             Volatile.Write(ref target.Status, new(target.Name, false, error));
             RefreshRoutes();
         }
+        if (notify)
+            InviteRequired?.Invoke(target.Address);
     }
 
     public RemoteReply Call(RpcRequest request, long? expectedGeneration = null) =>
@@ -435,7 +452,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             // Only a fresh successful probe may restore an offline root folder.
             return result;
         }
-        catch (RemoteException ex) when (ex.Code is "Disconnected" or "DeviceBlocked" or "DeviceRejected" or "PendingApproval" or "InvalidInvite" or "InviteUnsupported" or "HybridUnavailable" or "ServerLinkRequired")
+        catch (RemoteException ex) when (ex.Code is "Disconnected" or "DeviceBlocked" or "DeviceRejected" or "PendingApproval" or "InviteRequired" or "InvalidInvite" or "InviteUnsupported" or "HybridUnavailable" or "ServerLinkRequired")
         {
             MarkUnavailable(target, ex.Code);
             throw;

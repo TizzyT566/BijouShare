@@ -25,8 +25,19 @@ internal sealed class UserSessionLauncher(ILogger<UserSessionLauncher> logger, b
                     {
                         if (WaitForSingleObject(process, 0) != 0)
                             continue;
-                        process.Dispose();
                         children.Remove(session);
+                        using var exited = process;
+                        if (!sessions.Contains(session))
+                            continue;
+                        if (GetExitCodeProcess(exited, out var exitCode))
+                        {
+                            // An attached worker exits normally when the profile owner stops.
+                            if (exitCode == 0)
+                                continue;
+                            logger.LogWarning("The client worker in Windows session {Session} exited with code {ExitCode}. Retrying in 30 seconds.", session, exitCode);
+                        }
+                        else
+                            logger.LogWarning("Could not read the client worker exit code in Windows session {Session} (Windows error {Error}). Retrying in 30 seconds.", session, Marshal.GetLastWin32Error());
                         retryAfter[session] = DateTime.UtcNow.AddSeconds(30);
                     }
                     foreach (var session in sessions)
@@ -138,6 +149,8 @@ internal sealed class UserSessionLauncher(ILogger<UserSessionLauncher> logger, b
     private static extern bool CloseHandle(nint handle);
     [DllImport("kernel32.dll")]
     private static extern uint WaitForSingleObject(SafeProcessHandle process, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
     [DllImport("kernel32.dll")]
     private static extern bool TerminateProcess(SafeProcessHandle process, uint exitCode);
 }

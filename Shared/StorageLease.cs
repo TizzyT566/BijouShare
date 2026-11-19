@@ -1,5 +1,8 @@
 namespace BijouShare.Shared;
 
+internal sealed class StorageInUseException(IOException cause) : IOException(
+    "Another BijouShare process is using this data directory. Stop that service or console instance before running setup or starting another instance.", cause);
+
 /// <summary>Prevents independent service/setup processes from overwriting the same private state.</summary>
 public sealed class StorageLease : IDisposable
 {
@@ -31,7 +34,7 @@ public sealed class StorageLease : IDisposable
         }
         catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33)
         {
-            throw new IOException("Another BijouShare process is using this data directory. Stop that service or console instance before running setup or starting another instance.", ex);
+            throw new StorageInUseException(ex);
         }
 
         // The lease is the open handle itself. Never truncate an existing lock file or follow its content.

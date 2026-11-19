@@ -100,6 +100,20 @@ internal static class InviteSelfTests
         var rejected = Request("Rejected laptop");
         store.QueueRegistration(rejected);
         store.RejectDevice(TestRegistration.RecordId(rejected.DeviceId));
+        var waiting = Request("Awaiting manual approval");
+        store.QueueRegistration(waiting);
+        var waitingId = TestRegistration.RecordId(waiting.DeviceId);
+        var previousRequest = store.FindPendingDevice(waitingId);
+        Check(!store.Read(s => s.InviteOnly), "Servers initially accept manual enrollment requests");
+        store.SetInviteOnly(true);
+        Check(new StateStore(options).Read(s => s.InviteOnly), "Invite-only enrollment survives a server restart");
+        revision = store.Revision;
+        Reject(() => store.ApproveDevice(waitingId, groups, waiting.DeviceId),
+            "Invite-only enrollment prevents manual approval of previously pending devices");
+        Status(() => store.QueueRegistration(waiting with { DeviceName = "Changed name" }), "InviteRequired",
+            "A device queued before invite-only enrollment must still present an invite");
+        Check(store.Revision == revision && store.FindPendingDevice(waitingId) == previousRequest &&
+            store.FindRegisteredDevice(waitingId) is null, "A refused manual enrollment leaves the original pending request intact");
         var usesBefore = store.Read(state => state.Invites.Single(invite => invite.Id == unlimited.Invite.Id).Uses);
         Status(() => store.RedeemInvite(rejected, unlimited.Code), "DeviceRejected", "An invite cannot override an administrator's rejection");
         store.Update(state => { var index = state.Devices.FindIndex(device => device.Id == first.Id); state.Devices[index] = state.Devices[index] with { Enabled = false }; return true; });
@@ -114,7 +128,7 @@ internal static class InviteSelfTests
         store.RevokeInvite(revoked.Invite.Id);
         Status(() => store.RedeemInvite(Request(), revoked.Code), "InvalidInvite", "A revoked invite cannot approve a device");
 
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         using var audit = new AuditLog(store, NullLogger<AuditLog>.Instance);
         using var files = new FileService(store, audit);
         using var server = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance);
@@ -127,6 +141,29 @@ internal static class InviteSelfTests
             {
                 using var identityKem = HybridKem.Generate();
                 var id = DeviceIdentity.Id(networkIdentity.ExportSubjectPublicKeyInfo(), identityKem.ExportPublicKey());
+                async Task ExpectRejection(string? code, string expected, string label)
+                {
+                    var before = store.Revision;
+                    try
+                    {
+                        using var socket = new TcpClient();
+                        using var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
+                            id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId, code);
+                    }
+                    catch (RemoteException exception) when (exception.Code == expected)
+                    {
+                        Check(store.Revision == before && store.FindRegisteredDevice(id) is null && store.FindPendingDevice(id) is null, label);
+                        return;
+                    }
+                    throw new InvalidOperationException("FAIL: " + label);
+                }
+                store.SetInviteOnly(false);
+                await ExpectRejection(new string('x', 32), "InvalidInvite", "An unusable invite reports InvalidInvite when manual approval is available");
+                store.SetInviteOnly(true);
+                await ExpectRejection(null, "InviteRequired", "A fingerprint-only link returns an encrypted rejection without queuing a new device");
+                foreach (var (code, kind) in new[] { (new string('x', 32), "unknown"), (expired.Code, "expired"),
+                    (revoked.Code, "revoked"), (single.Code, "exhausted") })
+                    await ExpectRejection(code, "InviteRequired", $"The client receives an invite-only notice for a {kind} invite without queuing or approving the device");
                 var proofInvite = store.CreateInvite("Private-key proof required", groups, 1, null);
                 using (var socket = new TcpClient())
                 using (var ephemeral = KeyAgreement.NewKey())
@@ -195,7 +232,7 @@ internal static class InviteSelfTests
                         {
                             Operation = "List"
                         }, deadline.Token);
-                        Check(approved.Enabled && response.Entries!.Any(entry => entry.Name == "Team") &&
+                        Check(approved.Enabled && approved.GroupIds.SequenceEqual(groups) && response.Entries!.Any(entry => entry.Name == "Team") &&
                             KeyAgreement.Equals(transport.RemoteServerMlKemPublicKey!, Convert.FromBase64String(store.ServerMlKemPublicKey)) &&
                             transport.RemoteServerId == store.ServerId,
                             "Encrypted invite enrollment authenticates and exposes authorized files immediately with the permanent key pinned");
@@ -211,6 +248,13 @@ internal static class InviteSelfTests
                     id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId, wireInvite.Code))
                     Check(store.Read(state => state.Invites.Single(invite => invite.Id == wireInvite.Invite.Id).Uses) == 1,
                         "An exhausted invite does not prevent its already approved client from reconnecting with the same pins");
+                store.RevokeInvite(wireInvite.Invite.Id);
+                revision = store.Revision;
+                using (var socket = new TcpClient())
+                using (var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
+                    id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId))
+                    Check(transport.RemoteServerId == store.ServerId && store.Revision == revision,
+                        "An enrolled device reconnects without an invite after its original code is revoked");
                 var failedInvite = store.CreateInvite("Authentication check", groups, 1, null);
                 var wrongFingerprint = (store.ServerId[0] == '0' ? "1" : "0") + store.ServerId[1..];
                 using var invitedEc = KeyAgreement.NewKey();
@@ -231,25 +275,10 @@ internal static class InviteSelfTests
                         "A mismatched server fingerprint cannot consume an invite or queue an enrollment");
                 }
                 finally { CryptographicOperations.ZeroMemory(invitedPrivate); }
-                try
-                {
-                    using var badInviteIdentity = KeyAgreement.NewKey();
-                    using var badInviteKem = HybridKem.Generate();
-                    var badInvitePrivate = badInviteIdentity.ExportPkcs8PrivateKey();
-                    try
-                    {
-                        using var socket = new TcpClient();
-                        using var transport = await AuthenticatedClient.ConnectDeviceAsync(socket, "127.0.0.1", options.Port,
-                            DeviceIdentity.Id(badInviteIdentity.ExportSubjectPublicKeyInfo(), badInviteKem.ExportPublicKey()),
-                            "Bad invite", badInvitePrivate, badInviteKem, deadline.Token, store.ServerId, new string('x', 32));
-                        throw new InvalidOperationException("Accepted an invalid invite over TCP.");
-                    }
-                    finally { CryptographicOperations.ZeroMemory(badInvitePrivate); }
-                }
-                catch (RemoteException exception) when (exception.Code == "InvalidInvite")
-                {
-                    Check(true, "Invalid invite enrollment returns an encrypted rejection over TCP");
-                }
+                store.SetInviteOnly(false);
+                Check(store.ApproveDevice(waitingId, groups, waiting.DeviceId).Enabled &&
+                    !new StateStore(options).Read(s => s.InviteOnly),
+                    "Disabling invite-only enrollment restores manual approval of earlier requests and persists the decision");
             }
             finally { CryptographicOperations.ZeroMemory(privateKey); }
         }

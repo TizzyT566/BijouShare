@@ -12,6 +12,7 @@ if (launch.has('access')) {
 }
 const descriptions = {
   PendingApproval: ['Awaiting approval', 'An administrator must approve this device and choose its groups.', 'waiting'],
+  InviteRequired: ['Invite only', 'This server is invite only. Ask its administrator for a valid invite link, then paste the complete link into Connect a server.', 'blocked'],
   DeviceRejected: ['Blocked', 'An administrator must explicitly approve this device before it can connect.', 'blocked'],
   DeviceBlocked: ['Blocked', 'An administrator must enable this device before it can connect.', 'blocked'],
   InvalidInvite: ['Invite unavailable', 'The invite is invalid, expired, revoked, or has no uses remaining. Ask for a new link.', 'blocked'],
@@ -214,6 +215,12 @@ function render(next) {
   const preferredTab = document.getElementById('tab-' + preferred);
   const fallback = driveViews.values().next().value?.panel.id || 'add';
   selectView(preferredTab?.getAttribute('role') === 'tab' ? preferred : fallback, false);
+  if (previous) {
+    const rejected = state.servers.find(server => server.error === 'InviteRequired' &&
+      !previous.servers.some(old => old.mountPoint === server.mountPoint && old.host === server.host &&
+        old.port === server.port && old.error === 'InviteRequired'));
+    if (rejected) toast(`${rejected.host}:${rejected.port} is invite only. Ask its administrator for a valid invite link.`);
+  }
 }
 
 async function reload() {
@@ -333,9 +340,10 @@ $('#drive-panels').addEventListener('submit', async event => {
   const input = form.elements.uri;
   await submit(form.querySelector('button'), form.querySelector('.server-error'), async () => {
     const uri = input.value.trim();
-    render(await api('/servers', 'POST', {uri, mountPoint:panel.dataset.mountPoint}));
+    const next = await api('/servers', 'POST', {uri, mountPoint:panel.dataset.mountPoint});
+    toast('Server saved. Checking the connection…');
+    render(next);
     form.reset();
-    toast('Server saved. Its folder appears after authentication and approval.');
   });
 });
 $('#drive-panels').addEventListener('click', async event => {

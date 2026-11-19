@@ -16,6 +16,55 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 
 ![Client console showing the servers on drive N, their File Explorer paths, and their connection status](docs/screenshots/client.png)
 
+## Features
+
+### Windows drives and file operations
+
+- **Share a file, folder, or entire drive.** Give each share a display name and enable or disable it from the server console.
+- **Use fixed drive letters in Explorer and Windows apps.** Client setup starts with zero drives. Add available letters as needed and choose which servers belong on each drive.
+- **Browse several servers on one drive.** Each server gets a folder named `ServerName_First16FingerprintCharacters`, with its shares underneath.
+- **Manage files in place.** Browse and copy files, create folders, edit or resize files, rename items, and delete them according to the device’s permissions. Applications can also read and set supported attributes and timestamps.
+- **Coordinate simultaneous access.** Multiple readers can open a file. The server allows one writable handle per file, honors Windows sharing flags, and supports byte-range locks.
+
+### Device enrollment and invites
+
+- **Connect from a link.** Open a `wad://` link from a webpage or paste it into the client console for a specific drive. Links carry the full server fingerprint and can include an invite code.
+- **Approve devices manually.** Review a pending device’s name, fingerprint, and first and last contact times. Choose its groups when approving it. Rejected devices stay blocked until an administrator explicitly approves them.
+- **Issue several invites at once.** Assign groups to each invite, choose a use limit or unlimited uses, and set an expiration or let it run indefinitely. Copy the code when it is issued. The console tracks usage and lets administrators revoke individual invites.
+- **Require an invite for new devices.** Invite-only mode rejects new enrollment attempts without a valid invite. The client explains the rejection in its console and sends a tray notification. Previously approved devices can reconnect with their existing identity.
+- **Manage access after enrollment.** Change a device’s groups, disable it, or re-enable it. The server checks the current authorization on file requests, including requests on existing connections.
+
+### Groups and permissions
+
+- **Assign access through groups.** A device can belong to several groups. Devices with no groups have no share access. Manage memberships from **Devices** and edit share permissions directly from **Groups**.
+- **Scope rules by path.** Apply a rule to a whole share, one file or folder, or a folder and its descendants. The server combines matching grants across groups, and explicit denies take precedence.
+- **Separate editing from deletion.** Control listing, reading and writing data, creating files and folders, renaming, deleting, reading and changing attributes, and reading permissions. The **Read and write** preset lets devices create and edit while leaving rename and delete as separate choices.
+- **Grant administrator access explicitly.** The permanent **Administrator** group grants full control on enabled shares, including newly added ones. Matching denies from another group still apply. Membership requires manual assignment and is unavailable through invites.
+- **Respect Windows storage permissions.** File operations run as the server’s Windows account. The server also excludes its private data, client profiles, and reparse points such as junctions and symbolic links from exports.
+
+### Identity and encryption
+
+- **Separate profiles for each Windows user.** Each signed-in user has their own device name, keys, saved servers, and drive configuration under `%USERPROFILE%\.bijoushare`. The Windows Data Protection API protects the private keys for that user.
+- **Keep identities across renames.** Device and server fingerprints are derived from their persistent ECDH and ML-KEM public keys using SHA3-256. Changing a display name preserves the fingerprint and device enrollment.
+- **Verify both peers.** The client checks the full server fingerprint before sending an invite. The handshake proves possession of both peers’ identity keys, and the client flags a fingerprint mismatch.
+- **Encrypt file traffic in both directions.** Each connection combines ECDH P-256 and ML-KEM-768 secrets to derive separate AES-256-GCM keys for sending and receiving. The receiver rejects altered or replayed encrypted frames.
+
+### Performance and recovery
+
+- **Browse large folders in pages.** The server filters filename patterns and sends compact entries with basic attributes, sizes, and timestamps. Explorer can still request file contents separately for previews or thumbnails.
+- **Overlap file requests.** The binary transfer protocol supports up to 16 requests in flight per connection and file payloads up to 1 MiB per request. Independent reads can overlap while the server preserves the order of changes.
+- **Reconnect without losing drive layout.** An offline server’s folder disappears while the drive and other connected servers stay available. BijouShare keeps the saved connection, retries, and restores the folder when the server returns.
+- **Recover after sleep or network changes.** The client rechecks connections after resume and monitors mounted drives. If Windows drops a mount, the client attempts to restore it on the configured letter.
+
+### Administration and deployment
+
+- **Manage both services from a browser.** System tray icons open the client and server consoles. Each client drive has its own tab showing mount status, connected servers, fingerprints, and connection errors, with a manual refresh option.
+- **Control access to management.** The client console listens on loopback and requires the signed-in user’s access token for management requests. Server setup runs locally, administrator sign-in is rate-limited, and remote administration requires HTTPS.
+- **Review activity and diagnose failures.** The server console shows the latest 200 audit events, and the server keeps daily logs. Error details can identify a missing group permission, a Windows storage denial, or the device holding a conflicting file handle.
+- **Change listening ports at runtime.** Administrators can change the file-service port and, on a directly managed web endpoint, the console port. The browser waits for the new web address and then redirects. Existing file connections can finish on the old file port.
+- **Install interactively or unattended.** Separate x64 installers register each role as an automatic Windows service. They support silent setup, unattended setup with progress, repair, and uninstall. The client installer checks for the Dokan runtime and driver.
+- **Check connectivity from the command line.** The client’s `--probe` command reports enrollment status and lists authorized shares without mounting a drive.
+
 ## Prerequisites
 
 - **Windows.** The x64 installers require administrator privileges. Both computers need a Windows build with native support for ML-KEM-768 and SHA3-256. [Microsoft's Windows cryptography support](https://learn.microsoft.com/windows/win32/seccng/cng-algorithm-identifiers)
@@ -44,16 +93,27 @@ flowchart LR
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.15-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
-2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's **LOCAL SERVICE** account the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share.
-3. **Invite the client.** On **Overview → Connect a client**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.15-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray and choose a device name. Select **Add drive** and pick an unused letter.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.17-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
+3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.17-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, send the **Overview → Connect a client → Copy link** connection link in step 3. After the client connects, open **Devices** on the server, approve the waiting device, and assign its groups.
+
+To require invites for all new devices, go to **Settings → Device enrollment** in the server console, turn on **Invite only**, and save. A new device needs a valid invite with a remaining use to enroll. If its link is missing or unusable, the client displays **“This server is invite only”** in its console and sends a tray notification. The server skips the approval queue. Approved devices continue to reconnect with their enrolled keys. Turn the setting off to resume manual approval, including requests already waiting when you enabled it. Invite only is off by default.
 
 To change ports, open **Settings → Listening ports** on the server. The file service defaults to TCP **7443** and the local web UI to **5080**. After a web UI port change, the console reopens on the new port and the tray icon uses that address. For remote HTTPS access, allow the new web port through your firewall before saving. If you reach the console through a proxy on a different port, open it from the server tray to change its listener. Deployments with explicit Kestrel endpoints or multiple web URLs manage those bindings in their hosting configuration.
 
 After a file service port change, existing connections can finish on the old port. Update your firewall rule and copy a fresh connection link from **Overview**. Once file transfers finish, clients can disconnect the old server entry from their drive and reconnect using the new link. Device approvals and group memberships carry over.
 
 For unattended installation, run either installer from an elevated terminal with `/quiet /norestart`. Both services start automatically with Windows.
+
+### Changing the server service account
+
+If a device can browse a share but cannot create a folder, check **Activity** in the server web UI for the failed operation. For an NTFS denial, you can grant the service account **Create folders / append data** on the affected directory. If you choose to run the service under an existing Windows administrator account, follow these steps on the server PC. This gives the entire server process local administrator privileges. BijouShare still enforces its device and group rules.
+
+1. Open **Services** from Start using **Run as administrator**. Elevating the BijouShare tray shortcut only elevates the tray.
+2. Open **BijouShare Server → Properties → Log On → This account**. Enter `.\YourAdminUser`, replacing `YourAdminUser` with the local administrator's username. Enter and confirm the account password. Windows Hello PINs cannot be used for service logon.
+3. Click **Apply → OK**. Keep the startup type set to **Automatic**. Once active transfers finish, right-click **BijouShare Server** and select **Restart**.
+4. Open **Shares** in the server web UI. Check that **Windows accesses these paths as** shows the selected account, then retry the operation from the client. Check this setting again after an installer upgrade, which can restore the default `NT AUTHORITY\LocalService` account.

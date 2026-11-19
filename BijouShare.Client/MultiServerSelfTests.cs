@@ -16,9 +16,35 @@ internal static class MultiServerSelfTests
         await RoutingAndHandles(check);
         await ServerPermissions(check);
         await FailureIsolation(check);
+        await InviteNotices(check);
         await AuthenticatedNames(check);
         await OfflineRecovery(check);
         await ResumeDuringHandshake(check);
+    }
+
+    private static async Task InviteNotices(Action<bool, string> check)
+    {
+        var remote = new FakeConnection(37) { Failure = "InviteRequired" };
+        const string address = "archive.test:7443";
+        using var router = new MultiServerConnection([(address, (IRemoteConnection)remote,
+            (Func<string?>)(() => "Archive"), (Func<string?>)(() => null))]);
+        var notices = new ConcurrentQueue<string>();
+        router.InviteRequired += endpoint => notices.Enqueue(ClientTray.InviteRequiredNotice("N:", endpoint));
+        // Activating a wad link requests an asynchronous refresh through this same path.
+        router.RequestRefresh();
+        await router.RefreshAsync(CancellationToken.None);
+        remote.Failure = "Disconnected";
+        await router.RefreshAsync(CancellationToken.None);
+        remote.Failure = "InviteRequired";
+        await router.RefreshAsync(CancellationToken.None);
+        check(notices.TryDequeue(out var notice) && notices.IsEmpty && notice.Contains(address, StringComparison.Ordinal) &&
+            notice.Contains("N:", StringComparison.Ordinal) && notice.Contains("This server is invite only.", StringComparison.Ordinal),
+            "An invite-only server triggers one desktop notice with its endpoint and drive across retries");
+        remote.Failure = null;
+        await router.RefreshAsync(CancellationToken.None);
+        remote.Failure = "InviteRequired";
+        await router.RefreshAsync(CancellationToken.None);
+        check(notices.Count == 1, "A new invite rejection after reconnecting can notify the user again");
     }
 
     private static async Task ServerPermissions(Action<bool, string> check)

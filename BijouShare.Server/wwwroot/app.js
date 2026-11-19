@@ -53,8 +53,11 @@ function connectionUri(host, code = '') {
 function renderConnectionLink() {
   let uri = '';
   try { uri = connectionUri(connectionHost); } catch { /* Let the address field display a validation error. */ }
-  return `<section class="panel connection-panel"><div class="panel-title"><h2>${icon('link')}Connect a client</h2></div>
-    <div class="panel-body"><p class="muted">Send the connection link through a trusted channel. New devices will appear in <a href="#devices">Devices</a> for approval.</p>
+  const title = state.inviteOnly ? 'Reconnect an approved device' : 'Connect a client';
+  const hint = state.inviteOnly ? 'Approved devices can use this link. For a new device, create an invite in <a href="#invites">Invites</a>.'
+    : 'Send the connection link through a trusted channel. New devices will appear in <a href="#devices">Devices</a> for approval.';
+  return `<section class="panel connection-panel"><div class="panel-title"><h2>${icon('link')}${title}</h2></div>
+    <div class="panel-body"><p class="muted">${hint}</p>
     <label for="connection-host">Server LAN hostname or IP</label><input id="connection-host" value="${escapeHtml(connectionHost)}" maxlength="253" autocomplete="off" spellcheck="false" aria-describedby="connection-host-hint${isLoopbackAddress(connectionHost) ? ' connection-local-warning' : ''}">
     <p id="connection-host-hint" class="hint">Use an address the client can reach on port ${state.filePort}.</p><p id="connection-local-warning" class="address-warning" role="status" ${isLoopbackAddress(connectionHost) ? '' : 'hidden'}>This address points to the client itself. Enter the server’s LAN address to connect another device.</p>
     <output id="connection-uri" class="mono">${escapeHtml(uri)}</output><div class="connection-actions"><button type="button" data-copy-connection>${icon('copy')}Copy link</button><a id="connection-link" class="button-link quiet" ${uri ? `href="${escapeHtml(uri)}"` : ''}>Open BijouShare${icon('arrow')}</a></div><p id="connection-error" class="error" role="alert"></p></div></section>`;
@@ -231,7 +234,8 @@ setInterval(async () => {
   try {
     const updated = await api('/state');
     if (epoch !== viewEpoch || sequence !== stateLoadSequence || !canRefreshDevices()) return;
-    const changed = JSON.stringify([state.devices, state.pendingDevices, state.invites, state.groups, state.serverName, state.serverId]) !==
+    const changed = state.inviteOnly !== updated.inviteOnly ||
+      JSON.stringify([state.devices, state.pendingDevices, state.invites, state.groups, state.serverName, state.serverId]) !==
       JSON.stringify([updated.devices, updated.pendingDevices, updated.invites, updated.groups, updated.serverName, updated.serverId]);
     state = updated;
     if (changed) render();
@@ -313,7 +317,8 @@ function renderOverview() {
     ['shares', 'folder', 'Shared locations', shares.length],
     ['devices', 'devices', 'Approved devices', devices.length],
     ['groups', 'users', 'Access groups', groups.length],
-    ['devices', 'clock', 'Awaiting approval', pending]
+    state.inviteOnly ? ['invites', 'key', 'Active invites', state.invites.filter(invite => inviteStatus(invite) === 'Active').length]
+      : ['devices', 'clock', 'Awaiting approval', pending]
   ];
   const listing = shares.slice(0, 4).map(share => `<li>
     <span class="row-icon">${icon('folder')}</span><div class="row-copy"><strong>${escapeHtml(share.name)}</strong><small class="mono">${escapeHtml(share.localPath)}</small></div>${enabled(share.enabled)}</li>`).join('');
@@ -324,7 +329,7 @@ function renderOverview() {
   return `<section class="server-hero" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow">${icon('server')}Server overview</p><h1 id="overview-title" tabindex="-1">${escapeHtml(state.serverName)}</h1><div class="hero-meta"><span>${icon('network')}TCP <code>${state.filePort}</code></span><span class="hero-divider"></span><span>${icon('lock')}Encrypted file server</span></div>
       <div class="hero-actions">${newButton('Add share', 'shares')}<button type="button" data-new="invites">${icon('key')}Create invite</button></div></div></section>
     <div class="stats" aria-label="Server totals">${metrics.map(([target, symbol, label, value]) => `<a class="stat" href="#${target}"><span class="stat-label">${label}</span><strong>${value.toLocaleString()}</strong><span class="stat-symbol">${icon(symbol)}</span></a>`).join('')}</div>
-    ${pending ? `<div class="callout approval-notice">${icon('clock')}<div><strong>${pending} device ${pending === 1 ? 'request awaits' : 'requests await'} approval</strong><span>Review the identities and assign their access groups.</span></div><a class="text-link" href="#devices">Review requests${icon('arrow')}</a></div>` : ''}
+    ${pending && !state.inviteOnly ? `<div class="callout approval-notice">${icon('clock')}<div><strong>${pending} device ${pending === 1 ? 'request awaits' : 'requests await'} approval</strong><span>Review the identities and assign their access groups.</span></div><a class="text-link" href="#devices">Review requests${icon('arrow')}</a></div>` : ''}
     <div class="overview-grid">
       <section class="panel summary-panel"><div class="panel-title"><h2>${icon('folder')}Shared locations</h2><a class="text-link" href="#shares">View shares${icon('arrow')}</a></div>${listing ? `<ul class="summary-list">${listing}</ul>` : empty('No shared locations', 'Add a file, folder, or drive to start sharing.')}</section>
       <section class="panel summary-panel"><div class="panel-title"><h2>${icon('activity')}Recent activity</h2><a class="text-link" href="#activity">View log${icon('arrow')}</a></div>${events ? `<ul class="summary-list">${events}</ul>` : empty('No recent events', 'Connections and file operations will appear here.')}</section>
@@ -349,7 +354,9 @@ function inviteStatus(invite) {
 }
 
 function renderInvites() {
-  return heading('Invites', 'Automatically approve new devices into the groups you choose.', newButton('Create invite', 'invites')) +
+  const hint = state.inviteOnly ? 'Invite-only enrollment is on. Every new device needs a valid invite link.'
+    : 'Automatically approve new devices into the groups you choose.';
+  return heading('Invites', hint, newButton('Create invite', 'invites')) +
     `<div class="callout"><strong>Each invite grants its selected group memberships.</strong>Set a use limit and an expiration, or allow unlimited uses and no expiration. Existing devices keep their current groups; blocked devices remain blocked. Copy each new code when it is created.</div>` +
     table(['Invite', 'Groups', 'Uses', 'Expires', 'Status', ''], (state.invites ?? []).map(invite => {
       const status = inviteStatus(invite);
@@ -371,8 +378,14 @@ function renderSettings() {
   if (state.webPort == null) webPortHint = 'The web listener is managed by the server’s hosting configuration.';
   else if (!canChangeWebPort) webPortHint = 'To change this port, open the console directly from the BijouShare Server tray icon.';
   else if (!isLoopbackAddress(location.hostname)) webPortHint = 'Allow the new port through your firewall before saving. This page will reopen on that port.';
-  return heading('Settings', 'Manage the server name, listening ports, and administrator access.') +
+  return heading('Settings', 'Manage device enrollment, server identity, listening ports, and administrator access.') +
     `<div class="settings-grid">${renderServerIdentity()}${renderConnectionLink()}` +
+    `<section class="panel"><div class="panel-title"><h2>${icon('devices')}Device enrollment</h2></div>
+      <form id="device-enrollment" class="password-form">
+        <label class="check"><input type="checkbox" id="invite-only" name="inviteOnly" aria-describedby="enrollment-hint" ${state.inviteOnly ? 'checked' : ''}>Invite only</label>
+        <p id="enrollment-hint" class="hint">Require a valid invite link for each new device. This pauses manual approvals. Approved devices can reconnect as usual.</p>
+        <p id="enrollment-error" class="error" role="alert"></p><button class="primary" type="submit">Save enrollment settings</button>
+      </form></section>` +
     `<div class="panel"><div class="panel-title"><h2>${icon('server')}Server name</h2></div><form id="rename-server" class="password-form">
       <label>Display name<input name="name" required maxlength="100" pattern="[A-Za-z0-9\\-]+" spellcheck="false" value="${escapeHtml(state.serverName)}" aria-describedby="rename-hint"></label>
       <p id="rename-hint" class="hint">Clients see the new folder name when they reconnect. Existing links and fingerprints stay valid.</p>
@@ -404,7 +417,7 @@ function render() {
   const pendingCount = state.pendingDevices.filter(device => !device.rejected).length;
   const deviceLink = document.querySelector('[data-tab="devices"]');
   let badge = deviceLink.querySelector('.nav-badge');
-  if (pendingCount) {
+  if (pendingCount && !state.inviteOnly) {
     if (!badge) { badge = document.createElement('span'); badge.className = 'nav-badge'; deviceLink.append(badge); }
     badge.textContent = pendingCount; badge.setAttribute('aria-label', `${pendingCount} pending device ${pendingCount === 1 ? 'request' : 'requests'}`);
   } else if (badge) badge.remove();
@@ -418,6 +431,7 @@ function render() {
     devices: renderDeviceWorkspace, invites: renderInvites, activity: renderActivity, settings: renderSettings
   };
   $('#content').innerHTML = renderers[tab]();
+  $('#device-enrollment')?.addEventListener('submit', changeEnrollment);
   $('#rename-server')?.addEventListener('submit', changeServerName);
   $('#server-ports')?.addEventListener('submit', changeServerPorts);
   $('#password-form')?.addEventListener('submit', changePassword);
@@ -561,7 +575,7 @@ function confirmDeletion(entity, id) {
   let title = `Delete ${entityNames[entity]}?`, detail = '', button = 'Delete';
   if (entity === 'shares') { title = 'Remove share?'; button = 'Remove share'; detail = `Clients will lose this shared location and ${state.rules.filter(rule => rule.shareId === id).length} permission rule(s) will be removed. The server’s files remain in place.`; }
   if (entity === 'devices') { title = 'Block device?'; button = 'Block device'; detail = 'This device loses access immediately. Its identity and groups are retained. Expand its name and select Enabled to allow it to reconnect.'; }
-  if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'This device stays blocked when it retries. It will receive no file access unless you explicitly approve it later.'; }
+  if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'Blocked devices cannot enroll, even with a valid invite link.'; }
   if (entity === 'invites') { title = 'Revoke invite?'; button = 'Revoke invite'; detail = 'This code will no longer enroll devices. Devices already enrolled keep their current groups and permissions.'; }
   $('#confirmation-title').textContent = title; $('#confirmation-name').textContent = name;
   $('#confirmation-detail').textContent = detail; $('#confirm-delete').textContent = button;
@@ -632,6 +646,31 @@ async function changeServerName(event) {
     toast('Server name updated.');
   } catch (exception) { error.textContent = exception.message; }
   finally { setBusy(form, false); }
+}
+
+async function changeEnrollment(event) {
+  event.preventDefault();
+  const form = event.currentTarget, input = form.elements.inviteOnly;
+  if (input.disabled) return;
+  const epoch = viewEpoch, error = $('#enrollment-error');
+  error.textContent = '';
+  input.disabled = true;
+  setBusy(form, true);
+  try {
+    const saved = await api('/server/enrollment', 'POST', { inviteOnly: input.checked });
+    if (!state || viewEpoch !== epoch) return;
+    ++stateLoadSequence;
+    state.inviteOnly = saved.inviteOnly;
+    render();
+    if (tab === 'settings') $('#invite-only').focus({ preventScroll: true });
+    toast(saved.inviteOnly ? 'Invite-only enrollment enabled.' : 'Manual enrollment requests enabled.');
+  } catch (exception) {
+    if (error.isConnected) error.textContent = exception.message;
+    else if (viewEpoch === epoch) toast(exception.message);
+  } finally {
+    input.disabled = false;
+    setBusy(form, false);
+  }
 }
 
 $('#web-restarting').addEventListener('cancel', event => event.preventDefault());

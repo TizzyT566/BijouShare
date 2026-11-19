@@ -268,7 +268,8 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                     }
                     catch (RemoteException ex)
                     {
-                        await transport.SendAsync(RpcResponse.Fail(ex.Code), timeout.Token);
+                        var error = ex.Code == "InvalidInvite" && store.Read(s => s.InviteOnly) ? "InviteRequired" : ex.Code;
+                        await transport.SendAsync(RpcResponse.Fail(error), timeout.Token);
                         return;
                     }
                     finally { enrollment.ReleasePayload(); }
@@ -286,6 +287,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                         else if (prior.Name != hello.DeviceName)
                             audit.Write(hello.DeviceName!, "DeviceRenamed", publicIdentity);
                     }
+                    catch (RemoteException ex) { result = ex.Code; }
                     catch (UnauthorizedAccessException) { result = store.FindPendingDevice(publicIdentity)?.Rejected == true ? "DeviceRejected" : "DeviceBlocked"; }
                     catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException) { result = "DeviceBlocked"; }
                     await transport.SendAsync(RpcResponse.Fail(result), timeout.Token);

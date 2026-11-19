@@ -29,6 +29,7 @@ const deviceWorkspace = (() => {
 
   function editor(kind, device, key, draft) {
     const pending = kind === 'pending';
+    const inviteRequired = pending && state.inviteOnly;
     const safeKey = escapeHtml(key);
     const enabled = draft.enabled ?? device.enabled;
     const selected = new Set(selectedGroups(device, draft).map(group => group.id));
@@ -40,13 +41,13 @@ const deviceWorkspace = (() => {
     return `<form class="device-form" id="device-panel-${safeKey}" data-device-form="${safeKey}" data-kind="${kind}" data-id="${escapeHtml(device.id)}" aria-labelledby="device-name-${safeKey}" aria-busy="${draft.busy}">
       <fieldset class="device-inputs" ${draft.busy ? 'disabled' : ''}><legend class="sr-only">${pending ? 'Device approval' : 'Device settings'}</legend>
         <div class="device-fields">
-          <fieldset class="device-memberships"><legend>Group memberships</legend>
+          ${inviteRequired ? '' : `<fieldset class="device-memberships"><legend>Group memberships</legend>
             ${filterable ? `<input class="device-filter" type="search" name="group-filter" aria-label="Filter groups" placeholder="Filter groups" autocomplete="off" value="${escapeHtml(draft.filter)}" aria-controls="device-choices-${safeKey}">` : ''}
             <div class="device-checklist" id="device-choices-${safeKey}" role="region" tabindex="0" aria-label="Available groups">${choices || '<span class="muted">No groups available.</span>'}
               ${filterable ? `<span class="muted device-no-match" role="status" ${state.groups.some(matches) ? 'hidden' : ''}>No matching groups.</span>` : ''}</div>
             <p class="hint">Devices with no groups have no share access.</p>
             <p class="hint" data-admin-hint ${state.groups.some(group => group.isAdministrator && selected.has(group.id)) ? '' : 'hidden'}>Administrator grants full control on enabled shares. Explicit denies from other groups take precedence.</p>
-          </fieldset>
+          </fieldset>`}
           <div class="device-details">
             ${pending ? '' : `<label class="device-enabled"><input type="checkbox" name="enabled" ${enabled ? 'checked' : ''}>Enabled</label>`}
             <dl><div><dt>Device fingerprint</dt><dd class="mono">${escapeHtml(formattedFingerprint(draft.fingerprint))}</dd></div>
@@ -56,7 +57,7 @@ const deviceWorkspace = (() => {
         </div>
         <p class="error" role="alert">${escapeHtml(draft.error)}</p>
         <div class="device-form-actions">${block}<button type="button" class="quiet" data-device-cancel>Cancel</button>
-          <button type="submit" class="primary">${pending ? 'Approve device' : 'Save changes'}</button></div>
+          ${inviteRequired ? '' : `<button type="submit" class="primary">${pending ? 'Approve device' : 'Save changes'}</button>`}</div>
       </fieldset>
     </form>`;
   }
@@ -68,7 +69,8 @@ const deviceWorkspace = (() => {
       const key = keyFor(kind, device), safeKey = escapeHtml(key);
       const open = expanded === key, pending = kind === 'pending';
       const groups = (device.groupIds || []).map(id => nameOf(state.groups, id));
-      const status = pending ? device.rejected ? 'Blocked' : 'Awaiting approval' : device.enabled ? 'Enabled' : 'Blocked';
+      const status = pending ? device.rejected ? 'Blocked' : state.inviteOnly ? 'Invite required' : 'Awaiting approval'
+        : device.enabled ? 'Enabled' : 'Blocked';
       const summary = pending ? '' : groups.length ? groups.slice(0, 2).join(', ') + (groups.length > 2 ? ' +' + (groups.length - 2) : '') : 'No groups';
       return `<article class="device-row" data-${pending ? 'pending' : 'device'}-id="${escapeHtml(device.id)}">
         <button type="button" id="device-name-${safeKey}" class="device-toggle" data-device-expand="${safeKey}" aria-expanded="${open}" ${open ? `aria-controls="device-panel-${safeKey}"` : ''} aria-labelledby="device-label-${safeKey}" aria-describedby="device-status-${safeKey}${summary ? ' device-groups-' + safeKey : ''}">
@@ -91,7 +93,10 @@ const deviceWorkspace = (() => {
       drafts.delete(key);
       if (expanded === key) expanded = null;
     }
-    return heading('Devices', 'Select a device to manage its access groups or review its request.') +
+    const hint = state.inviteOnly ? 'Invite-only enrollment is on. New devices need a valid invite link.' +
+      (state.pendingDevices.some(device => !device.rejected) ? ' Devices with earlier requests can enroll using an invite.' : '')
+      : 'Select a device to manage its access groups or review its request.';
+    return heading('Devices', hint) +
       '<div class="device-workspace">' + section('pending', 'Device requests', state.pendingDevices) + section('approved', 'Approved devices', state.devices) + '</div>';
   }
 
@@ -156,6 +161,7 @@ const deviceWorkspace = (() => {
     const draft = drafts.get(key), device = devicesFor(kind).find(item => item.id === id);
     if (!draft || !device || draft.busy || draft.fingerprint !== fingerprintOf(device)) return;
     const pending = kind === 'pending';
+    if (pending && state.inviteOnly) return;
     const groupIds = selectedGroups(device, draft).map(group => group.id);
     const enabled = draft.enabled ?? device.enabled;
     const message = pending ? 'Device approved. It can connect on its next attempt.' : 'Device changes saved.';

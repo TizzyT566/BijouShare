@@ -10,6 +10,7 @@ namespace BijouShare.Server;
 public static class AdminApi
 {
     public sealed record ServerNameUpdate(string Name);
+    public sealed record EnrollmentSettings(bool InviteOnly);
     public sealed record Login(string Name, string Password);
     public sealed record PasswordChange(string CurrentPassword, string NewPassword);
     public sealed record DeviceApproval(Guid[] GroupIds, string Fingerprint);
@@ -84,11 +85,18 @@ public static class AdminApi
             Save(context, audit, "RenameServer", update.Name, () => { store.RenameServer(update.Name); return true; }));
         api.MapPost("/server/ports", (PortUpdate update, ServerPortSettings ports, HttpContext context) =>
             ports.SaveAsync(update, context));
+        api.MapPost("/server/enrollment", (EnrollmentSettings settings, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "ChangeEnrollment", settings.InviteOnly ? "Invite only" : "Manual approval and invites", () =>
+            {
+                store.SetInviteOnly(settings.InviteOnly);
+                return settings;
+            }));
         api.MapPost("/logout", async (HttpContext context) => { await context.SignOutAsync(); return Results.Ok(); });
         api.MapGet("/state", (StateStore store, AuditLog audit, ServerOptions options, WebPortListener web, HttpContext context) => store.Read(s => Results.Ok(new
         {
             s.ServerName,
             s.ServerId,
+            s.InviteOnly,
             s.ServerPublicKey,
             s.ServerMlKemPublicKey,
             filePort = options.Port,

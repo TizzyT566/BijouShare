@@ -1,9 +1,11 @@
 using System.Security.Cryptography;
-using Microsoft.AspNetCore.DataProtection;
+using System.ComponentModel;
+using System.Diagnostics;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using BijouShare.Client;
 using BijouShare.Shared;
 
+var startupStage = "opening the Windows user session";
 try
 {
     var protocolLink = WadProtocol.ParseActivation(args);
@@ -18,12 +20,6 @@ try
         throw new PlatformNotSupportedException("BijouShare requires Windows.");
     if (commandLine.Command == ClientCommand.SelfTest)
         return await ClientSelfTests.RunAsync();
-    if (commandLine.Command == ClientCommand.OpenManagement)
-    {
-        await ClientActivation.OpenManagementAsync(UserProfileStorage.Resolve(null), ClientTray.OpenBrowser);
-        return 0;
-    }
-
     if (WindowsServiceHelpers.IsWindowsService())
     {
         var service = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
@@ -57,8 +53,10 @@ try
         Console.WriteLine("Connection link delivered to the running client.");
         return 0;
     }
-    if (commandLine.Command == ClientCommand.Run && commandLine.Link is null && commandLine["--server"] is null &&
-        commandLine["--name"] is null && commandLine["--mount"] is null && commandLine["--management-port"] is null)
+    var desktopLaunch = commandLine.Command is ClientCommand.Run or ClientCommand.OpenManagement &&
+        commandLine.Link is null && commandLine["--server"] is null && commandLine["--name"] is null &&
+        commandLine["--mount"] is null && commandLine["--management-port"] is null;
+    if (desktopLaunch)
     {
         var running = await ClientActivation.TryGetRunningClientAsync(directory);
         if (running is not null)
@@ -68,13 +66,24 @@ try
             return 0;
         }
     }
-    using var lease = UserProfileStorage.Acquire(directory);
+    startupStage = "opening the private client profile";
+    StorageLease lease;
+    try { lease = UserProfileStorage.Acquire(directory); }
+    catch (StorageInUseException) when (desktopLaunch)
+    {
+        // The service and the shortcut can start together, before the winner publishes its pipe.
+        var running = await ClientActivation.WaitForRunningClientAsync(directory);
+        await ClientTray.AttachAsync(directory, running, commandLine);
+        return 0;
+    }
+    using var profileLifetime = lease;
     var path = Path.Combine(directory, "client.json");
 
+    startupStage = "loading the device identity and settings";
     var existing = File.Exists(path);
     var settings = existing ? ClientSettings.Load(path) : ClientSettings.Create(commandLine["--name"] ?? Environment.UserName);
     settings.AttachPath(path);
-    if (!existing && commandLine.Command == ClientCommand.Run && commandLine["--server"] is null)
+    if (!existing && commandLine.Command is ClientCommand.Run or ClientCommand.OpenManagement && commandLine["--server"] is null)
         settings.SetupComplete = false;
     var changed = !existing;
     if (commandLine["--management-port"] is { } managementPort)
@@ -159,11 +168,9 @@ try
                 Console.WriteLine($"{endpoint.FolderName ?? endpoint.Host}: {count} visible share(s).");
                 return (Status: 0, Count: count);
             }
-            catch (RemoteException ex) when (ex.Code is "PendingApproval" or "DeviceRejected" or "DeviceBlocked")
+            catch (RemoteException ex) when (EnrollmentMessage(ex.Code) is { } message)
             {
-                Console.WriteLine(ex.Code == "PendingApproval"
-                    ? $"{endpoint.Name}: This device is awaiting administrator approval on the server."
-                    : $"{endpoint.Name}: This device was rejected or blocked. An administrator must explicitly approve or enable it.");
+                Console.WriteLine($"{endpoint.Name}: {message}");
                 return (Status: ex.Code == "PendingApproval" ? 2 : 3, Count: 0);
             }
             catch (Exception ex) when (ex is IOException or CryptographicException or InvalidOperationException)
@@ -180,43 +187,42 @@ try
         return results.Any(result => result.Status == 2) ? 2 : results.Any(result => result.Status == 3) ? 3 : 1;
     }
 
-    var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = [], ContentRootPath = AppContext.BaseDirectory });
-    builder.WebHost.UseUrls($"http://127.0.0.1:{settings.ManagementPort}");
-    builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 8192);
-    var managementAccess = new ClientManagementAccess();
-    builder.Services.AddSingleton(managementAccess);
-    builder.Services.AddSingleton(settings);
-    builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(directory, "web-keys")))
-        .ProtectKeysWithDpapi(false).SetApplicationName("BijouShare.Client");
-    builder.Services.AddSingleton<DriveConnections>();
-    builder.Services.AddHostedService<DriveWorker>();
-    ClientManagementWeb.AddServices(builder.Services);
-    using var host = builder.Build();
-    managementAccess.RequireOwner(host);
-    ClientManagementWeb.Map(host);
-    using var trayPresence = commandLine.NoBrowser ? null : ClientTray.ClaimSession(directory, Environment.ProcessId);
-    await host.StartAsync();
-    var address = host.Urls.Single();
-    managementAccess.Listen(address);
-    Console.WriteLine($"Client management: {address}");
-    WadProtocol.RegisterOnLaunch(commandLine);
-    using var tray = trayPresence is null ? null : ClientTray.Start(
-        () => managementAccess.LaunchUrl(host.Lifetime.ApplicationStopping).GetAwaiter().GetResult(),
-        commandLine.SessionWorker ? null : host.Lifetime.StopApplication);
-    await host.WaitForShutdownAsync();
-    return Environment.ExitCode;
+    startupStage = "starting the local web console and drive worker";
+    return await ClientWorkerHost.RunAsync(settings, directory, commandLine);
 }
 
-catch (RemoteException ex) when (ex.Code is "PendingApproval" or "DeviceRejected" or "DeviceBlocked")
+catch (RemoteException ex) when (EnrollmentMessage(ex.Code) is { } message)
 {
-    Console.WriteLine(ex.Code == "PendingApproval"
-        ? "This device is awaiting administrator approval on the server. Approve it, assign groups, then connect again."
-        : "This device was rejected or blocked by the server administrator. It stays blocked until explicitly approved or enabled.");
+    Console.WriteLine(message);
     return ex.Code == "PendingApproval" ? 2 : 3;
 }
 catch (Exception ex) when (!args.Contains("--self-test") && ex is IOException or InvalidDataException or OperationCanceledException or UnauthorizedAccessException or
-    ArgumentException or InvalidOperationException or CryptographicException or System.Text.Json.JsonException or PlatformNotSupportedException)
+    ArgumentException or InvalidOperationException or CryptographicException or System.Text.Json.JsonException or PlatformNotSupportedException or Win32Exception or System.Security.SecurityException)
 {
     Console.Error.WriteLine($"BijouShare client: {ex.Message}");
+    if (args is ["--open-management"])
+        ClientTray.ShowStartupError(ex.Message);
+    if (args.Contains("--session-worker", StringComparer.Ordinal))
+    {
+        var cause = ex.GetBaseException();
+        var code = cause is Win32Exception native ? native.NativeErrorCode : cause.HResult;
+        // Application events are readable by other accounts. Leave profile paths, keys and links out.
+        try
+        {
+            EventLog.WriteEntry("BijouShare.Client",
+                $"The signed-in client failed while {startupStage} ({cause.GetType().Name}, code 0x{code:X8}). Open BijouShare Client from Start for the error details.",
+                EventLogEntryType.Error, 4301);
+        }
+        catch (Exception loggingError) when (loggingError is Win32Exception or InvalidOperationException or
+            IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
+    }
     return 1;
 }
+
+static string? EnrollmentMessage(string code) => code switch
+{
+    "InviteRequired" => "This server is invite only. Ask its administrator for a valid invite link.",
+    "PendingApproval" => "This device is awaiting administrator approval on the server.",
+    "DeviceRejected" or "DeviceBlocked" => "This device was rejected or blocked. An administrator must explicitly approve or enable it.",
+    _ => null
+};

@@ -8,6 +8,7 @@ public sealed class DriveConnections : IDisposable
     private readonly object gate = new();
     private readonly Dictionary<string, MultiServerConnection> routers = new(StringComparer.OrdinalIgnoreCase);
     private bool disposed;
+    internal event Action<string, string>? InviteRequired;
 
     public DriveConnections(ClientSettings settings, ILoggerFactory loggers)
     {
@@ -42,7 +43,11 @@ public sealed class DriveConnections : IDisposable
             foreach (var letter in letters)
             {
                 if (!routers.TryGetValue(letter, out var router))
-                    routers.Add(letter, new MultiServerConnection(settings, loggers, letter));
+                {
+                    router = new MultiServerConnection(settings, loggers, letter);
+                    router.InviteRequired += address => InviteRequired?.Invoke(letter, address);
+                    routers.Add(letter, router);
+                }
                 else if (settings.SetupComplete)
                     router.Synchronize(settings, loggers, reconnectAll, reconnect);
             }

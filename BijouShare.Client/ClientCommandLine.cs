@@ -115,7 +115,7 @@ internal sealed class ClientCommandLine
           --register-protocol
               Register this executable to open wad links for the current Windows user.
           --open-management
-              Open the signed-in user's running client console once in the default browser.
+              Open this Windows user's console in the default browser, starting the client if needed.
           --management-port 5081
               Use a fixed loopback port. By default Windows chooses an available port.
           --no-browser
@@ -125,7 +125,8 @@ internal sealed class ClientCommandLine
               Create/reuse this device identity, add/update a server, and connect.
               The primary drive contains folders such as N:\ServerName_First16IdCharacters\Share.
               Each server supplies its current display name when the client connects.
-              Unknown devices wait for administrator approval in the server's Devices page.
+              New devices need a valid invite when invite-only enrollment is enabled.
+              Otherwise a connection link can request manual approval on the server's Devices page.
               Approved servers appear under the shared drive; subsequent starts reuse this configuration.
           --probe [--server HOST] [--port 7443]
               Report approval status and authorized shares for every configured server without mounting.

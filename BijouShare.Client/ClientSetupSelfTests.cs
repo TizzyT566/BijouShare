@@ -27,8 +27,7 @@ internal static class ClientSetupSelfTests
             var osActivation = WadProtocol.ParseActivation(["--open-uri", link.ToStringWithInvite()]);
             check(osActivation == link && WadProtocol.ParseActivation([link.ToStringWithInvite()]) is null,
                 "Only a Windows protocol activation enters the short-lived launcher");
-            var opened = new List<string>();
-            var firstLaunch = ClientActivation.OpenManagementAsync(directory, opened.Add, deadline.Token);
+            var firstLaunch = ClientActivation.WaitForRunningClientAsync(directory, deadline.Token);
             await ClientActivation.DeliverProtocolLinkAsync(directory, link, start =>
             {
                 check(start.FileName == Path.Combine(AppContext.BaseDirectory, "BijouShare.Client.exe") &&
@@ -41,15 +40,21 @@ internal static class ClientSetupSelfTests
                 });
             }, deadline.Token);
             await listener;
-            await firstLaunch;
-            check(opened.Count == 1 && opened[0] == await access.LaunchUrl(deadline.Token),
-                "Post-install client activation waits for the signed-in owner's listener and opens its authenticated console exactly once");
+            check((await firstLaunch).ManagementUrl == await access.LaunchUrl(deadline.Token),
+                "A concurrent desktop launch waits for the profile owner's authenticated console");
             var running = await ClientActivation.TryGetRunningClientAsync(directory, deadline.Token);
             check(running is not null && running.ProcessId == Environment.ProcessId && running.ManagementUrl == await access.LaunchUrl(deadline.Token),
                 "A desktop tray attaches to the verified profile owner and obtains its private console URL");
             using (var iconClaim = ClientTray.ClaimSession(directory, Environment.ProcessId))
             using (var duplicate = ClientTray.ClaimSession(directory, Environment.ProcessId))
+            {
                 check(iconClaim is not null && duplicate is null, "A second client launch shares the existing tray icon in this Windows session");
+                var opened = new List<string>();
+                await ClientTray.AttachAsync(directory, running!, ClientCommandLine.Parse(["--open-management"]), opened.Add).WaitAsync(deadline.Token);
+                await ClientTray.AttachAsync(directory, running!, ClientCommandLine.Parse([]), opened.Add).WaitAsync(deadline.Token);
+                check(opened.Count == 1 && opened[0] == running!.ManagementUrl,
+                    "The Start menu opens the owner's console even with an existing tray, while ordinary launches leave the browser alone");
+            }
             using (var reclaimed = ClientTray.ClaimSession(directory, Environment.ProcessId))
                 check(reclaimed is not null, "A replacement client can claim the tray after its previous owner exits");
             var warm = new WadUri("second-host", 7443, new string('2', 64), new string('t', 32));

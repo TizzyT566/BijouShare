@@ -62,6 +62,7 @@ public sealed class ServerState
     public int SchemaVersion { get; set; } = 6;
     public int? FilePort { get; set; }
     public int? WebPort { get; set; }
+    public bool InviteOnly { get; set; }
     public string ServerId { get; set; } = "";
     public string ServerName { get; set; } = "";
     public string ServerPublicKey { get; set; } = "";
@@ -188,6 +189,7 @@ public sealed partial class StateStore
         s.WebPort = webPort;
         return true;
     });
+    public void SetInviteOnly(bool inviteOnly) => Update(s => s.InviteOnly = inviteOnly);
     public bool VerifyAdmin(string? name, string? password) => AuthenticateAdmin(name, password) is not null;
     public void ChangeAdminPassword(string name, string currentPassword, string newPassword)
     {
@@ -311,6 +313,8 @@ public sealed partial class StateStore
             var pending = state.PendingDevices.SingleOrDefault(device => device.ClientPublicKey == binding.Ecdh);
             if (pending is { Rejected: true })
                 throw new UnauthorizedAccessException("Device registration was rejected by an administrator.");
+            if (state.InviteOnly)
+                throw new RemoteException("InviteRequired");
             var now = DateTime.UtcNow;
             if (pending is not null && pending.Name == request.DeviceName && now - pending.LastSeenUtc < TimeSpan.FromMinutes(5))
                 return false;
@@ -331,6 +335,8 @@ public sealed partial class StateStore
 
     public Device ApproveDevice(Guid id, Guid[] groupIds, string expectedFingerprint) => Update(s =>
     {
+        if (s.InviteOnly)
+            throw new ArgumentException("Manual approval is paused while invite-only enrollment is enabled.");
         var pending = s.PendingDevices.SingleOrDefault(device => device.Id == id)
             ?? throw new ArgumentException("No pending device request exists for this ID.");
         if (!string.Equals(pending.PublicIdentity, expectedFingerprint, StringComparison.Ordinal))

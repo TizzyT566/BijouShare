@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using static BijouShare.Shared.TrayNative;
@@ -10,7 +11,7 @@ internal sealed class TrayOpenException(string message) : IOException(message);
 internal sealed class WindowsTrayIcon : IDisposable
 {
     private const uint CallbackMessage = 0x8001; // WM_APP + 1
-    private const uint OpenFailed = 0x8002;
+    private const uint ShowNotices = 0x8002;
     private const uint Close = 0x0010, Timer = 0x0113;
     private const uint Add = 0, Modify = 1, Delete = 2, SetFocus = 3, SetVersion = 4;
     private readonly string title;
@@ -27,7 +28,8 @@ internal sealed class WindowsTrayIcon : IDisposable
     private IconData icon;
     private int disposed;
     private int opening;
-    private string? pendingNotice;
+    private readonly ConcurrentQueue<string> notices = new();
+    private bool registered;
     private long lastActivation = -60_000;
 
     private WindowsTrayIcon(string title, Func<CancellationToken, Task> openConsole, Action<Exception>? onError, Action? onExit)
@@ -111,16 +113,47 @@ internal sealed class WindowsTrayIcon : IDisposable
     private void RegisterIcon()
     {
         icon.Flags = 0x01 | 0x02 | 0x04 | 0x80; // NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
-        if (Shell_NotifyIconW(Add, in icon) || Shell_NotifyIconW(Modify, in icon))
+        registered = Shell_NotifyIconW(Add, in icon) || Shell_NotifyIconW(Modify, in icon);
+        if (registered)
         {
             icon.Version = 4;
             Shell_NotifyIconW(SetVersion, in icon);
             KillTimer(icon.Window, 1);
+            DeliverNotices();
         }
         else
         {
             // A user worker can start before Explorer has created its notification area.
             SetTimer(icon.Window, 1, 3000, 0);
+        }
+    }
+
+    // Called by the profile worker. Queue first so early enrollment responses survive Explorer startup.
+    internal void ShowWarning(string text)
+    {
+        if (Volatile.Read(ref disposed) != 0 || Completion.IsCompleted)
+            return;
+        notices.Enqueue(text.Length <= 255 ? text : text[..254] + "…");
+        if (ready.Task.IsCompletedSuccessfully && ready.Task.Result != 0)
+            PostMessageW(ready.Task.Result, ShowNotices, 0, 0);
+    }
+
+    private void DeliverNotices()
+    {
+        while (registered && Volatile.Read(ref disposed) == 0 && notices.TryPeek(out var text))
+        {
+            var notice = icon;
+            notice.Flags = 0x10; // NIF_INFO
+            notice.InfoTitle = title;
+            notice.Info = text;
+            notice.InfoFlags = 0x82; // NIIF_WARNING | NIIF_RESPECT_QUIET_TIME
+            if (Shell_NotifyIconW(Modify, in notice))
+                notices.TryDequeue(out _);
+            else
+            {
+                registered = false;
+                SetTimer(icon.Window, 1, 3000, 0);
+            }
         }
     }
 
@@ -134,18 +167,9 @@ internal sealed class WindowsTrayIcon : IDisposable
                 PostQuitMessage(0);
                 return 0;
             }
-            if (message == OpenFailed)
+            if (message == ShowNotices)
             {
-                var text = Interlocked.Exchange(ref pendingNotice, null);
-                if (text is not null && Volatile.Read(ref disposed) == 0)
-                {
-                    var notice = icon;
-                    notice.Flags = 0x10; // NIF_INFO
-                    notice.InfoTitle = title;
-                    notice.Info = text;
-                    notice.InfoFlags = 0x82; // NIIF_WARNING | NIIF_RESPECT_QUIET_TIME
-                    Shell_NotifyIconW(Modify, in notice);
-                }
+                DeliverNotices();
                 return 0;
             }
             if (message == taskbarCreated || (message == Timer && wParam == 1))
@@ -160,6 +184,7 @@ internal sealed class WindowsTrayIcon : IDisposable
                     case 0x0202: // WM_LBUTTONUP
                     case 0x0400: // NIN_SELECT
                     case 0x0401: // NIN_KEYSELECT
+                    case 0x0405: // NIN_BALLOONUSERCLICK
                         var now = Environment.TickCount64;
                         if (now - lastActivation >= GetDoubleClickTime())
                         {
@@ -184,18 +209,17 @@ internal sealed class WindowsTrayIcon : IDisposable
     private void OpenConsole()
     {
         if (Interlocked.Exchange(ref opening, 1) == 0)
-            _ = OpenConsoleAsync(icon.Window, stopping.Token);
+            _ = OpenConsoleAsync(stopping.Token);
     }
 
-    private async Task OpenConsoleAsync(nint window, CancellationToken token)
+    private async Task OpenConsoleAsync(CancellationToken token)
     {
         try { await openConsole(token).ConfigureAwait(false); }
         catch (Exception error)
         {
             if (token.IsCancellationRequested) return;
             Report(error);
-            Interlocked.Exchange(ref pendingNotice, OpenFailureNotice(error));
-            PostMessageW(window, OpenFailed, 0, 0);
+            ShowWarning(OpenFailureNotice(error));
         }
         finally { Volatile.Write(ref opening, 0); }
     }
