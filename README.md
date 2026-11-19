@@ -53,8 +53,9 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 
 - **Browse large folders in pages.** The server filters filename patterns and sends compact entries with basic attributes, sizes, and timestamps. Explorer can still request file contents separately for previews or thumbnails.
 - **Overlap file requests.** The binary transfer protocol supports up to 16 requests in flight per connection and file payloads up to 1 MiB per request. Independent reads can overlap while the server preserves the order of changes.
-- **Reconnect without losing drive layout.** An offline server’s folder disappears while the drive and other connected servers stay available. BijouShare keeps the saved connection, retries, and restores the folder when the server returns.
-- **Recover after sleep or network changes.** The client rechecks connections after resume and monitors mounted drives. If Windows drops a mount, the client attempts to restore it on the configured letter.
+- **Reconnect without losing drive layout.** The client keeps a previously connected server’s folder visible briefly while Wi-Fi returns. If the outage continues, it hides that folder and keeps retrying. Other servers on the drive stay available.
+- **Keep open files across sleep.** With client and server 2.0.20 or later, the client can reconnect to the original open files and byte-range locks. If a write loses its reply, the client checks what the server recorded before continuing. An operation reports an error if recovery exceeds its timeout or the server can no longer confirm the outcome.
+- **Resume a disconnected file session.** The server can retain open files and their locks for up to 24 hours after a disconnect. If the server restarts, Windows unmounts the drive, or the session expires or is evicted, applications must reopen their files. The client restores a lost mount on its configured letter.
 
 ### Administration and deployment
 
@@ -85,7 +86,7 @@ flowchart LR
 
 **Access and concurrent use.** Devices inherit access through their groups. The server checks the applicable share and path rules for each operation. An explicit deny overrides an allow, including a grant from the permanent **Administrator** group. The server service also needs the Windows permissions required for the operation. Multiple readers can open a file, and the server allows one writable handle at a time, subject to Windows sharing flags.
 
-**Drive layout and reconnection.** Each server appears as a folder named after the server and the first 16 characters of its fingerprint, for example `N:\North-Archive_838cff90d76c4ed0\Projects`. If a server goes offline, the client hides its folder and keeps the drive mounted. The folder returns after reconnection. Reopen any files whose connection was lost.
+**Drive layout and reconnection.** Each server appears as a folder named after the server and the first 16 characters of its fingerprint, for example `N:\North-Archive_838cff90d76c4ed0\Projects`. After wake, the client keeps the folder visible briefly while it reconnects. If the server stays offline, the client hides its folder and keeps the drive mounted. The folder returns automatically when the server reconnects. Open files remain usable when the original file session resumes.
 
 **Browsing media folders on a slow connection.** Directory listings contain names, sizes, attributes, and timestamps. Explorer may then read parts of photos or videos to generate thumbnails or preview a selected file. On the client, open **File Explorer → … → Options → View**, select **Always show icons, never thumbnails**, and click **Apply**. This affects Explorer for that Windows user across all drives. Turn off the **Preview pane** under **View → Show** (or press **Alt+P** if it is open). For video or music folders, use **Details** view with basic columns such as **Name**, **Size**, and **Date modified**. Media-specific columns such as **Length** can trigger additional file reads. BijouShare presents its mounts as fixed drives, so a Windows policy scoped only to network folders may miss them. [Windows thumbnail policies](https://learn.microsoft.com/windows/client-management/mdm/policy-csp-admx-thumbnails)
 
@@ -93,10 +94,10 @@ flowchart LR
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.19-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.20-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.19-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.20-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.

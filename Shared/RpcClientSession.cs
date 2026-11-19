@@ -14,6 +14,8 @@ public sealed class RpcClientSession : IDisposable
     private readonly Task receiver;
     private long nextId;
     private int disposed;
+    private Exception? failure;
+    internal Exception? Failure => Volatile.Read(ref failure);
     public bool BinaryPayloads => transport.BinaryPayloads;
     public bool IsClosed => Volatile.Read(ref disposed) != 0;
     public string? UserName => transport.RemoteUserName;
@@ -40,7 +42,7 @@ public sealed class RpcClientSession : IDisposable
                 return response;
             }
             catch (RemoteException) { throw; }
-            catch { Dispose(); throw; }
+            catch (Exception ex) { Fail(ex); throw; }
             finally { legacyGate.Release(); }
         }
         await window.WaitAsync(linked.Token);
@@ -66,12 +68,12 @@ public sealed class RpcClientSession : IDisposable
             return response;
         }
         catch (RemoteException) { throw; }
-        catch
+        catch (Exception ex)
         {
             // A request canceled while waiting to send has no remote outcome to resolve.
             // Once assigned an ID, never keep or retry a potentially partially sent request.
             if (id != 0)
-                Dispose();
+                Fail(ex);
             throw;
         }
         finally { pending.TryRemove(id, out _); window.Release(); }
@@ -91,10 +93,17 @@ public sealed class RpcClientSession : IDisposable
         }
         catch (Exception ex)
         {
+            Interlocked.CompareExchange(ref failure, ex, null);
             foreach (var item in pending.Values)
                 item.TrySetException(new IOException("File connection ended.", ex));
             Dispose();
         }
+    }
+
+    private void Fail(Exception error)
+    {
+        Interlocked.CompareExchange(ref failure, error, null);
+        Dispose();
     }
 
     public void Dispose()

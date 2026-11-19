@@ -19,6 +19,8 @@ internal static class MultiServerSelfTests
         await InviteNotices(check);
         await AuthenticatedNames(check);
         await OfflineRecovery(check);
+        await WakeRecoveryWindow(check);
+        await DeferredCloses(check);
         await ResumeDuringHandshake(check);
     }
 
@@ -443,11 +445,12 @@ internal static class MultiServerSelfTests
         var savedIdentity = new string('a', 64);
         var archive = new FakeConnection(91);
         var healthy = new FakeConnection(92);
+        long now = 1_000;
         using var router = new MultiServerConnection(new[]
         {
             ("archive", (IRemoteConnection)archive, (Func<string?>)(() => folder), (Func<string?>)(() => savedIdentity)),
             ("healthy", (IRemoteConnection)healthy, (Func<string?>)(() => "Other_bbbbbbbbbbbbbbbb"), (Func<string?>)(() => new string('b', 64)))
-        });
+        }, () => now);
         check(router.Call(new() { Operation = "List" }).Response.Entries is { Count: 0 } && router.Statuses.Count == 2,
             "Remembered server identities stay configured but create no folders before successful connection");
         await router.RefreshAsync(CancellationToken.None);
@@ -473,6 +476,7 @@ internal static class MultiServerSelfTests
         Expect("Disconnected", () => router.Call(new() { Operation = "List", Path = "/" + folder }), check,
             "An IO disconnect records the failed server without affecting other endpoints");
         archive.ReleaseRead.SetResult();
+        now += 5_000;
         check((await inFlight).Response.Data is [91] && router.Call(new() { Operation = "List" }).Response.Entries is [{ Name: "Other_bbbbbbbbbbbbbbbb" }],
             "An older in-flight success cannot resurrect a folder after a newer disconnect");
         await router.RefreshAsync(CancellationToken.None);
@@ -515,6 +519,139 @@ internal static class MultiServerSelfTests
             "A stale successful heartbeat cannot override a more recent connection failure");
     }
 
+    private static async Task WakeRecoveryWindow(Action<bool, string> check)
+    {
+        const string folder = "Archive_aaaaaaaaaaaaaaaa";
+        var identity = new string('a', 64);
+        var verified = new FakeConnection(33);
+        var unverified = new FakeConnection(34) { Failure = "Disconnected" };
+        long now = 100;
+        using var router = new MultiServerConnection(new[]
+        {
+            ("archive", (IRemoteConnection)verified, (Func<string?>)(() => folder), (Func<string?>)(() => identity)),
+            ("unverified", (IRemoteConnection)unverified, (Func<string?>)(() => "Unseen"), (Func<string?>)(() => identity))
+        }, () => now);
+        await router.RefreshAsync(CancellationToken.None);
+        verified.Failure = "Disconnected";
+        Expect("Disconnected", () => router.Call(new() { Operation = "List", Path = "/" + folder }), check,
+            "The first file request after adapter loss reports the transport failure");
+        check(router.HasRecoveringFolders && router.MountedServerFolders.SequenceEqual([folder]) &&
+            router.Statuses.All(status => !status.Connected),
+            "A known folder briefly stays routable when I/O detects adapter loss before the Windows notification");
+        now += 1_000;
+        await router.RecoverAfterResumeAsync(CancellationToken.None);
+        now += 15_000;
+        await router.RecoverAfterResumeAsync(CancellationToken.None, resumed: false);
+        check(router.MountedServerFolders.SequenceEqual([folder]) &&
+            router.Call(new() { Operation = "Stat", Path = "/" + folder }).Response.Entry!.Name == folder,
+            "Server paths survive delayed Wi-Fi recovery without exposing a never-connected endpoint");
+        var calls = verified.Calls.Count;
+        Expect("Disconnected", () => router.Call(new() { Operation = "Open", Path = "/" + folder + "/Team/file" }), check,
+            "Access beneath a recovering folder still goes through the authenticated connection");
+        check(verified.Calls.Count == calls + 1, "A recovering folder cannot fabricate a remote file handle");
+        now += 15_000;
+        check(router.Call(new() { Operation = "List" }).Response.Entries!.Count == 0 && !router.HasRecoveringFolders,
+            "Repeated network notifications cannot keep an offline server visible beyond the original grace period");
+        verified.Failure = null;
+        await router.RefreshAsync(CancellationToken.None, retryOnly: true);
+        check(router.MountedServerFolders.SequenceEqual([folder]), "A fresh probe restores the original folder after the grace period");
+        await router.RecoverAfterResumeAsync(CancellationToken.None);
+        verified.Failure = "Disconnected";
+        await router.RefreshAsync(CancellationToken.None);
+        verified.Failure = "DeviceBlocked";
+        await router.RefreshAsync(CancellationToken.None, retryOnly: true);
+        check(router.MountedServerFolders.Length == 0 && !router.HasRecoveringFolders &&
+            router.Statuses.Any(status => status.Error == "DeviceBlocked"),
+            "An explicit device block ends wake grace immediately and remains visible in connection status");
+        calls = verified.Calls.Count;
+        await router.RefreshAsync(CancellationToken.None, retryOnly: true);
+        check(verified.Calls.Count == calls, "Fast recovery retries skip explicit enrollment failures");
+    }
+
+    private static async Task DeferredCloses(Action<bool, string> check)
+    {
+        var peer = new FakeConnection(35);
+        var identity = new string('a', 64);
+        using var router = new MultiServerConnection(new[]
+        {
+            ("archive", (IRemoteConnection)peer, (Func<string?>)(() => "Archive"), (Func<string?>)(() => identity))
+        });
+        await router.RefreshAsync(CancellationToken.None);
+        var open = new RpcRequest { Operation = "Open", Path = "/Archive/Team/file", Access = AccessMask.WriteData };
+        void MissClose(RemoteReply file)
+        {
+            peer.Failure = "Disconnected";
+            Expect("Disconnected", () => router.Call(new()
+            {
+                Operation = "Close", Path = open.Path, Handle = file.Response.Handle
+            }, file.Generation), check, "A final close reports loss of its transport");
+            peer.Failure = null;
+            peer.Calls.Clear();
+        }
+
+        var original = router.Call(open);
+        peer.Failure = "Disconnected";
+        Expect("Disconnected", () => router.Call(new()
+        {
+            Operation = "Cleanup", Path = open.Path, Handle = original.Response.Handle, DeleteOnClose = true
+        }, original.Generation), check, "An unconfirmed cleanup with delete intent reports its error");
+        MissClose(original);
+        peer.DelayedOperation = "Close";
+        peer.ReadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        peer.ReleaseRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstOpen = router.CallAsync(open);
+        await peer.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var probe = router.RefreshAsync(CancellationToken.None);
+        var otherOpen = router.CallAsync(open);
+        var close = peer.Calls.Single(call => call.Request.Operation == "Close");
+        check(close.ExpectedGeneration == original.Generation && close.Request.Handle == peer.RemoteHandle &&
+            !close.Request.DeleteOnClose && close.Request.Path != open.Path && peer.Calls.All(call => call.Request.Operation != "Cleanup") &&
+            !firstOpen.IsCompleted && !otherOpen.IsCompleted,
+            "Concurrent reopens and probes wait for one exact-generation handle release without replaying delete intent");
+        peer.ReleaseRead.SetResult();
+        await Task.WhenAll(firstOpen, otherOpen, probe);
+        check(peer.Calls.Count(call => call.Request.Operation == "Close") == 1 &&
+            peer.Calls.Count(call => call.Request.Operation == "Open") == 2,
+            "Both waiting opens proceed after a single recovery close");
+
+        MissClose(firstOpen.Result);
+        peer.CloseFailure = "InvalidHandle";
+        await router.RefreshAsync(CancellationToken.None);
+        await router.RefreshAsync(CancellationToken.None);
+        check(peer.Calls.Count(call => call.Request.Operation == "Close") == 1 && router.Statuses.Single().Connected,
+            "A close whose response was lost accepts an already-released handle exactly once");
+        peer.CloseFailure = null;
+        MissClose(otherOpen.Result);
+        peer.CloseFailure = "OutcomeUnknown";
+        await router.RefreshAsync(CancellationToken.None);
+        check(router.Statuses.Single().Error == "Disconnected", "An uncertain release leaves the endpoint eligible for reconnect");
+        peer.CloseFailure = null;
+        peer.ReleaseRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await router.CallAsync(open).WaitAsync(TimeSpan.FromSeconds(15));
+            throw new InvalidOperationException("A stalled deferred release admitted a new open");
+        }
+        catch (RemoteException ex) when (ex.Code == "Timeout")
+        {
+            check(peer.Calls.All(call => call.Request.Operation != "Open"), "A stalled release returns a timeout inside the Dokan callback budget");
+        }
+        peer.ReleaseRead.SetResult();
+        await router.RefreshAsync(CancellationToken.None);
+        check(router.Statuses.Single().Connected && peer.Calls.Count(call => call.Request.Operation == "Close") == 3,
+            "An unfinished release survives both a lost outcome and the bounded drain deadline");
+        MissClose(router.Call(open));
+        peer.Generation++;
+        await router.RefreshAsync(CancellationToken.None);
+        check(peer.Calls.All(call => call.Request.Operation != "Close"), "A fresh lease discards old releases before dispatch");
+        MissClose(router.Call(open));
+        peer.Failure = "DeviceBlocked";
+        await router.RefreshAsync(CancellationToken.None);
+        peer.Failure = null;
+        await router.RefreshAsync(CancellationToken.None);
+        check(peer.Calls.All(call => call.Request.Operation != "Close"), "Revocation retires pending releases before re-enrollment");
+    }
+
     private static void Expect(string code, Action action, Action<bool, string> check, string label)
     {
         try
@@ -533,6 +670,7 @@ internal static class MultiServerSelfTests
         // Deliberately collide across independent server sessions.
         public Guid RemoteHandle { get; } = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
         public long Generation { get; set; } = 17;
+        public string? CloseFailure { get; set; }
         public int MaxTransferSize { get; init; } = Wire.MaxChunk;
         public long FreeBytes
         {
@@ -582,6 +720,8 @@ internal static class MultiServerSelfTests
                 throw new RemoteException(Failure);
             if (expectedGeneration is not null && expectedGeneration != Generation)
                 throw new RemoteException("InvalidHandle");
+            if (request.Operation == "Close" && CloseFailure is { } closeFailure)
+                throw new RemoteException(closeFailure);
             var response = request.Operation switch
             {
                 "Open" => new RpcResponse { Handle = RemoteHandle, Entry = Entry("file", false) },

@@ -117,7 +117,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         var heartbeat = HeartbeatAsync(connection, changes, heartbeatCancellation.Token);
         try
         {
-            await MonitorMountAsync(connection, instance, mountPoint, stoppingToken);
+            await MonitorMountAsync(connection, instance, mountPoint, changes, stoppingToken);
         }
         finally
         {
@@ -175,19 +175,25 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         entries.MoveNext();
     }
 
-    private static async Task MonitorMountAsync(MultiServerConnection connection, DokanInstance instance, string mountPoint, CancellationToken token)
+    private static async Task MonitorMountAsync(MultiServerConnection connection, DokanInstance instance, string mountPoint,
+        ConnectionChangeMonitor changes, CancellationToken token)
     {
         var previous = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var absentSamples = 0;
         var nextRootCheck = Environment.TickCount64 + 15_000;
+        var lastTick = Environment.TickCount64;
         var failedRootCheck = false;
         while (!token.IsCancellationRequested && instance.IsFileSystemRunning())
         {
+            var tick = Environment.TickCount64;
+            if (tick - lastTick > 45_000)
+                changes.NoteResume(tick);
+            lastTick = tick;
             // A power transition can remove the DOS mapping while the driver instance
             // remains alive. Give Windows time to republish the letter before remounting.
             if (Directory.GetLogicalDrives().Contains(mountPoint, StringComparer.OrdinalIgnoreCase))
                 absentSamples = 0;
-            else if (++absentSamples >= 3)
+            else if (++absentSamples >= 3 && !changes.WaitingForVolume(tick))
                 throw new IOException($"Windows removed the shared drive letter {mountPoint}.");
 
             // A drive letter and driver instance can both survive an unusable volume.
@@ -200,7 +206,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    if (failedRootCheck)
+                    if (failedRootCheck && !changes.WaitingForVolume(Environment.TickCount64))
                         throw new IOException($"Windows cannot open the mounted drive {mountPoint}. BijouShare will remount it.", ex);
                     failedRootCheck = true;
                 }
@@ -219,22 +225,34 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
     private async Task HeartbeatAsync(MultiServerConnection connection, ConnectionChangeMonitor changes, CancellationToken token)
     {
         var previous = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        long lastProbe = Environment.TickCount64 - 15_000;
-        var lastTick = DateTime.UtcNow;
+        long lastProbe = Environment.TickCount64 - 15_000, lastRetry = lastProbe;
+        long eagerUntil = 0, lastResume = -5_000, lastChange = -2_000;
+        var lastTick = Environment.TickCount64;
         while (!token.IsCancellationRequested)
         {
             var events = changes.TakeChanges();
-            var now = DateTime.UtcNow;
             // A long gap also catches missed power notifications and Modern Standby.
-            var resumed = events.HasFlag(ConnectionChangeMonitor.Change.Resume) || now - lastTick > TimeSpan.FromSeconds(45);
-            lastTick = now;
-            if (resumed || events.HasFlag(ConnectionChangeMonitor.Change.Network) || Environment.TickCount64 - lastProbe >= 15_000)
+            var tick = Environment.TickCount64;
+            var resumed = (events.HasFlag(ConnectionChangeMonitor.Change.Resume) || tick - lastTick > 45_000) &&
+                tick - lastResume >= 5_000;
+            lastTick = tick;
+            // Windows often reports availability and several address changes for one adapter transition.
+            var changed = resumed || events.HasFlag(ConnectionChangeMonitor.Change.Network) && tick - lastChange >= 2_000;
+            if (resumed)
+                lastResume = tick;
+            if (changed)
+            {
+                lastChange = tick;
+                eagerUntil = tick + MultiServerConnection.WakeRecoveryMilliseconds;
+            }
+            var fullProbe = changed || tick - lastProbe >= 15_000;
+            if (fullProbe || tick - lastRetry >= 2_000 && (tick < eagerUntil || connection.HasRecoveringFolders))
             {
                 try
                 {
-                    var statuses = resumed
-                        ? await connection.RecoverAfterResumeAsync(token)
-                        : await connection.RefreshAsync(token);
+                    var statuses = changed
+                        ? await connection.RecoverAfterResumeAsync(token, resumed)
+                        : await connection.RefreshAsync(token, retryOnly: !fullProbe);
                     LogStatuses(statuses, previous);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
@@ -243,11 +261,13 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 {
                     logger.LogWarning(exception, "Connection check failed. The client will retry.");
                 }
-                lastProbe = Environment.TickCount64;
+                lastRetry = Environment.TickCount64;
+                if (fullProbe)
+                    lastProbe = lastRetry;
             }
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(1), token);
+                await changes.WaitAsync(token);
             }
             catch (OperationCanceledException) { break; }
         }

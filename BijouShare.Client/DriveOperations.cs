@@ -56,6 +56,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             "DiskFull" => NtStatus.DiskFull,
             "TooManyOpenFiles" => NtStatus.TooManyOpenedFiles,
             "Disconnected" => unchecked((NtStatus)0xC000009D),
+            "OutcomeUnknown" => unchecked((NtStatus)0xC0000185), // STATUS_IO_DEVICE_ERROR
             "Timeout" => NtStatus.IoTimeout,
             "PendingApproval" or "DeviceRejected" or "DeviceBlocked" or "ServerIdentityChanged" or "ServerIdentityConflict" or "AuthenticationFailed" => NtStatus.AccessDenied,
             "NotSameDevice" => unchecked((NtStatus)0xC00000D4),
@@ -130,9 +131,13 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                 DeleteOnClose = info.DeletePending
             }, context.Generation);
         }
+        catch (Exception ex) when (info.DeletePending)
+        {
+            logger.LogWarning("Could not confirm deletion of {Path} during cleanup: {Reason}", fileName, ex.Message);
+        }
         catch (RemoteException ex) when (ex.Code is "InvalidHandle" or "Disconnected")
         {
-            logger.LogDebug("Remote cleanup already completed for {Path}: {Reason}", fileName, ex.Code);
+            logger.LogDebug("Remote cleanup for {Path} ended with {Reason}", fileName, ex.Code);
         }
         catch (Exception ex) { logger.LogWarning("Cleanup of {Path} failed: {Reason}", fileName, ex.Message); }
     }
@@ -156,7 +161,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
         }
         catch (RemoteException ex) when (ex.Code is "InvalidHandle" or "Disconnected")
         {
-            logger.LogDebug("Remote handle already closed for {Path}: {Reason}", fileName, ex.Code);
+            logger.LogDebug("Remote close for {Path} ended with {Reason}", fileName, ex.Code);
         }
         catch (Exception ex) { logger.LogWarning("Closing {Path} failed: {Reason}", fileName, ex.Message); }
     }

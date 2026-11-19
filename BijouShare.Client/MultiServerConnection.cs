@@ -28,6 +28,13 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         public int Removed;
         public long FailureRevision;
         public bool InviteNoticeSent;
+        public bool HasConnected;
+        public string? AuthenticatedIdentity;
+        public long? DisconnectedAt;
+        public long RecoveryUntil;
+        public readonly ConcurrentDictionary<DeferredClose, byte> DeferredCloses = new();
+        public readonly SemaphoreSlim Closing = new(1, 1);
+        public long CloseGeneration;
     }
 
     private static Target CreateTarget(ClientSettings settings, ServerEndpoint endpoint, ILoggerFactory loggerFactory)
@@ -44,12 +51,18 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         };
     }
     private sealed record Handle(Target Server, Guid RemoteHandle, long Generation, string FolderName, string? Identity);
+    private readonly record struct DeferredClose(Guid Handle, long Generation, string? Identity);
+    private const int MaximumDeferredCloses = 512; // The server's per-session open handle limit.
     private sealed record Route(Target Server, string Name, string? Identity);
-    private sealed record RouteStamp(string? Name, string? Identity, bool Connected);
-    private sealed record RouteTable(Dictionary<string, Route> Names, HashSet<string> Conflicts, Route[] Entries);
+    private sealed record RouteStamp(string? Name, string? Identity, bool Connected, long RetainUntil);
+    private sealed record RouteTable(Dictionary<string, Route> Names, HashSet<string> Conflicts, Route[] Entries,
+        long ExpiresAt = long.MaxValue);
     private Target[] targets;
     private readonly string? mountPoint;
     private readonly object routeGate = new();
+    private readonly Func<long> milliseconds;
+    internal const int WakeRecoveryMilliseconds = 30_000;
+    private const int DisconnectGraceMilliseconds = 4_000;
     private RouteStamp[] routeStamps = [];
     private RouteTable routes = new(new(StringComparer.OrdinalIgnoreCase), new(StringComparer.OrdinalIgnoreCase), []);
     private readonly ConcurrentDictionary<Guid, Handle> handles = new();
@@ -78,8 +91,10 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     {
     }
 
-    internal MultiServerConnection(IEnumerable<(string Label, IRemoteConnection Connection, Func<string?> FolderName, Func<string?> Identity)> servers)
+    internal MultiServerConnection(IEnumerable<(string Label, IRemoteConnection Connection, Func<string?> FolderName, Func<string?> Identity)> servers,
+        Func<long>? milliseconds = null)
     {
+        this.milliseconds = milliseconds ?? (() => Environment.TickCount64);
         targets = servers.Select(server => new Target(server.Label, server.Connection, server.FolderName, server.Identity)).ToArray();
         RefreshRoutes();
     }
@@ -157,7 +172,19 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         }
     }
     public int MaxTransferSize => Wire.MaxChunk;
-    internal string[] MountedServerFolders => Volatile.Read(ref routes).Entries.Select(entry => entry.Name).ToArray();
+    private RouteTable CurrentRoutes
+    {
+        get
+        {
+            var current = Volatile.Read(ref routes);
+            if (current.ExpiresAt == long.MaxValue || milliseconds() < current.ExpiresAt)
+                return current;
+            RefreshRoutes();
+            return Volatile.Read(ref routes);
+        }
+    }
+    internal bool HasRecoveringFolders => CurrentRoutes.ExpiresAt != long.MaxValue;
+    internal string[] MountedServerFolders => CurrentRoutes.Entries.Select(entry => entry.Name).ToArray();
     public int MaxTransferSizeFor(string path)
     {
         try
@@ -172,16 +199,20 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         lock (routeGate)
         {
             var current = Volatile.Read(ref targets);
+            var now = milliseconds();
+            long RetainUntil(Target target) => target.DisconnectedAt.HasValue && target.RecoveryUntil > now &&
+                !target.VerificationToken.IsCancellationRequested && target.AuthenticatedIdentity is { } id && id == target.Identity
+                    ? target.RecoveryUntil : 0;
             var changed = routeStamps.Length != current.Length;
             for (var index = 0; !changed && index < current.Length; index++)
             {
                 var target = current[index];
                 changed = routeStamps[index].Name != target.FolderName || routeStamps[index].Identity != target.Identity ||
-                    routeStamps[index].Connected != Volatile.Read(ref target.Status).Connected;
+                    routeStamps[index].Connected != target.Status.Connected || routeStamps[index].RetainUntil != RetainUntil(target);
             }
             if (!changed)
                 return;
-            var stamps = current.Select(target => new RouteStamp(target.FolderName, target.Identity, Volatile.Read(ref target.Status).Connected)).ToArray();
+            var stamps = current.Select(target => new RouteStamp(target.FolderName, target.Identity, target.Status.Connected, RetainUntil(target))).ToArray();
             var names = new Dictionary<string, Route>(StringComparer.OrdinalIgnoreCase);
             var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var candidates = current.Select((target, index) => stamps[index].Name is { } name
@@ -194,27 +225,29 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     conflicts.Add(group.Key);
                     continue;
                 } // A short display-ID collision must never choose an arbitrary server.
-                // Remembered identities still reserve their names, but an offline endpoint
-                // has no mounted directory until an authenticated probe succeeds again.
-                var chosen = entries.FirstOrDefault(entry => Volatile.Read(ref entry.Server.Status).Connected);
+                // Prefer a live endpoint. Keep its pinned name routable briefly while Wi-Fi returns.
+                var chosen = entries.FirstOrDefault(entry => entry.Server.Status.Connected) ??
+                    entries.FirstOrDefault(entry => RetainUntil(entry.Server) != 0);
                 if (chosen is not null)
                     names.Add(chosen.Name, chosen);
             }
             routeStamps = stamps;
-            Volatile.Write(ref routes, new(names, conflicts, names.Values.ToArray()));
+            var expiresAt = stamps.Where(stamp => stamp.RetainUntil != 0).Select(stamp => stamp.RetainUntil).DefaultIfEmpty(long.MaxValue).Min();
+            Volatile.Write(ref routes, new(names, conflicts, names.Values.ToArray(), expiresAt));
         }
     }
 
     internal void RequestRefresh() => StartProbes(queue: true);
 
-    private List<Task> StartProbes(bool queue = false)
+    private List<Task> StartProbes(bool queue = false, bool retryOnly = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         // Rebuild endpoints invalidated by a settings change.
         foreach (var target in Volatile.Read(ref targets))
             if (target.VerificationToken.IsCancellationRequested)
                 ReplaceConnection(target);
-        return Volatile.Read(ref targets).Select(target =>
+        return Volatile.Read(ref targets).Where(target => !retryOnly ||
+            Volatile.Read(ref target.Status).Error is "Waiting" or "Disconnected" or "Timeout").Select(target =>
         {
             lock (target.Gate)
             {
@@ -226,10 +259,12 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     }
 
     // Probe every endpoint independently. A slow/offline endpoint cannot delay mounting a healthy one.
-    public async Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token)
+    public Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token) => RefreshAsync(token, retryOnly: false);
+
+    internal async Task<IReadOnlyList<ServerConnectionStatus>> RefreshAsync(CancellationToken token, bool retryOnly)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
-        var probes = StartProbes();
+        var probes = StartProbes(retryOnly: retryOnly);
         var pause = Task.Delay(TimeSpan.FromSeconds(1), linked.Token);
         while (probes.Count > 0)
         {
@@ -245,16 +280,26 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         return Statuses;
     }
 
-    internal Task<IReadOnlyList<ServerConnectionStatus>> RecoverAfterResumeAsync(CancellationToken token)
+    internal Task<IReadOnlyList<ServerConnectionStatus>> RecoverAfterResumeAsync(CancellationToken token, bool resumed = true)
     {
-        // An unfinished handshake can be stuck on the pre-sleep adapter. Established
-        // sessions use the regular RPC deadline so a queued probe cannot cut off a writer.
+        var now = milliseconds();
         foreach (var target in Volatile.Read(ref targets))
         {
             token.ThrowIfCancellationRequested();
-            if (!Volatile.Read(ref target.Status).Connected)
+            bool known;
+            lock (routeGate)
+            {
+                known = target.HasConnected;
+                if (target.Status.Connected || target.DisconnectedAt.HasValue && target.RecoveryUntil > now)
+                    // Repeated Windows notifications cannot extend a continuing outage indefinitely.
+                    target.RecoveryUntil = (target.DisconnectedAt ?? now) + WakeRecoveryMilliseconds;
+            }
+            if (!known)
                 ReplaceConnection(target);
+            else if (resumed && target.Connection is RemoteConnection remote)
+                remote.PrepareAfterWake();
         }
+        RefreshRoutes();
         return RefreshAsync(token);
     }
 
@@ -296,7 +341,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         var revision = Volatile.Read(ref target.FailureRevision);
         try
         {
-            await target.Connection.CallAsync(new()
+            var ping = await target.Connection.CallAsync(new()
             {
                 Operation = "Ping"
             }, token: lifetime.Token);
@@ -304,6 +349,12 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             {
                 MarkUnavailable(target, "ServerUpgradeRequired");
                 return;
+            }
+            if (!target.DeferredCloses.IsEmpty)
+            {
+                lock (routeGate)
+                    AdvanceCloseGeneration(target, ping.Generation);
+                await ReleaseDeferredClosesAsync(target, lifetime.Token);
             }
             var space = (await target.Connection.CallAsync(new()
             {
@@ -317,6 +368,11 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 if (target.FailureRevision == revision && Volatile.Read(ref target.Removed) == 0 && Volatile.Read(ref disposed) == 0)
                 {
                     target.InviteNoticeSent = false;
+                    target.HasConnected = true;
+                    target.AuthenticatedIdentity = target.Identity;
+                    if (target.DisconnectedAt.HasValue)
+                        target.RecoveryUntil = 0;
+                    target.DisconnectedAt = null;
                     Volatile.Write(ref target.Status, new(target.Name, true, null));
                     RefreshRoutes();
                 }
@@ -326,7 +382,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         {
             // A timeout before transmission says nothing about the authenticated connection.
         }
-        catch (RemoteException ex) { MarkUnavailable(target, ex.Code); }
+        catch (RemoteException ex) { MarkUnavailable(target, ex.Code == "OutcomeUnknown" ? "Disconnected" : ex.Code); }
         catch (ServerIdentityMismatchException) { MarkUnavailable(target, "ServerIdentityChanged"); }
         catch (CryptographicException) { MarkUnavailable(target, "AuthenticationFailed"); }
         catch (UnauthorizedAccessException) { MarkUnavailable(target, "ConfigurationError"); }
@@ -349,6 +405,23 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0)
                 return;
             target.FailureRevision++;
+            if (error is "Disconnected" or "Timeout")
+            {
+                if (target.Status.Connected && target.AuthenticatedIdentity is not null)
+                {
+                    // I/O may notice the adapter loss before Windows signals the worker.
+                    var now = milliseconds();
+                    target.DisconnectedAt = now;
+                    target.RecoveryUntil = Math.Max(target.RecoveryUntil, now + DisconnectGraceMilliseconds);
+                }
+            }
+            else
+            {
+                target.DisconnectedAt = null;
+                target.RecoveryUntil = 0;
+                if (RetiresLease(error))
+                    target.DeferredCloses.Clear();
+            }
             if (error == "InviteRequired" && !target.InviteNoticeSent)
             {
                 target.InviteNoticeSent = true;
@@ -416,10 +489,94 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             Handle = mapped?.RemoteHandle ?? Guid.Empty
         };
         if (mapped is not null && request.Operation == "Close")
-            handles.TryRemove(request.Handle, out _);
+        {
+            if (!handles.TryRemove(request.Handle, out _))
+                throw new RemoteException("InvalidHandle");
+            try { return await Forward(target, forwarded, mapped.Generation, route.Identity, linked.Token); }
+            catch (Exception ex) when (ex is OperationCanceledException or RemoteException { Code: "Disconnected" or "Timeout" or "OutcomeUnknown" })
+            {
+                RememberClose(mapped);
+                throw;
+            }
+        }
+        if (request.Operation == "Open" && !target.DeferredCloses.IsEmpty)
+            await ReleaseDeferredClosesAsync(target, linked.Token);
         var reply = await Forward(target, forwarded, mapped?.Generation, route.Identity, linked.Token);
         return request.Operation == "Open" && reply.Response.Handle != Guid.Empty
             ? RetainHandle(target, route.Identity, request.Path, reply) : reply;
+    }
+
+    // Windows abandons its local handle after Close even when the server was unreachable.
+    // Keep only the remote handle and original lease. A later pathname could refer to a replacement file.
+    private void RememberClose(Handle handle)
+    {
+        var target = handle.Server;
+        lock (routeGate)
+        {
+            if (disposed != 0 || target.Removed != 0 || target.VerificationToken.IsCancellationRequested ||
+                target.Identity != handle.Identity || target.CloseGeneration > handle.Generation || RetiresLease(target.Status.Error))
+                return;
+            AdvanceCloseGeneration(target, handle.Generation);
+            var close = new DeferredClose(handle.RemoteHandle, handle.Generation, handle.Identity);
+            if (target.DeferredCloses.ContainsKey(close))
+                return;
+            if (target.DeferredCloses.Count < MaximumDeferredCloses)
+            {
+                target.DeferredCloses.TryAdd(close, 0);
+                return;
+            }
+        }
+        // An inconsistent peer exceeded its session limit. Retire the whole lease.
+        ReplaceConnection(target);
+    }
+
+    private static bool RetiresLease(string? error) => error is "DeviceBlocked" or "DeviceRejected" or "PendingApproval"
+        or "InviteRequired" or "InvalidInvite" or "InviteUnsupported" or "ServerLinkRequired" or "ServerIdentityChanged"
+        or "AuthenticationFailed" or "ServerUpgradeRequired";
+
+    private static void AdvanceCloseGeneration(Target target, long generation)
+    {
+        if (generation <= target.CloseGeneration)
+            return;
+        target.CloseGeneration = generation;
+        target.DeferredCloses.Clear();
+    }
+
+    private async Task ReleaseDeferredClosesAsync(Target target, CancellationToken token)
+    {
+        if (target.DeferredCloses.IsEmpty)
+            return;
+        // Reserve time for the caller's own network request inside Dokan's 60-second deadline.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(TimeSpan.FromSeconds(8));
+        try
+        {
+            await target.Closing.WaitAsync(deadline.Token);
+            try
+            {
+                var pending = target.DeferredCloses.Keys;
+                if (pending.Count == 0)
+                    return;
+                var options = new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = deadline.Token };
+                await Parallel.ForEachAsync(pending, options, async (close, cancellation) =>
+                {
+                    if (!target.DeferredCloses.ContainsKey(close))
+                        return;
+                    try
+                    {
+                        await Forward(target, new() { Operation = "Close", Handle = close.Handle },
+                            close.Generation, close.Identity, cancellation);
+                    }
+                    catch (RemoteException ex) when (ex.Code == "InvalidHandle") { } // Already closed, or the lease ended.
+                    target.DeferredCloses.TryRemove(close, out _);
+                });
+            }
+            finally { target.Closing.Release(); }
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw new RemoteException("Timeout");
+        }
     }
 
     private RemoteReply RetainHandle(Target target, string? identity, string path, RemoteReply reply)
@@ -502,7 +659,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 if (request.Offset is < 0 or > int.MaxValue || request.Count is < 0 or > 256)
                     throw new RemoteException("InvalidParameter");
                 var count = request.Count == 0 ? 256 : request.Count;
-                var visible = Volatile.Read(ref routes).Entries;
+                var visible = CurrentRoutes.Entries;
                 var entries = visible.Skip((int)request.Offset).Take(count).Select(server => DirectoryEntry(server.Name)).ToList();
                 return new()
                 {
@@ -511,7 +668,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     More = request.Offset + entries.Count < visible.Length
                 };
             case "Space":
-                var selected = target is null ? Volatile.Read(ref routes).Entries.Select(entry => entry.Server) : new[] { target };
+                var selected = target is null ? CurrentRoutes.Entries.Select(entry => entry.Server) : new[] { target };
                 long free = 0, total = 0;
                 foreach (var server in selected.Where(server => Volatile.Read(ref server.Status).Connected))
                 {
@@ -543,7 +700,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         var parts = NormalizePath(path);
         if (parts.Length == 0)
             return (null, "/", null);
-        var snapshot = Volatile.Read(ref routes);
+        var snapshot = CurrentRoutes;
         if (snapshot.Conflicts.Contains(parts[0]))
             throw new RemoteException("ServerIdentityConflict");
         if (!snapshot.Names.TryGetValue(parts[0], out var route))

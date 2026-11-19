@@ -49,6 +49,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     {
         public Guid Id { get; } = id;
         public Guid Session { get; } = session;
+        public long OpenOutcomeId { get; init; }
         public Device Identity { get; } = identity;
         public Location Location { get; set; } = location;
         public uint Access { get; } = access;
@@ -72,8 +73,28 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     private static RemoteEntry Root => new("", FileAttributes.Directory, 0, VolumeTime, VolumeTime, VolumeTime,
         Permission.ListDirectory | Permission.ReadAttributes | Permission.ReadPermissions);
 
-    public RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice = null)
+    public RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice = null) =>
+        Execute(session, deviceId, request, authenticatedDevice, null);
+
+    internal RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice, OperationReceipts? receipts)
     {
+        RpcResponse Run()
+        {
+            var device = store.Identity(deviceId);
+            if (authenticatedDevice is not null && !device.HasSameIdentity(authenticatedDevice))
+                throw new UnauthorizedAccessException("The device binding changed. Authenticate again.");
+            if (receipts is not null && request.Operation == "AbandonOpen")
+            {
+                // The application never got this open's reply. Release only the original handle.
+                var orphan = handles.Values.FirstOrDefault(h => h.Session == session && h.OpenOutcomeId == request.OutcomeId);
+                if (orphan is not null)
+                    Release(orphan);
+                return new();
+            }
+            if (receipts is not null && request.OutcomeId > 0)
+                return receipts.Execute(request, store.Revision, () => ExecuteLocked(session, device, request));
+            return ExecuteLocked(session, device, request);
+        }
         // Read/data requests run concurrently; mutations and policy invalidation remain exclusive.
         if (request.Operation is "Read" or "Write" or "Flush" or "Stat" or "Ping" or "Security" or "Space")
         {
@@ -81,7 +102,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             try
             {
                 var response = store.Read(_ => prunedRevision == store.Revision
-                    ? ExecuteLocked(session, deviceId, request, authenticatedDevice) : null);
+                    ? Run() : null);
                 if (response is not null)
                     return response;
             }
@@ -102,7 +123,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 }
                 try
                 {
-                    return ExecuteLocked(session, deviceId, request, authenticatedDevice);
+                    return Run();
                 }
                 finally
                 {
@@ -116,12 +137,9 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         }
         finally { gate.ExitWriteLock(); }
     }
-    private RpcResponse ExecuteLocked(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice)
+    private RpcResponse ExecuteLocked(Guid session, Device device, RpcRequest request)
     {
-        var device = store.Identity(deviceId);
         var principal = device; // Re-evaluated even on existing handles.
-        if (authenticatedDevice is not null && !device.HasSameIdentity(authenticatedDevice))
-            throw new UnauthorizedAccessException("The device binding changed. Authenticate again.");
         if (request.Operation == "Ping")
             return new();
         if (request.Operation == "Space")
@@ -537,7 +555,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 ClearDirectoryCursors();
             var id = Guid.NewGuid();
             var handle = new OpenHandle(id, session, identity, location, request.Access, request.Share, stream, directory,
-                request.Mode == FileMode.Append || AccessMask.AppendOnly(request.Access));
+                request.Mode == FileMode.Append || AccessMask.AppendOnly(request.Access)) { OpenOutcomeId = request.OutcomeId };
             // Opening requires only requested rights; it must not silently require ReadAttributes as well.
             var attributes = ExportAttributes(location, File.GetAttributes(location.Physical));
             var info = new RemoteEntry(Path.GetFileName(location.Physical), attributes, stream?.Length ?? 0,

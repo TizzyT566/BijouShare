@@ -16,7 +16,9 @@ internal sealed class ConnectionChangeMonitor : IDisposable
     private GCHandle callbackRoot;
     private nint registration;
     private int pending;
-    private readonly bool watchingNetwork;
+    private long resumeGraceUntil;
+    private readonly SemaphoreSlim changed = new(0);
+    private readonly bool watchingAddresses, watchingAvailability;
 
     public ConnectionChangeMonitor(ILogger logger)
     {
@@ -34,7 +36,9 @@ internal sealed class ConnectionChangeMonitor : IDisposable
         try
         {
             NetworkChange.NetworkAddressChanged += OnNetworkChange;
-            watchingNetwork = true;
+            watchingAddresses = true;
+            NetworkChange.NetworkAvailabilityChanged += OnAvailabilityChange;
+            watchingAvailability = true;
         }
         catch (NetworkInformationException exception)
         {
@@ -43,21 +47,40 @@ internal sealed class ConnectionChangeMonitor : IDisposable
     }
 
     internal Change TakeChanges() => (Change)Interlocked.Exchange(ref pending, 0);
+    internal Task WaitAsync(CancellationToken token) => changed.WaitAsync(TimeSpan.FromSeconds(1), token);
+    internal void NoteResume(long tick) => Interlocked.Exchange(ref resumeGraceUntil, tick + 15_000);
+    internal bool WaitingForVolume(long tick) => tick < Interlocked.Read(ref resumeGraceUntil);
+
+    private void Signal(Change flags)
+    {
+        if (Interlocked.Or(ref pending, (int)flags) == 0)
+        {
+            try { changed.Release(); }
+            catch (ObjectDisposedException) { } // A final Windows notification can race shutdown.
+        }
+    }
 
     private uint OnPowerChange(nint context, uint type, nint setting)
     {
         // Windows sends RESUMEAUTOMATIC on every resume, even without user input.
         if (type == ResumeAutomatic)
-            Interlocked.Or(ref pending, (int)Change.Resume);
+        {
+            NoteResume(Environment.TickCount64);
+            Signal(Change.Resume);
+        }
         return 0;
     }
 
-    private void OnNetworkChange(object? sender, EventArgs args) => Interlocked.Or(ref pending, (int)Change.Network);
+    private void OnNetworkChange(object? sender, EventArgs args) => Signal(Change.Network);
+    private void OnAvailabilityChange(object? sender, NetworkAvailabilityEventArgs args) => Signal(Change.Network);
 
     public void Dispose()
     {
-        if (watchingNetwork)
+        if (watchingAddresses)
             NetworkChange.NetworkAddressChanged -= OnNetworkChange;
+        if (watchingAvailability)
+            NetworkChange.NetworkAvailabilityChanged -= OnAvailabilityChange;
+        changed.Dispose();
         var handle = Interlocked.Exchange(ref registration, 0);
         if (handle == 0)
             return;

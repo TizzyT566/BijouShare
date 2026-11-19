@@ -95,6 +95,7 @@ public static class AuthenticatedClient
             if (string.IsNullOrWhiteSpace(name) || name.Length > 100)
                 throw new CryptographicException("Invalid device name in session confirmation.");
             transport.RemoteDeviceName = name;
+            transport.SupportsSessionResume = binaryPayloads && ready.SupportsSessionResume;
             transport.RemoteUserName = ready.UserName ?? name;
             transport.RemoteIdentityPublicKey = server.GlobalIdentityPublicKey;
             transport.RemoteServerId = expectedServerId;

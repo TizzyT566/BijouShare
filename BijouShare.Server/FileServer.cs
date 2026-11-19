@@ -10,6 +10,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
     AuditLog audit, ILogger<FileServer> logger) : BackgroundService
 {
     private readonly ConcurrentDictionary<Guid, Task> connections = new();
+    private readonly FileSessionLeases leases = new(store, files, TimeProvider.System);
     private readonly object listenerGate = new();
     private TcpListener? listener;
     private TaskCompletionSource portChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -81,6 +82,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var sessions = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var sweep = leases.RunAsync(sessions.Token);
         try
         {
             while (!store.IsInitialized)
@@ -153,7 +155,8 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 listener = null;
             }
             await sessions.CancelAsync();
-            await Task.WhenAll(connections.Values);
+            try { await Task.WhenAll(connections.Values.Append(sweep)); }
+            finally { leases.Sweep(shutdown: true); }
         }
     }
     private async Task ServeAsync(TcpClient client, Guid session, CancellationToken stoppingToken)
@@ -163,6 +166,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             var remoteEndpoint = client.Client.RemoteEndPoint;
             string actor = "unenrolled";
             var authenticated = false;
+            var pipelineOwnsSession = false;
             try
             {
                 var stream = client.GetStream();
@@ -309,6 +313,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                     audit.Write(readyIdentity.Name, "DeviceRenamed", publicIdentity);
                 await transport.SendAsync(new RpcResponse
                 {
+                    SupportsSessionResume = hello.BinaryPayloads,
                     DeviceName = readyIdentity.Name,
                     UserName = registration ? null : readyIdentity.Name
                 }, timeout.Token);
@@ -317,6 +322,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 audit.Write(actor, "Connect", publicIdentity);
                 if (hello.BinaryPayloads)
                 {
+                    pipelineOwnsSession = true;
                     await ServePipelinedAsync(transport, session, deviceId, device, actor, stoppingToken);
                     return;
                 }
@@ -344,15 +350,19 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             }
             catch (PlatformNotSupportedException ex) { logger.LogError("Hybrid key establishment is unavailable: {Reason}", ex.Message); }
             catch (Exception ex) { logger.LogError(ex, "File session failed"); }
-            finally { files.ReleaseSession(session); if (authenticated) audit.Write(actor, "Disconnect", session.ToString()); }
+            finally
+            {
+                if (!pipelineOwnsSession) files.ReleaseSession(session);
+                if (authenticated) audit.Write(actor, "Disconnect", session.ToString());
+            }
         }
     }
-    private RpcResponse ExecuteFileRequest(Guid session, Device device, string actor, RpcRequest request)
+    private RpcResponse ExecuteFileRequest(Guid session, Device device, string actor, RpcRequest request, OperationReceipts? receipts = null)
     {
         try
         {
             request.Validate();
-            var response = files.Execute(session, device.Id, request, device);
+            var response = files.Execute(session, device.Id, request, device, receipts);
             if (request.Operation == "List" && request.BasicDirectoryInfo && response.Entries is { } entries)
                 return response with { Entries = null, Items = entries.ConvertAll(DirectoryItem.FromEntry) };
             return response;
@@ -375,6 +385,8 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
         string actor, CancellationToken stoppingToken)
     {
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var owner = new FileSessionLeases.Owner(lifetime);
+        FileSessionLeases.Lease? lease = null;
         using var window = new SemaphoreSlim(16, 16);
         var work = new List<Task>();
         var reads = new List<Task>();
@@ -391,7 +403,29 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 {
                     if (request.RequestId <= previousId)
                         throw new InvalidDataException("Invalid RPC request sequence.");
+                    var first = previousId == 0;
                     previousId = request.RequestId;
+                    if (first && request.Operation == "ResumeSession")
+                    {
+                        if (request.Data is not null || request.InviteCode is not null)
+                            throw new InvalidDataException("Invalid session negotiation.");
+                        lease = await leases.AttachAsync(device, request.Handle, owner, idle.Token);
+                        session = lease.FileSession;
+                        await transport.SendAsync(new RpcResponse { RequestId = request.RequestId, Handle = lease.Ticket }, idle.Token);
+                        request.ReleasePayload();
+                        continue;
+                    }
+                    if (lease is not null && request.Operation == "EndSession")
+                    {
+                        if (request.Data is not null || request.InviteCode is not null ||
+                            request.Handle != Guid.Empty && request.Handle != lease.Ticket)
+                            throw new InvalidDataException("Invalid session close.");
+                        await Task.WhenAll(work).WaitAsync(idle.Token);
+                        leases.Detach(lease, owner, end: true);
+                        await transport.SendAsync(new RpcResponse { RequestId = request.RequestId }, idle.Token);
+                        request.ReleasePayload();
+                        return;
+                    }
                     await window.WaitAsync(lifetime.Token);
                 }
                 catch { request.ReleasePayload(); throw; }
@@ -407,7 +441,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                         response = ExecuteFileRequest(session, device, actor, request with
                         {
                             BorrowReadBuffer = true
-                        });
+                        }, lease?.Receipts);
                         await transport.SendAsync(response with
                         {
                             RequestId = request.RequestId
@@ -443,6 +477,11 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             catch (Exception ex) when (ex is IOException or OperationCanceledException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 logger.LogDebug("Pipelined file session ended: {Reason}", ex.GetType().Name);
+            }
+            finally
+            {
+                if (lease is null) files.ReleaseSession(session);
+                else leases.Detach(lease, owner, end: stoppingToken.IsCancellationRequested);
             }
         }
     }

@@ -1252,6 +1252,7 @@ public static class ServerSelfTests
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
         {
+            await FileSessionSelfTests.RunAsync(options, store, files, device, privateKey, identityKem, check, deadline.Token);
             using var socket = new TcpClient();
             using var transport = await AuthenticatedClient.ConnectAsync(socket, "127.0.0.1", options.Port, device.PublicIdentity!, privateKey,
                 identityKem, store.ServerId, deadline.Token, binaryPayloads: false);

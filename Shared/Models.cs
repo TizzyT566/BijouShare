@@ -107,6 +107,13 @@ public sealed record RpcRequest
     {
         get; init;
     }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public long OutcomeId { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool RecoveryAttempt { get; init; }
+    [JsonIgnore]
+    public bool TracksOutcome => Operation is "Open" or "Write" or "Flush" or "Resize" or "Allocate" or "Attributes"
+        or "Times" or "Move" or "Lock" or "Unlock" or "Cleanup" or "Close";
     public string Operation { get; init; } = "Ping";
     // Optional directory filter. Older servers ignore it and use their default page size.
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -196,8 +203,13 @@ public sealed record RpcRequest
             throw new ArgumentException("Enrollment is valid only during connection setup.");
         if (Operation is not ("Ping" or "Space" or "Open" or "Stat" or "List" or "Read" or "Write" or "Flush" or
             "Resize" or "Allocate" or "Attributes" or "Times" or "CanDelete" or "Move" or "Lock" or "Unlock" or
-            "Security" or "Cleanup" or "Close"))
+            "Security" or "Cleanup" or "Close" or "GetOutcome" or "AbandonOpen"))
             throw new RemoteException("Unsupported");
+        var receiptControl = Operation is "GetOutcome" or "AbandonOpen";
+        if (OutcomeId < 0 || receiptControl && (OutcomeId == 0 || Data is not null || Handle != Guid.Empty) ||
+            OutcomeId != 0 && !receiptControl && !TracksOutcome ||
+            RecoveryAttempt && (OutcomeId == 0 || !TracksOutcome))
+            throw new ArgumentException("Invalid operation receipt.");
         if (Path is null || Path.Length > 2048 || Destination?.Length > 2048 || DataCount > Wire.MaxChunk || Count is < 0 or > Wire.MaxChunk)
             throw new ArgumentException("Invalid request size.");
     }
@@ -226,6 +238,8 @@ public readonly record struct DirectoryItem(
 
 public sealed record RpcResponse
 {
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SupportsSessionResume { get; init; }
     [JsonIgnore] internal int BorrowedCount { get; init; } = -1;
     [JsonIgnore]
     internal bool OwnsData

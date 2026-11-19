@@ -345,12 +345,16 @@ internal static class ClientSelfTests
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var full = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sessionTicket = Guid.NewGuid();
+        var fileHandle = Guid.NewGuid();
+        var directoryHandle = Guid.NewGuid();
+        var createDirectory = new RpcRequest { Operation = "Open", Directory = true, Mode = FileMode.CreateNew, Path = @"\Media\New folder" };
         using var serverKem = HybridKem.Generate();
         var kemPublic = serverKem.ExportPublicKey();
         var identityPublic = serverKey.ExportSubjectPublicKeyInfo();
         var fingerprint = ServerIdentityNaming.Id(identityPublic, kemPublic);
         var localRoot = Wire.Decode<ClientSettings>(Wire.Encode(settings));
+        localRoot.RequestTimeoutSeconds = 5;
         var directory = Path.Combine(Path.GetTempPath(), "BijouShare-handshake-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         var profilePath = Path.Combine(directory, "client.json");
@@ -372,6 +376,7 @@ internal static class ClientSelfTests
             catch (RemoteException ex) when (ex.Code == "InvalidHandle") { check(true, "A stale folder route cannot send an RPC to a different server"); }
             var pending = Enumerable.Range(0, 16).Select(i => connection.CallAsync(new(), token: deadline.Token)).ToArray();
             await full.Task.WaitAsync(deadline.Token);
+            connection.PrepareAfterWake(); // A delivered notification must not interrupt these active calls.
             using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(30));
             try
             {
@@ -384,14 +389,43 @@ internal static class ClientSelfTests
             var next = await connection.CallAsync(new(), token: deadline.Token);
             check(replies.All(x => x.Generation == established.Generation) && next.Generation == established.Generation,
                 "Canceling an unsent queued request preserves all in-flight IO and the authenticated generation");
-            finished.SetResult();
+            var append = await connection.CallAsync(new() { Operation = "Write", Handle = fileHandle, Append = true, Data = [1, 2, 3] },
+                established.Generation, deadline.Token);
+            check(append.Generation == established.Generation && append.Response.Length == 3,
+                "A lost append acknowledgement is recovered from the original lease after a dropped reconnect handshake");
+            var created = await connection.CallAsync(createDirectory, token: deadline.Token);
+            check(created.Generation == established.Generation && created.Response.Handle == directoryHandle,
+                "A directory creation lost before delivery executes once after the server confirms it was never admitted");
+            try
+            {
+                await connection.CallAsync(createDirectory with { Path = @"\Media\Uncertain" }, token: deadline.Token);
+                throw new InvalidOperationException("Repeated an operation with an unknown outcome.");
+            }
+            catch (RemoteException ex) when (ex.Code == "OutcomeUnknown")
+            { check(true, "An uncertain directory creation is never reissued"); }
+            var reopened = await connection.CallAsync(new RpcRequest { Operation = "Open", Path = @"\Media\Uncertain" }, token: deadline.Token);
+            check(reopened.Generation == established.Generation && reopened.Response.Handle == fileHandle,
+                "An open whose result never reached Dokan releases only its own server handle before the next open");
+            var read = new RpcRequest { Operation = "Read", Handle = fileHandle, Count = 1 };
+            var resumedRead = await connection.CallAsync(read, established.Generation, deadline.Token);
+            check(resumedRead.Generation == established.Generation && resumedRead.Response.Data is [9],
+                "A handle-bound read retries on a fresh transport only after the server confirms the original lease");
+            connection.PrepareAfterWake();
+            try
+            {
+                await connection.CallAsync(read, established.Generation, deadline.Token);
+                throw new InvalidOperationException("Sent an old file handle on a replacement lease.");
+            }
+            catch (RemoteException ex) when (ex.Code == "InvalidHandle") { }
+            var fresh = await connection.CallAsync(new(), token: deadline.Token);
+            check(fresh.Generation != established.Generation, "An expired lease invalidates old handles and allows new path requests");
+            connection.Dispose();
             await peer;
         }
         finally
         {
             await deadline.CancelAsync();
             release.TrySetResult();
-            finished.TrySetResult();
             listener.Stop();
             try
             {
@@ -402,9 +436,8 @@ internal static class ClientSelfTests
             Directory.Delete(directory);
         }
 
-        async Task ServePeerAsync()
+        async Task<SecureTransport> AcceptSessionAsync(TcpClient socket, Guid offered, Guid confirmed)
         {
-            using var socket = await listener.AcceptTcpClientAsync(deadline.Token);
             var stream = socket.GetStream();
             var hello = await SecureTransport.ReadPlainAsync<ClientHello>(stream, deadline.Token);
             using var ephemeral = KeyAgreement.NewKey();
@@ -449,9 +482,24 @@ internal static class ClientSelfTests
                 secure = new SecureTransport(stream, material, true, hello.BinaryPayloads);
             }
             finally { CryptographicOperations.ZeroMemory(material); }
-            using (secure)
+            try
             {
-                await secure.SendAsync(new RpcResponse { DeviceName = settings.DeviceName }, deadline.Token);
+                await secure.SendAsync(new RpcResponse { DeviceName = settings.DeviceName, SupportsSessionResume = true }, deadline.Token);
+                var resume = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (resume.Operation != "ResumeSession" || resume.Handle != offered)
+                    throw new InvalidOperationException("Expected the saved ticket on the first encrypted RPC.");
+                await secure.SendAsync(new RpcResponse { RequestId = resume.RequestId, Handle = confirmed }, deadline.Token);
+                return secure;
+            }
+            catch { secure.Dispose(); throw; }
+        }
+
+        async Task ServePeerAsync()
+        {
+            long receipt;
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, Guid.Empty, sessionTicket))
+            {
                 var first = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
                 try
                 {
@@ -477,7 +525,87 @@ internal static class ClientSelfTests
                     await secure.SendAsync(new RpcResponse { RequestId = last.RequestId }, deadline.Token);
                 }
                 finally { last.ReleasePayload(); }
-                await finished.Task.WaitAsync(deadline.Token);
+                var append = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                try
+                {
+                    if (append.Operation != "Write" || !append.Append || append.Handle != fileHandle ||
+                        append.DataCount != 3 || append.OutcomeId <= first.OutcomeId || append.RecoveryAttempt)
+                        throw new InvalidOperationException("Missing tracked append.");
+                    receipt = append.OutcomeId;
+                }
+                finally { append.ReleasePayload(); }
+                // Simulate a committed append whose acknowledgement never reached the client.
+            }
+            using (var unavailable = await listener.AcceptTcpClientAsync(deadline.Token))
+            {
+                await SecureTransport.ReadPlainAsync<ClientHello>(unavailable.GetStream(), deadline.Token);
+            }
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, sessionTicket, sessionTicket))
+            {
+                var query = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (query.Operation != "GetOutcome" || query.OutcomeId != receipt)
+                    throw new InvalidOperationException("An uncertain append must be queried, never sent twice.");
+                await secure.SendAsync(new RpcResponse { RequestId = query.RequestId, Length = 3 }, deadline.Token);
+                // Lose the next frame before the complete directory creation reaches the dispatcher.
+                await socket.GetStream().ReadExactlyAsync(new byte[1], deadline.Token);
+            }
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, sessionTicket, sessionTicket))
+            {
+                var query = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (query.Operation != "GetOutcome" || query.OutcomeId <= receipt) throw new InvalidOperationException("Missing directory receipt query.");
+                await secure.SendAsync(new RpcResponse { RequestId = query.RequestId, Error = "OutcomeNotExecuted" }, deadline.Token);
+                var create = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (create.Operation != "Open" || create.Path != createDirectory.Path || !create.Directory || create.Mode != FileMode.CreateNew ||
+                    create.OutcomeId != query.OutcomeId || !create.RecoveryAttempt)
+                    throw new InvalidOperationException("Directory recovery lost its original parameters or receipt.");
+                await secure.SendAsync(new RpcResponse { RequestId = create.RequestId, Handle = directoryHandle }, deadline.Token);
+                var uncertain = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (uncertain.Operation != "Open" || uncertain.RecoveryAttempt || uncertain.OutcomeId <= create.OutcomeId)
+                    throw new InvalidOperationException("Missing fresh directory operation.");
+                receipt = uncertain.OutcomeId;
+            }
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, sessionTicket, sessionTicket))
+            {
+                var query = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (query.Operation != "GetOutcome" || query.OutcomeId != receipt) throw new InvalidOperationException("Missing uncertain directory query.");
+                await secure.SendAsync(new RpcResponse { RequestId = query.RequestId, Error = "OutcomeUnknown" }, deadline.Token);
+                var abandon = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (abandon.Operation != "AbandonOpen" || abandon.OutcomeId != receipt || abandon.Handle != Guid.Empty || abandon.DeleteOnClose)
+                    throw new InvalidOperationException("A failed open's handle must be released by its exact original receipt.");
+                await secure.SendAsync(new RpcResponse { RequestId = abandon.RequestId }, deadline.Token);
+                var reopened = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (reopened.Operation != "Open" || reopened.OutcomeId <= receipt || reopened.RecoveryAttempt)
+                    throw new InvalidOperationException("Expected the new open after releasing the unclaimed handle.");
+                await secure.SendAsync(new RpcResponse { RequestId = reopened.RequestId, Handle = fileHandle }, deadline.Token);
+                var read = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (read.Operation != "Read" || read.Handle != fileHandle)
+                    throw new InvalidOperationException("Expected a read on the existing handle.");
+                // A half-open connection can accept the request and then remain silent after wake.
+                try { await secure.ReceiveAsync<RpcRequest>(deadline.Token); throw new InvalidOperationException("Expected the client to abandon the stalled transport."); }
+                catch (IOException) { }
+            }
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, sessionTicket, sessionTicket))
+            {
+                var retried = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (retried.Operation != "Read" || retried.Handle != fileHandle)
+                    throw new InvalidOperationException("Expected a retried read on the existing handle.");
+                await secure.SendAsync(new RpcResponse { RequestId = retried.RequestId, Data = [9] }, deadline.Token);
+                try { await secure.ReceiveAsync<RpcRequest>(deadline.Token); throw new InvalidOperationException("Expected idle wake disconnect."); }
+                catch (EndOfStreamException) { }
+            }
+            using (var socket = await listener.AcceptTcpClientAsync(deadline.Token))
+            using (var secure = await AcceptSessionAsync(socket, sessionTicket, Guid.NewGuid()))
+            {
+                var fresh = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (fresh.Operation != "Ping") throw new InvalidOperationException("A stale handle reached a fresh lease.");
+                await secure.SendAsync(new RpcResponse { RequestId = fresh.RequestId }, deadline.Token);
+                var end = await secure.ReceiveAsync<RpcRequest>(deadline.Token);
+                if (end.Operation != "EndSession") throw new InvalidOperationException("Expected explicit lease release.");
+                await secure.SendAsync(new RpcResponse { RequestId = end.RequestId }, deadline.Token);
             }
         }
     }

@@ -20,6 +20,7 @@ public sealed class SecureTransport : IDisposable
     {
         get;
     }
+    public bool SupportsSessionResume { get; internal set; }
     public string? RemoteUserName
     {
         get; internal set;
