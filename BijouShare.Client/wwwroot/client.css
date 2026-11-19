@@ -1,4 +1,6 @@
 :root {
+  --drive-art: image-set(url("/drive-art-480.webp") 1x, url("/drive-art-720.webp") 1.5x, url("/drive-art-960.webp") 2x, url("/drive-art.webp") 3x);
+  --drive-art-small: image-set(url("/drive-art-320.webp") 1x, url("/drive-art-480.webp") 1.5x, url("/drive-art-720.webp") 2x, url("/drive-art-960.webp") 3x, url("/drive-art.webp") 4x);
   color-scheme: dark;
   --canvas: var(--ui-bg, #111112);
   --rail: var(--ui-rail, #171718);
@@ -97,7 +99,7 @@ code, .server-endpoint, .server-digest { font-family: var(--mono); }
 }
 .drive-hero::before, .setup-visual::after {
   content: ""; position: absolute; pointer-events: none; z-index: -1; inset: 0 0 0 auto; width: 55%;
-  background: #151515 url("/drive-art.webp") right center / cover no-repeat;
+  background: #151515 var(--drive-art) right center / cover no-repeat;
   mask-image: linear-gradient(90deg, transparent, #000 22%);
 }
 .drive-hero::before {
@@ -235,6 +237,7 @@ dialog .muted { font-size: 13px; margin-top: 12px; }
   .server-info { grid-column: 1 / -1; }
   .setup-card { max-width: 460px; grid-template-columns: 1fr; }
   .setup-visual { min-height: 110px; padding: 20px 23px; border-right: 0; border-bottom: 1px solid var(--line); display: flex; align-items: center; }
+  .drive-hero::before, .setup-visual::after { background-image: var(--drive-art-small); }
   .setup-visual::after { height: 100%; width: 50%; background-size: cover; mask-image: linear-gradient(90deg, transparent, black 35%); }
 }
 @media (max-width: 460px) {

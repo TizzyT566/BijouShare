@@ -11,6 +11,8 @@
   --rail-width: 228px;
   --gutter: clamp(22px, 3vw, 48px);
   --radius: 12px;
+  --server-art: image-set(url("/server-art-480.webp") 1x, url("/server-art-720.webp") 1.5x, url("/server-art-960.webp") 2x, url("/server-art.webp") 3x);
+  --server-art-small: image-set(url("/server-art-320.webp") 1x, url("/server-art-480.webp") 1.5x, url("/server-art-720.webp") 2x, url("/server-art-960.webp") 3x, url("/server-art.webp") 4x);
   font: 14px/1.5 var(--ui-font, "Segoe UI", system-ui, sans-serif);
 }
 *, *::before, *::after { box-sizing: border-box; }
@@ -84,7 +86,7 @@ header button { min-height: 32px; font-size: 12px; flex: none; }
 .page-heading .muted { margin-top: 8px; max-width: 72ch; }
 .page-heading > button { flex-shrink: 0; }
 .server-hero { isolation: isolate; position: relative; overflow: hidden; background: #161616; border: 1px solid #3d3d3f; border-radius: var(--radius); }
-.server-hero::before { content: ""; position: absolute; z-index: -1; right: 0; top: 50%; transform: translateY(-50%); height: 119%; aspect-ratio: 16 / 9; max-width: 63%; background: url("/server-art.webp") right center / cover no-repeat; mask-image: linear-gradient(90deg, transparent, #000 31%); }
+.server-hero::before { content: ""; position: absolute; z-index: -1; right: 0; top: -9.5%; height: 119%; aspect-ratio: 16 / 9; max-width: 63%; background: var(--server-art) right center / cover no-repeat; mask-image: linear-gradient(90deg, transparent, #000 31%); }
 .hero-copy { padding: clamp(24px, 2.5vw, 40px); width: 63%; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: #bcbcc0; }
 .eyebrow .bi { width: 14px; height: 14px; }
@@ -197,7 +199,7 @@ dialog h2 { font-size: 22px; }
 .login-screen:not(#server-loading) { grid-template-columns: minmax(0, 490px); }
 #setup-screen { grid-template-columns: minmax(0, 520px); }
 .entry-identity { isolation: isolate; position: relative; overflow: hidden; display: flex; align-items: flex-start; height: 126px; padding: 18px clamp(22px, 3vw, 36px); margin: 0 calc(-1 * clamp(22px, 3vw, 36px)) 25px; border-bottom: 1px solid var(--border); background: #171717; }
-.entry-identity::before { content: ""; position: absolute; z-index: -1; inset: 0 0 0 auto; width: 62%; background: url("/server-art.webp") right center / cover no-repeat; mask-image: linear-gradient(90deg, transparent, #000 35%); }
+.entry-identity::before { content: ""; position: absolute; z-index: -1; inset: 0 0 0 auto; width: 62%; background: var(--server-art-small) right center / cover no-repeat; mask-image: linear-gradient(90deg, transparent, #000 35%); }
 .login-card h1 { font-size: 29px; }
 .login-card > .muted { font-size: 13px; margin: 6px 0 20px; }
 .login-card .primary { margin-top: 22px; width: 100%; justify-content: space-between; }
@@ -252,7 +254,7 @@ dialog h2 { font-size: 22px; }
   .stat:nth-child(n+3) { border-top: 1px solid var(--border); }
   .stat { border-radius: 0 !important; }
   .stat-symbol { right: 16px; bottom: 16px; }
-  .server-hero::before { top: 1px; right: 0; width: 34%; max-width: none; height: 97px; transform: none; background-position: right center; background-size: cover; mask-image: linear-gradient(90deg, transparent, #000 32%); }
+  .server-hero::before { top: 1px; right: 0; width: 34%; max-width: none; height: 97px; background-image: var(--server-art-small); mask-image: linear-gradient(90deg, transparent, #000 32%); }
   .hero-copy { padding: 20px; width: 100%; }
   .server-hero h1 { max-width: 68%; }
   .server-hero::after { content: ""; position: absolute; z-index: -1; inset: 63px 0 auto auto; width: 34%; height: 36px; background: linear-gradient(0deg,#161616 0%,transparent); }

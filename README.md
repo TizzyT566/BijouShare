@@ -94,10 +94,10 @@ flowchart LR
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.20-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.22-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.20-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.22-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.
@@ -109,6 +109,16 @@ After a file service port change, existing connections can finish on the old por
 For unattended installation, run either installer from an elevated terminal with `/quiet /norestart`. Both services start automatically with Windows.
 
 ### Changing the server service account
+
+To switch an **already installed** server to the built-in local Windows Administrator account, finish any active transfers and run this from the folder containing Server Setup:
+
+```powershell
+.\BijouShare.Server-2.0.22-win-x64-Setup.exe /serviceaccount
+```
+
+Approve elevation and enter the displayed account’s Windows password. Setup checks that Windows permits a service logon, changes the account, restarts the server, and reports when it is running. The built-in Administrator must be enabled and have a password. Setup recognizes a renamed account by its Windows identity. The web console has its own administrator login.
+
+For an interactive upgrade, select Administrator again and enter the password to keep that account. Unattended installations use the Local Service default. To use another Windows account or change back to Local Service, use the service’s **Log On** tab.
 
 If a device can browse a share but cannot create a folder, check **Activity** in the server web UI for the failed operation. For an NTFS denial, you can grant the service account **Create folders / append data** on the affected directory. If you choose to run the service under an existing Windows administrator account, follow these steps on the server PC. This gives the entire server process local administrator privileges. BijouShare still enforces its device and group rules.
 
