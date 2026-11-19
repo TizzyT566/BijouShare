@@ -346,10 +346,13 @@ const formattedFingerprint = value => String(value ?? '').match(/.{1,8}/g)?.join
 const deviceGroups = device => device.groupIds.map(id => `<span class="pill">${escapeHtml(nameOf(state.groups, id))}</span>`).join(' ') || '<span class="muted">No groups — no access</span>';
 const timeText = value => `<time datetime="${escapeHtml(value)}">${escapeHtml(new Date(value).toLocaleString())}</time>`;
 
+const inviteIsUsedUp = invite => invite.maxUses != null && invite.uses >= invite.maxUses;
+const canRemoveInvite = invite => invite.revoked || inviteIsUsedUp(invite);
+
 function inviteStatus(invite) {
   if (invite.revoked) return 'Revoked';
+  if (inviteIsUsedUp(invite)) return 'Used up';
   if (invite.expiresUtc && new Date(invite.expiresUtc).getTime() <= Date.now()) return 'Expired';
-  if (invite.maxUses !== null && invite.uses >= invite.maxUses) return 'Used up';
   return 'Active';
 }
 
@@ -360,8 +363,9 @@ function renderInvites() {
     `<div class="callout"><strong>Each invite grants its selected group memberships.</strong>Set a use limit and an expiration, or allow unlimited uses and no expiration. Existing devices keep their current groups; blocked devices remain blocked. Copy each new code when it is created.</div>` +
     table(['Invite', 'Groups', 'Uses', 'Expires', 'Status', ''], (state.invites ?? []).map(invite => {
       const status = inviteStatus(invite);
-      const action = invite.revoked ? 'Remove' : 'Revoke';
-      return `<tr data-invite-id="${escapeHtml(invite.id)}"><td><strong>${escapeHtml(invite.name)}</strong><small>Created ${timeText(invite.createdUtc)}</small></td><td>${deviceGroups(invite)}</td><td>${invite.maxUses === null ? `${invite.uses} used · unlimited` : `${invite.uses} of ${invite.maxUses} used`}<small>${invite.maxUses === null ? 'No use limit' : Math.max(0, invite.maxUses - invite.uses) + ' remaining'}</small></td><td>${invite.expiresUtc ? timeText(invite.expiresUtc) : 'Never'}</td><td><span class="pill ${status === 'Active' ? '' : 'off'}">${status}</span></td><td><button type="button" class="quiet danger" ${invite.revoked ? 'data-remove-record' : 'data-delete'}="invites" data-id="${escapeHtml(invite.id)}" aria-label="${action} invite ${escapeHtml(invite.name)}">${action}</button></td></tr>`;
+      const removable = canRemoveInvite(invite);
+      const action = removable ? 'Remove' : 'Revoke';
+      return `<tr data-invite-id="${escapeHtml(invite.id)}"><td><strong>${escapeHtml(invite.name)}</strong><small>Created ${timeText(invite.createdUtc)}</small></td><td>${deviceGroups(invite)}</td><td>${invite.maxUses === null ? `${invite.uses} used · unlimited` : `${invite.uses} of ${invite.maxUses} used`}<small>${invite.maxUses === null ? 'No use limit' : Math.max(0, invite.maxUses - invite.uses) + ' remaining'}</small></td><td>${invite.expiresUtc ? timeText(invite.expiresUtc) : 'Never'}</td><td><span class="pill ${status === 'Active' ? '' : 'off'}">${status}</span></td><td><button type="button" class="quiet danger" ${removable ? 'data-remove-record' : 'data-delete'}="invites" data-id="${escapeHtml(invite.id)}" aria-label="${action} invite ${escapeHtml(invite.name)}">${action}</button></td></tr>`;
     }), 'Enrollment invites', 'Create an invite and share its link with the devices you want to enroll.');
 }
 
@@ -579,9 +583,11 @@ function confirmDeletion(entity, id, removeRecord = false) {
   if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'Blocked devices cannot enroll, even with a valid invite link.'; }
   if (entity === 'invites') { title = 'Revoke invite?'; button = 'Revoke invite'; detail = 'This code will no longer enroll devices. Devices already enrolled keep their current groups and permissions.'; }
   if (removeRecord) {
-    if (entity === 'invites' && item.revoked) {
-      title = 'Remove revoked invite?'; button = 'Remove invite';
-      detail = 'Permanently remove this invite from the list. Its code stays revoked.';
+    if (entity === 'invites' && canRemoveInvite(item)) {
+      title = item.revoked ? 'Remove revoked invite?' : 'Remove used-up invite?';
+      button = 'Remove invite';
+      detail = item.revoked ? 'Permanently remove this invite from the list. Its code stays revoked.'
+        : 'This invite has reached its use limit. Permanently remove it from the list?';
     } else if ((entity === 'devices' && !item.enabled) || (entity === 'pendingDevices' && item.rejected)) {
       title = 'Forget blocked device?'; button = 'Forget device';
       const effect = entity === 'devices' ? 'This permanently removes the device and its group memberships and clears its block.'
@@ -602,7 +608,7 @@ $('#confirm-delete').addEventListener('click', async () => {
   if (!pendingDeletion) return;
   const { entity, id, removeRecord } = pendingDeletion;
   const epoch = viewEpoch;
-  const message = removeRecord ? (entity === 'invites' ? 'Revoked invite removed.' : 'Device forgotten. Its block has been cleared.')
+  const message = removeRecord ? (entity === 'invites' ? 'Invite removed.' : 'Device forgotten. Its block has been cleared.')
     : entity === 'devices' || entity === 'pendingDevices' ? 'Device blocked.' : entity === 'shares' ? 'Share removed.' : entity === 'invites' ? 'Invite revoked.' : 'Item deleted.';
   let deleted = false;
   setBusy($('#confirmation-form'), true);

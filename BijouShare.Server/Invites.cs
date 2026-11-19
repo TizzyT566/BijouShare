@@ -5,7 +5,10 @@ using BijouShare.Shared;
 namespace BijouShare.Server;
 
 public sealed record InviteCode(Guid Id, string Name, Guid[] GroupIds, string CodeHash, int? MaxUses,
-    long Uses, DateTime CreatedUtc, DateTime? ExpiresUtc, bool Revoked = false);
+    long Uses, DateTime CreatedUtc, DateTime? ExpiresUtc, bool Revoked = false)
+{
+    internal bool IsExhausted => MaxUses is { } limit && Uses >= limit;
+}
 public sealed record CreatedInvite(InviteCode Invite, string Code);
 
 public sealed partial class StateStore
@@ -43,10 +46,10 @@ public sealed partial class StateStore
         return true;
     });
 
-    public bool RemoveRevokedInvite(Guid id) => Update(s =>
+    public bool RemoveInviteRecord(Guid id) => Update(s =>
     {
-        if (s.Invites.RemoveAll(invite => invite.Id == id && invite.Revoked) == 0)
-            throw new ArgumentException("Only a revoked invite can be removed. Refresh the invite list.");
+        if (s.Invites.RemoveAll(invite => invite.Id == id && (invite.Revoked || invite.IsExhausted)) == 0)
+            throw new ArgumentException("Only a revoked or used-up invite can be removed. Refresh the invite list.");
         return true;
     });
 
@@ -85,7 +88,7 @@ public sealed partial class StateStore
 
     private static bool IsUsable(InviteCode invite, DateTime now) => !invite.Revoked &&
         !invite.GroupIds.Contains(AdministratorGroupId) &&
-        (invite.ExpiresUtc is null || invite.ExpiresUtc > now) && (invite.MaxUses is null || invite.Uses < invite.MaxUses);
+        (invite.ExpiresUtc is null || invite.ExpiresUtc > now) && !invite.IsExhausted;
     private static bool IsCode(string? code) => code is { Length: 32 } &&
         code.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
     private static string HashInvite(string code) => Convert.ToHexStringLower(SHA3_256.HashData(Encoding.ASCII.GetBytes(code)));

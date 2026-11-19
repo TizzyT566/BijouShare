@@ -191,7 +191,7 @@ public static class AdminApi
         api.MapDelete("/invites/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "RevokeInvite", id.ToString(), () => { store.RevokeInvite(id); return true; }));
         api.MapDelete("/invites/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
-            Save(context, audit, "RemoveRevokedInvite", id.ToString(), () => store.RemoveRevokedInvite(id)));
+            Save(context, audit, "RemoveInvite", id.ToString(), () => store.RemoveInviteRecord(id)));
         api.MapPut("/shares/{id:guid}", (Guid id, ExportShare share, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "Share", share.Name, () => store.Update(s =>
             {

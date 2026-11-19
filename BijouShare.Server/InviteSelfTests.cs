@@ -131,18 +131,31 @@ internal static class InviteSelfTests
         store.RevokeInvite(revoked.Invite.Id);
         Status(() => store.RedeemInvite(Request(), revoked.Code), "InvalidInvite", "A revoked invite cannot approve a device");
 
+        var limited = store.CreateInvite("Two uses", groups, 2, null);
+        var firstRecipient = store.RedeemInvite(Request(), limited.Code);
         revision = store.Revision;
         Reject(() => store.RemoveBlockedDevice(promoted.Id), "An enabled device cannot be removed");
         Reject(() => store.RemoveRejectedRequest(waitingId), "A waiting request cannot be removed");
-        Reject(() => store.RemoveRevokedInvite(unlimited.Invite.Id), "An active invite cannot be removed");
-        Reject(() => store.RemoveRevokedInvite(expired.Invite.Id), "An expired invite must be revoked before removal");
-        Reject(() => store.RemoveRevokedInvite(single.Invite.Id), "An exhausted invite must be revoked before removal");
+        Reject(() => store.RemoveInviteRecord(unlimited.Invite.Id), "An unlimited active invite cannot be removed");
+        Reject(() => store.RemoveInviteRecord(limited.Invite.Id), "A used invite with a remaining use cannot be removed");
+        Reject(() => store.RemoveInviteRecord(expired.Invite.Id), "An expired invite with uses remaining must be revoked before removal");
+        Reject(() => store.RemoveInviteRecord(Guid.NewGuid()), "An unknown invite cannot be removed");
         Check(store.Revision == revision, "Ineligible record removal leaves state unchanged");
+        var lastRecipient = store.RedeemInvite(Request(), limited.Code);
+        store.RemoveInviteRecord(limited.Invite.Id);
         var rejectedId = TestRegistration.RecordId(rejected.DeviceId);
         store.RemoveBlockedDevice(first.Id);
         store.RemoveRejectedRequest(rejectedId);
-        store.RemoveRevokedInvite(revoked.Invite.Id);
+        store.RemoveInviteRecord(revoked.Invite.Id);
         reloaded = new StateStore(options);
+        Check(reloaded.Read(state => state.Invites.All(i => i.Id != limited.Invite.Id && i.CodeHash != limited.Invite.CodeHash)) &&
+            new[] { firstRecipient, lastRecipient }.All(recipient =>
+            {
+                var saved = reloaded.Identity(recipient.Id);
+                return saved.HasSameIdentity(recipient) && saved.GroupIds.SequenceEqual(groups);
+            }),
+            "Deleting a used-up invite preserves both recipients' enrollments and group memberships across restart");
+        Status(() => reloaded.RedeemInvite(Request(), limited.Code), "InvalidInvite", "A deleted used-up code cannot enroll another device");
         Check(reloaded.FindRegisteredDevice(first.Id) is null && reloaded.FindPendingDevice(rejectedId) is null &&
             reloaded.Read(state => state.Invites.All(i => i.Id != revoked.Invite.Id && i.CodeHash != revoked.Invite.CodeHash)),
             "Removed device, request and invite records stay absent after restart");
