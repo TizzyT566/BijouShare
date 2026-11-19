@@ -1189,12 +1189,67 @@ public static class ServerSelfTests
         l.Stop();
         return p;
     }
+    private static async Task CheckFilePortChange(FileServer service, StateStore store, ServerOptions options,
+        SecureTransport transport, Action<bool, string> check, CancellationToken token)
+    {
+        var original = options.Port;
+        using var occupied = new TcpListener(IPAddress.Loopback, 0) { ExclusiveAddressUse = true };
+        occupied.Start();
+        var occupiedPort = ((IPEndPoint)occupied.LocalEndpoint).Port;
+        try
+        {
+            using var change = service.PreparePort(occupiedPort);
+            throw new InvalidOperationException("A file port already owned by another listener was accepted.");
+        }
+        catch (SocketException)
+        {
+            check(options.Port == original, "An occupied file port leaves the current listener unchanged");
+        }
+
+        var newPort = FreePort();
+        var revision = store.Revision;
+        using (var candidate = service.PreparePort(newPort))
+        {
+            try
+            {
+                store.SavePorts(newPort, newPort);
+                throw new InvalidOperationException("Conflicting file and web ports were saved.");
+            }
+            catch (ArgumentException)
+            {
+                check(store.Revision == revision && options.Port == original, "Failed port validation preserves the saved settings");
+            }
+        }
+        using (var change = service.PreparePort(newPort))
+        {
+            store.SavePorts(newPort, occupiedPort);
+            change.Commit();
+        }
+        var reloadedOptions = new ServerOptions { DataDirectory = options.DataDirectory, Port = original };
+        var reloaded = new StateStore(reloadedOptions);
+        check(options.Port == newPort && reloadedOptions.Port == newPort && reloaded.Read(s => s.WebPort) == occupiedPort,
+            "A rolled-back file port reservation is reusable and committed ports survive reload");
+
+        await transport.SendAsync(new RpcRequest { Operation = "Ping" }, token);
+        check((await transport.ReceiveAsync<RpcResponse>(token)).Error is null,
+            "An authenticated file session on the old port remains usable after the port change");
+        using var retired = new TcpClient();
+        try
+        {
+            await retired.ConnectAsync(IPAddress.Loopback, original, token);
+            throw new InvalidOperationException("The retired listener accepted a new file connection.");
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused)
+        {
+            check(true, "The retired file port refuses new connections");
+        }
+    }
     private static async Task NetworkTests(ServerOptions options, StateStore store, FileService files, AuditLog audit, Device device,
         byte[] privateKey, byte[] serverPublic, HybridKem identityKem, Action<bool, string> check)
     {
         using var service = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance);
         await service.StartAsync(CancellationToken.None);
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
         {
             using var socket = new TcpClient();
@@ -1202,6 +1257,7 @@ public static class ServerSelfTests
                 identityKem, store.ServerId, deadline.Token, binaryPayloads: false);
             await transport.SendAsync(new RpcRequest { Operation = "List" }, deadline.Token);
             check((await transport.ReceiveAsync<RpcResponse>(deadline.Token)).Entries!.Any(e => e.Name == "Team"), "Real TCP handshake and encrypted file listing succeed");
+            await CheckFilePortChange(service, store, options, transport, check, deadline.Token);
             const string deniedPath = "/Team/restricted/secret.txt";
             await transport.SendAsync(new RpcRequest { Operation = "Stat", Path = deniedPath }, deadline.Token);
             var denied = await transport.ReceiveAsync<RpcResponse>(deadline.Token);

@@ -44,12 +44,16 @@ flowchart LR
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.14-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.15-win-x64-Setup.exe` and approve elevation. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's **LOCAL SERVICE** account the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share.
 3. **Invite the client.** On **Overview → Connect a client**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.14-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray and choose a device name. Select **Add drive** and pick an unused letter.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.15-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray and choose a device name. Select **Add drive** and pick an unused letter.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, send the **Overview → Connect a client → Copy link** connection link in step 3. After the client connects, open **Devices** on the server, approve the waiting device, and assign its groups.
+
+To change ports, open **Settings → Listening ports** on the server. The file service defaults to TCP **7443** and the local web UI to **5080**. After a web UI port change, the console reopens on the new port and the tray icon uses that address. For remote HTTPS access, allow the new web port through your firewall before saving. If you reach the console through a proxy on a different port, open it from the server tray to change its listener. Deployments with explicit Kestrel endpoints or multiple web URLs manage those bindings in their hosting configuration.
+
+After a file service port change, existing connections can finish on the old port. Update your firewall rule and copy a fresh connection link from **Overview**. Once file transfers finish, clients can disconnect the old server entry from their drive and reconnect using the new link. Device approvals and group memberships carry over.
 
 For unattended installation, run either installer from an elevated terminal with `/quiet /norestart`. Both services start automatically with Windows.

@@ -82,14 +82,18 @@ public static class AdminApi
         var api = app.MapGroup("/api").RequireAuthorization();
         api.MapPost("/server/name", (ServerNameUpdate update, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "RenameServer", update.Name, () => { store.RenameServer(update.Name); return true; }));
+        api.MapPost("/server/ports", (PortUpdate update, ServerPortSettings ports, HttpContext context) =>
+            ports.SaveAsync(update, context));
         api.MapPost("/logout", async (HttpContext context) => { await context.SignOutAsync(); return Results.Ok(); });
-        api.MapGet("/state", (StateStore store, AuditLog audit, ServerOptions options) => store.Read(s => Results.Ok(new
+        api.MapGet("/state", (StateStore store, AuditLog audit, ServerOptions options, WebPortListener web, HttpContext context) => store.Read(s => Results.Ok(new
         {
             s.ServerName,
             s.ServerId,
             s.ServerPublicKey,
             s.ServerMlKemPublicKey,
             filePort = options.Port,
+            webPort = web.CurrentPort,
+            webPortEditable = ServerPortSettings.IsDirectWebEndpoint(context, web.CurrentPort),
             storageAccount = FileService.StorageAccount,
             cryptoSuite = Wire.CryptoSuite,
             cryptoProvider = HybridKem.ProviderName,

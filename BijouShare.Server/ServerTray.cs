@@ -34,7 +34,7 @@ internal static class ServerTray
     internal static WindowsTrayIcon StartForHost(WebApplication app)
     {
         var tray = WindowsTrayIcon.Start(Title,
-            () => OpenBrowser(LocalAddress(app.Urls)),
+            () => OpenBrowser(LocalAddress(app.Urls, app.Services.GetRequiredService<WebPortListener>().CurrentPort)),
             error => app.Logger.LogWarning(error, "Could not open server management from the notification area."),
             app.Lifetime.StopApplication);
         WindowsTrayIcon.DetachPrivateConsole();
@@ -148,7 +148,7 @@ internal static class ServerTray
         return service.IsInvalid && Marshal.GetLastPInvokeError() is 1060 or 1072; // Missing or marked for deletion.
     }
 
-    internal static Uri? LocalAddress(IEnumerable<string> addresses)
+    internal static Uri? LocalAddress(IEnumerable<string> addresses, int? port = null)
     {
         foreach (var address in addresses)
         {
@@ -156,7 +156,7 @@ internal static class ServerTray
             var value = address.Replace("://*:", "://0.0.0.0:", StringComparison.Ordinal)
                 .Replace("://+:", "://0.0.0.0:", StringComparison.Ordinal);
             if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
-                uri.Scheme is not ("http" or "https") || uri.Port < 1 || uri.UserInfo.Length != 0 ||
+                uri.Scheme is not ("http" or "https") || uri.Port < 1 || (port.HasValue && uri.Port != port) || uri.UserInfo.Length != 0 ||
                 uri.AbsolutePath != "/" || uri.Query.Length != 0 || uri.Fragment.Length != 0)
                 continue;
             if (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase))

@@ -98,8 +98,8 @@ async function api(path, method = 'GET', body) {
     }
     return data;
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('The server did not respond in time. Refresh its state before retrying a change.');
-    if (error instanceof TypeError) throw new Error('Cannot reach the server. Check the connection and refresh its state before retrying a change.');
+    if (error.name === 'AbortError') throw new Error('The server did not respond in time. Refresh its state before retrying a change.', { cause: error });
+    if (error instanceof TypeError) throw new Error('Cannot reach the server. Check the connection and refresh its state before retrying a change.', { cause: error });
     throw error;
   } finally { clearTimeout(timeout); }
 }
@@ -365,12 +365,26 @@ function renderActivity() {
 }
 
 function renderSettings() {
-  return heading('Settings', 'Manage the server name and administrator access.') +
+  const browserPort = Number(location.port || (location.protocol === 'https:' ? 443 : 80));
+  const canChangeWebPort = browserPort === state.webPort && state.webPortEditable !== false;
+  let webPortHint = 'This page will reopen on the new port when the web UI is ready.';
+  if (state.webPort == null) webPortHint = 'The web listener is managed by the server’s hosting configuration.';
+  else if (!canChangeWebPort) webPortHint = 'To change this port, open the console directly from the BijouShare Server tray icon.';
+  else if (!isLoopbackAddress(location.hostname)) webPortHint = 'Allow the new port through your firewall before saving. This page will reopen on that port.';
+  return heading('Settings', 'Manage the server name, listening ports, and administrator access.') +
     `<div class="settings-grid">${renderServerIdentity()}${renderConnectionLink()}` +
     `<div class="panel"><div class="panel-title"><h2>${icon('server')}Server name</h2></div><form id="rename-server" class="password-form">
       <label>Display name<input name="name" required maxlength="100" pattern="[A-Za-z0-9\\-]+" spellcheck="false" value="${escapeHtml(state.serverName)}" aria-describedby="rename-hint"></label>
       <p id="rename-hint" class="hint">Clients see the new folder name when they reconnect. Existing links and fingerprints stay valid.</p>
       <p id="rename-error" class="error" role="alert"></p><button class="primary" type="submit">Save name</button></form></div>` +
+    `<section class="panel"><div class="panel-title"><h2>${icon('link')}Listening ports</h2></div>
+      <form id="server-ports" class="password-form">
+        <label for="file-port">File service port</label><input id="file-port" name="filePort" type="number" min="1" max="65535" required value="${escapeHtml(state.filePort)}" aria-describedby="file-port-hint">
+        <p id="file-port-hint" class="hint">Allow this TCP port through your firewall. Clients will need the new port to reconnect.</p>
+        <label for="web-port">Web UI port</label><input id="web-port" name="webPort" type="number" min="1" max="65535" ${canChangeWebPort ? 'required' : 'disabled'} value="${escapeHtml(state.webPort)}" aria-describedby="web-port-hint">
+        <p id="web-port-hint" class="hint">${webPortHint}</p>
+        <p id="ports-error" class="error" role="alert"></p><button class="primary" type="submit">Save ports</button>
+      </form></section>` +
     `<div class="panel"><div class="panel-title"><h2>${icon('key')}Administrator password</h2></div><form id="password-form" class="password-form">
       <label>Current password<input name="currentPassword" type="password" autocomplete="current-password" required maxlength="1024"></label>
       <label>New password<input name="newPassword" type="password" autocomplete="new-password" minlength="14" maxlength="1024" required aria-describedby="password-hint"></label>
@@ -405,6 +419,7 @@ function render() {
   };
   $('#content').innerHTML = renderers[tab]();
   $('#rename-server')?.addEventListener('submit', changeServerName);
+  $('#server-ports')?.addEventListener('submit', changeServerPorts);
   $('#password-form')?.addEventListener('submit', changePassword);
 }
 
@@ -617,6 +632,65 @@ async function changeServerName(event) {
     toast('Server name updated.');
   } catch (exception) { error.textContent = exception.message; }
   finally { setBusy(form, false); }
+}
+
+$('#web-restarting').addEventListener('cancel', event => event.preventDefault());
+async function changeServerPorts(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (form.getAttribute('aria-busy') === 'true') return;
+  const fileInput = form.elements.filePort, webInput = form.elements.webPort;
+  const expectedFilePort = Number(fileInput.defaultValue);
+  const expectedWebPort = webInput.defaultValue ? Number(webInput.defaultValue) : null;
+  const filePort = fileInput.valueAsNumber;
+  const webPort = webInput.disabled ? expectedWebPort : webInput.valueAsNumber;
+  const webPortChanged = webPort !== expectedWebPort;
+  const error = $('#ports-error'), dialog = $('#web-restarting');
+  error.textContent = '';
+  if (filePort === webPort) {
+    error.textContent = 'Choose a different port for each listener.';
+    fileInput.focus();
+    return;
+  }
+  if (!webPortChanged && filePort === expectedFilePort) { toast('The listening ports are unchanged.'); return; }
+  setBusy(form, true);
+  fileInput.readOnly = webInput.readOnly = true;
+  if (webPortChanged) {
+    $('#restart-port').textContent = webPort;
+    dialog.showModal();
+  }
+  try {
+    const saved = await api('/server/ports', 'POST', { filePort, webPort, expectedFilePort, expectedWebPort });
+    if (webPortChanged) {
+      // The server acknowledges only after the new listener is ready.
+      if (saved?.webPort !== webPort) throw new Error('Could not confirm the new web UI port. Reopen the console from the server tray icon.');
+      const destination = new URL(location.href);
+      destination.port = String(webPort);
+      location.replace(destination.href);
+      return;
+    }
+    if (state) {
+      state.filePort = saved.filePort;
+      fileInput.defaultValue = String(saved.filePort);
+      const hint = $('#connection-host-hint');
+      if (hint) hint.textContent = `Use an address the client can reach on port ${saved.filePort}.`;
+      updateConnectionLink();
+      updateInviteLink();
+    }
+    toast('File service port updated.');
+  } catch (exception) {
+    if (dialog.open) dialog.close();
+    const message = webPortChanged && exception.cause
+      ? 'The server did not confirm the port change. Use the BijouShare Server tray icon to open the current web UI.'
+      : exception.message;
+    if (error.isConnected) {
+      error.textContent = message;
+      if (webPortChanged) webInput.focus();
+    } else toast(message);
+  } finally {
+    fileInput.readOnly = webInput.readOnly = false;
+    setBusy(form, false);
+  }
 }
 
 async function changePassword(event) {

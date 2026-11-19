@@ -7,6 +7,7 @@ using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using BijouShare.Server;
 using BijouShare.Shared;
@@ -108,12 +109,15 @@ try
         return 0;
     using var storageLease = StorageLease.Acquire(options.DataDirectory, includeLocalService: true);
     var store = new StateStore(options);
+    var webPorts = WebPortListener.Configure(builder, store.Read(s => s.WebPort));
     builder.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Server");
     builder.Services.AddSingleton(options);
     builder.Services.AddSingleton(store);
     builder.Services.AddSingleton<AuditLog>();
     builder.Services.AddSingleton<FileService>();
-    builder.Services.AddHostedService<FileServer>();
+    builder.Services.AddSingleton<FileServer>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<FileServer>());
+    builder.Services.AddSingleton<ServerPortSettings>();
     if (isService)
         builder.Services.AddHostedService<ServerTrayEndpoint>();
     builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(store.DataDirectory, "web-keys")))
@@ -178,6 +182,7 @@ try
             }));
     });
     await using var app = builder.Build();
+    webPorts.Attach(app.Services.GetRequiredService<IServer>());
     app.Use(async (context, next) =>
     {
         context.Response.Headers["X-Content-Type-Options"] = "nosniff";

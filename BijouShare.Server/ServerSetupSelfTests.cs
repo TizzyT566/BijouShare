@@ -23,6 +23,7 @@ internal static class ServerSetupSelfTests
         }
         CheckStorageAcl(Check);
         await CheckTrayAsync(Check);
+        await WebPortSelfTests.RunAsync(Check);
         var root = Path.GetFullPath(Path.Combine("artifacts", "server-setup-tests", Guid.NewGuid().ToString("N")));
         var options = new ServerOptions { DataDirectory = root };
         var store = new StateStore(options);
@@ -107,6 +108,13 @@ internal static class ServerSetupSelfTests
             !ServerSetupSecurity.IsLocalRequest(Context("127.0.0.1", "127.0.0.1:5080", "https://attacker.invalid")) &&
             !ServerSetupSecurity.IsLocalRequest(Context("127.0.0.1", "127.0.0.1:5080", fetchSite: "cross-site")),
             "Server setup rejects remote clients, foreign Hosts and Origins, and cross-site requests");
+        var console = Context("127.0.0.1", "localhost:5080", "http://localhost:5080");
+        console.Connection.LocalPort = 5080;
+        Check(ServerPortSettings.IsDirectWebEndpoint(console, 5080),
+            "The direct console can change its own web port");
+        console.Request.Headers.Origin = "https://example.test";
+        Check(!ServerPortSettings.IsDirectWebEndpoint(console, 5080),
+            "A proxy with a different public origin cannot redirect the browser to an unverified port");
         var portProbe = new TcpListener(IPAddress.Loopback, 0);
         portProbe.Start();
         var filePort = ((IPEndPoint)portProbe.LocalEndpoint).Port;

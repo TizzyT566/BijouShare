@@ -181,6 +181,8 @@ input[type="checkbox"] { accent-color: #e8e8ea; width: 15px; height: 15px; margi
 dialog { border: 1px solid #46464a; padding: 25px; width: min(550px, calc(100% - 26px)); max-width: none; max-height: 88vh; overflow: auto; scrollbar-gutter: stable; border-radius: 13px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 90px #000a; }
 dialog::backdrop { background: #050505c9; backdrop-filter: blur(3px); }
 dialog h2 { font-size: 22px; }
+#web-restarting { width: min(400px, calc(100% - 26px)); scrollbar-gutter: auto; }
+#restart-detail { margin-top: 10px; }
 .dialog-heading, .dialog-actions { display: flex; align-items: center; gap: 12px; }
 .dialog-heading { justify-content: space-between; margin-bottom: 16px; }
 .dialog-actions { justify-content: flex-end; flex-wrap: wrap; border-top: 1px solid var(--border); margin-top: 22px; padding-top: 18px; gap: 8px; }

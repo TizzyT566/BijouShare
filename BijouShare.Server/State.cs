@@ -60,6 +60,8 @@ public sealed record AdminCredential(string Name, byte[] Salt, byte[] Hash, stri
 public sealed class ServerState
 {
     public int SchemaVersion { get; set; } = 6;
+    public int? FilePort { get; set; }
+    public int? WebPort { get; set; }
     public string ServerId { get; set; } = "";
     public string ServerName { get; set; } = "";
     public string ServerPublicKey { get; set; } = "";
@@ -106,6 +108,8 @@ public sealed partial class StateStore
         path = System.IO.Path.Combine(DataDirectory, "state.json");
         state = File.Exists(path) ? LoadState(File.ReadAllBytes(path)) : CreateState();
         Validate(state, validatePrivateKeys: true);
+        if (state.FilePort is { } filePort)
+            options.Port = filePort;
     }
     private static ServerState LoadState(byte[] bytes)
     {
@@ -178,6 +182,12 @@ public sealed partial class StateStore
         ValidateServerName(name);
         Update(s => s.ServerName = name);
     }
+    public void SavePorts(int? filePort, int? webPort) => Update(s =>
+    {
+        s.FilePort = filePort;
+        s.WebPort = webPort;
+        return true;
+    });
     public bool VerifyAdmin(string? name, string? password) => AuthenticateAdmin(name, password) is not null;
     public void ChangeAdminPassword(string name, string currentPassword, string newPassword)
     {
@@ -460,6 +470,10 @@ public sealed partial class StateStore
     }
     private static void Validate(ServerState s, bool validatePrivateKeys = false)
     {
+        if (s.FilePort is < 1 or > 65535 || s.WebPort is < 1 or > 65535)
+            throw new ArgumentException("Ports must be between 1 and 65535.");
+        if (s.FilePort.HasValue && s.FilePort == s.WebPort)
+            throw new ArgumentException("The file service and web UI must use different ports.");
         if (s.SchemaVersion != 6 || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
             s.Groups.Any(x => x is null) || s.Shares.Any(x => x is null) ||
             s.Rules.Any(x => x is null) || s.Devices.Any(x => x is null) || s.PendingDevices.Any(x => x is null) ||

@@ -10,6 +10,10 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
     AuditLog audit, ILogger<FileServer> logger) : BackgroundService
 {
     private readonly ConcurrentDictionary<Guid, Task> connections = new();
+    private readonly object listenerGate = new();
+    private TcpListener? listener;
+    private TaskCompletionSource portChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool stopped;
     private long lastFailureAudit;
     private int suppressedFailures;
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -19,8 +23,64 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             throw new ArgumentException("Invalid file server configuration.");
         await base.StartAsync(cancellationToken);
     }
+    internal sealed class PortChange(FileServer server, TcpListener candidate, int port) : IDisposable
+    {
+        private TcpListener? pending = candidate;
+
+        internal void Commit()
+        {
+            var replacement = Interlocked.Exchange(ref pending, null);
+            if (replacement is not null)
+                server.Activate(replacement, port);
+        }
+
+        public void Dispose() => Interlocked.Exchange(ref pending, null)?.Stop();
+    }
+
+    internal PortChange PreparePort(int port)
+    {
+        if (port is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(port), "Ports must be between 1 and 65535.");
+        return new(this, Bind(port), port);
+    }
+
+    private TcpListener Bind(int port)
+    {
+        var candidate = new TcpListener(IPAddress.Parse(options.ListenAddress), port) { ExclusiveAddressUse = true };
+        try
+        {
+            candidate.Start();
+            return candidate;
+        }
+        catch
+        {
+            candidate.Stop();
+            throw;
+        }
+    }
+
+    private void Activate(TcpListener replacement, int port)
+    {
+        lock (listenerGate)
+        {
+            options.Port = port;
+            if (stopped)
+            {
+                replacement.Stop();
+                return;
+            }
+            var previous = listener;
+            listener = replacement;
+            previous?.Stop();
+            portChanged.SetResult();
+            portChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        logger.LogInformation("Encrypted file server listening on {Address}:{Port}", options.ListenAddress, port);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var sessions = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         try
         {
             while (!store.IsInitialized)
@@ -28,40 +88,47 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             var retryDelay = TimeSpan.FromSeconds(2);
             while (!stoppingToken.IsCancellationRequested)
             {
+                TcpListener? accepting = null;
+                TcpClient client;
                 try
                 {
-                    await ListenAsync(stoppingToken);
-                    return;
+                    ValueTask<TcpClient> pending;
+                    lock (listenerGate)
+                    {
+                        if (listener is null)
+                        {
+                            listener = Bind(options.Port);
+                            logger.LogInformation("Encrypted file server listening on {Address}:{Port}", options.ListenAddress, options.Port);
+                        }
+                        accepting = listener;
+                        pending = accepting.AcceptTcpClientAsync(stoppingToken);
+                    }
+                    client = await pending;
                 }
+                catch (Exception ex) when (accepting is not null && ex is SocketException or OperationCanceledException or ObjectDisposedException
+                    && !ReferenceEquals(accepting, Volatile.Read(ref listener))) { continue; }
+                // Windows can report a peer that disappeared before accept completed.
+                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted) { continue; }
                 catch (SocketException ex) when (ex.SocketErrorCode is SocketError.AddressNotAvailable
-                    or SocketError.NetworkDown or SocketError.NetworkReset)
+                    or SocketError.AddressAlreadyInUse or SocketError.AccessDenied or SocketError.NetworkDown or SocketError.NetworkReset)
                 {
+                    Task changed;
+                    lock (listenerGate)
+                    {
+                        if (!ReferenceEquals(listener, accepting))
+                            continue;
+                        listener?.Stop();
+                        listener = null;
+                        changed = portChanged.Task;
+                    }
                     logger.LogWarning("File listener {Address}:{Port} is unavailable ({Reason}). Retrying in {Seconds} seconds.",
                         options.ListenAddress, options.Port, ex.SocketErrorCode, retryDelay.TotalSeconds);
-                    await Task.Delay(retryDelay, stoppingToken);
+                    try { await changed.WaitAsync(retryDelay, stoppingToken); }
+                    catch (TimeoutException) { }
                     retryDelay = TimeSpan.FromSeconds(Math.Min(30, retryDelay.TotalSeconds * 2));
-                }
-            }
-        }
-        catch when (!stoppingToken.IsCancellationRequested) { Environment.ExitCode = 1; throw; }
-    }
-    private async Task ListenAsync(CancellationToken stoppingToken)
-    {
-        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        using var listener = new TcpListener(IPAddress.Parse(options.ListenAddress), options.Port);
-        listener.Start();
-        logger.LogInformation("Encrypted file server listening on {Address}:{Port}", options.ListenAddress, options.Port);
-        try
-        {
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                TcpClient client;
-                try { client = await listener.AcceptTcpClientAsync(lifetime.Token); }
-                catch (SocketException ex) when (ex.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted)
-                {
-                    // Windows can report a peer that disappeared before accept completed.
                     continue;
                 }
+                retryDelay = TimeSpan.FromSeconds(2);
                 if (connections.Count >= options.MaxConnections)
                 {
                     client.Dispose();
@@ -69,17 +136,23 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 }
                 client.NoDelay = true;
                 var session = Guid.NewGuid();
-                var task = ServeAsync(client, session, lifetime.Token);
+                var task = ServeAsync(client, session, sessions.Token);
                 connections[session] = task;
                 _ = task.ContinueWith(_ => { connections.TryRemove(session, out var ignored); },
                     CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+        catch when (!stoppingToken.IsCancellationRequested) { Environment.ExitCode = 1; throw; }
         finally
         {
-            listener.Stop();
-            await lifetime.CancelAsync(); // An unexpected listener failure must also close existing sessions.
+            lock (listenerGate)
+            {
+                stopped = true;
+                listener?.Stop();
+                listener = null;
+            }
+            await sessions.CancelAsync();
             await Task.WhenAll(connections.Values);
         }
     }

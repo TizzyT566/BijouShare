@@ -11,7 +11,8 @@ namespace BijouShare.Server;
 
 // Session zero supplies only Kestrel's current loopback address. The interactive helper
 // never needs the service's private directory or access to an administrator session.
-internal sealed class ServerTrayEndpoint(IServer server, IHostApplicationLifetime lifetime, ILogger<ServerTrayEndpoint> logger) : BackgroundService
+internal sealed class ServerTrayEndpoint(IServer server, IHostApplicationLifetime lifetime, ILogger<ServerTrayEndpoint> logger,
+    WebPortListener? webPorts = null) : BackgroundService
 {
     // Windows also checks FILE_READ_ATTRIBUTES when opening the local pipe for the desktop client.
     private const PipeAccessRights ClientRights = PipeAccessRights.ReadData | PipeAccessRights.WriteData |
@@ -35,7 +36,7 @@ internal sealed class ServerTrayEndpoint(IServer server, IHostApplicationLifetim
                     continue;
                 var addresses = server.Features.Get<IServerAddressesFeature>()?.Addresses;
                 var uri = lifetime.ApplicationStarted.IsCancellationRequested && !lifetime.ApplicationStopping.IsCancellationRequested &&
-                    addresses is not null ? ServerTray.LocalAddress(addresses) : null;
+                    addresses is not null ? ServerTray.LocalAddress(addresses, webPorts?.CurrentPort) : null;
                 await WriteAsync(pipe, uri, request.Token);
             }
             catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested) { }
