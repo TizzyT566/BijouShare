@@ -43,6 +43,13 @@ public sealed partial class StateStore
         return true;
     });
 
+    public bool RemoveRevokedInvite(Guid id) => Update(s =>
+    {
+        if (s.Invites.RemoveAll(invite => invite.Id == id && invite.Revoked) == 0)
+            throw new ArgumentException("Only a revoked invite can be removed. Refresh the invite list.");
+        return true;
+    });
+
     // The handshake proves both private identity keys before an invite can be redeemed.
     public Device RedeemInvite(EnrollmentRequest request, string? code)
     {

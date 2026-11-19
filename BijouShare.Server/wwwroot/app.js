@@ -360,7 +360,8 @@ function renderInvites() {
     `<div class="callout"><strong>Each invite grants its selected group memberships.</strong>Set a use limit and an expiration, or allow unlimited uses and no expiration. Existing devices keep their current groups; blocked devices remain blocked. Copy each new code when it is created.</div>` +
     table(['Invite', 'Groups', 'Uses', 'Expires', 'Status', ''], (state.invites ?? []).map(invite => {
       const status = inviteStatus(invite);
-      return `<tr data-invite-id="${invite.id}"><td><strong>${escapeHtml(invite.name)}</strong><small>Created ${timeText(invite.createdUtc)}</small></td><td>${deviceGroups(invite)}</td><td>${invite.maxUses === null ? `${invite.uses} used · unlimited` : `${invite.uses} of ${invite.maxUses} used`}<small>${invite.maxUses === null ? 'No use limit' : Math.max(0, invite.maxUses - invite.uses) + ' remaining'}</small></td><td>${invite.expiresUtc ? timeText(invite.expiresUtc) : 'Never'}</td><td><span class="pill ${status === 'Active' ? '' : 'off'}">${status}</span></td><td>${invite.revoked ? '' : `<button class="quiet danger" data-delete="invites" data-id="${invite.id}" aria-label="Revoke invite ${escapeHtml(invite.name)}">Revoke</button>`}</td></tr>`;
+      const action = invite.revoked ? 'Remove' : 'Revoke';
+      return `<tr data-invite-id="${escapeHtml(invite.id)}"><td><strong>${escapeHtml(invite.name)}</strong><small>Created ${timeText(invite.createdUtc)}</small></td><td>${deviceGroups(invite)}</td><td>${invite.maxUses === null ? `${invite.uses} used · unlimited` : `${invite.uses} of ${invite.maxUses} used`}<small>${invite.maxUses === null ? 'No use limit' : Math.max(0, invite.maxUses - invite.uses) + ' remaining'}</small></td><td>${invite.expiresUtc ? timeText(invite.expiresUtc) : 'Never'}</td><td><span class="pill ${status === 'Active' ? '' : 'off'}">${status}</span></td><td><button type="button" class="quiet danger" ${invite.revoked ? 'data-remove-record' : 'data-delete'}="invites" data-id="${escapeHtml(invite.id)}" aria-label="${action} invite ${escapeHtml(invite.name)}">${action}</button></td></tr>`;
     }), 'Enrollment invites', 'Create an invite and share its link with the devices you want to enroll.');
 }
 
@@ -568,7 +569,7 @@ function editShare(id) {
   });
 }
 
-function confirmDeletion(entity, id) {
+function confirmDeletion(entity, id, removeRecord = false) {
   const item = state[entity].find(value => value.id === id);
   if (!item) return;
   const name = item.name;
@@ -577,19 +578,45 @@ function confirmDeletion(entity, id) {
   if (entity === 'devices') { title = 'Block device?'; button = 'Block device'; detail = 'This device loses access immediately. Its identity and groups are retained. Expand its name and select Enabled to allow it to reconnect.'; }
   if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'Blocked devices cannot enroll, even with a valid invite link.'; }
   if (entity === 'invites') { title = 'Revoke invite?'; button = 'Revoke invite'; detail = 'This code will no longer enroll devices. Devices already enrolled keep their current groups and permissions.'; }
+  if (removeRecord) {
+    if (entity === 'invites' && item.revoked) {
+      title = 'Remove revoked invite?'; button = 'Remove invite';
+      detail = 'Permanently remove this invite from the list. Its code stays revoked.';
+    } else if ((entity === 'devices' && !item.enabled) || (entity === 'pendingDevices' && item.rejected)) {
+      title = 'Forget blocked device?'; button = 'Forget device';
+      const effect = entity === 'devices' ? 'This permanently removes the device and its group memberships and clears its block.'
+        : 'This permanently removes the rejected request and clears the device’s block.';
+      const enrollment = state.inviteOnly ? 'Invite-only enrollment is on, so the device needs a valid invite to enroll again.'
+        : 'The device can request approval again or enroll with a valid invite.';
+      detail = effect + ' ' + enrollment;
+    } else return;
+  }
   $('#confirmation-title').textContent = title; $('#confirmation-name').textContent = name;
+  $('#confirmation-id').hidden = !removeRecord;
+  $('#confirmation-id').textContent = removeRecord ? 'Record ID ' + id : '';
   $('#confirmation-detail').textContent = detail; $('#confirm-delete').textContent = button;
-  $('#confirmation-error').textContent = ''; pendingDeletion = { entity, id };
+  $('#confirmation-error').textContent = ''; pendingDeletion = { entity, id, removeRecord };
   $('#confirmation').showModal(); $('#cancel-deletion').focus();
 }
 $('#confirm-delete').addEventListener('click', async () => {
   if (!pendingDeletion) return;
-  const { entity, id } = pendingDeletion;
-  const message = entity === 'devices' || entity === 'pendingDevices' ? 'Device blocked.' : entity === 'shares' ? 'Share removed.' : entity === 'invites' ? 'Invite revoked.' : 'Item deleted.';
+  const { entity, id, removeRecord } = pendingDeletion;
+  const epoch = viewEpoch;
+  const message = removeRecord ? (entity === 'invites' ? 'Revoked invite removed.' : 'Device forgotten. Its block has been cleared.')
+    : entity === 'devices' || entity === 'pendingDevices' ? 'Device blocked.' : entity === 'shares' ? 'Share removed.' : entity === 'invites' ? 'Invite revoked.' : 'Item deleted.';
   let deleted = false;
   setBusy($('#confirmation-form'), true);
   try {
-    await api(`/${entity === 'pendingDevices' ? 'pending-devices' : entity}/${id}`, 'DELETE'); deleted = true; $('#confirmation').close(); pendingDeletion = null;
+    const endpoint = entity === 'pendingDevices' ? 'pending-devices' : entity;
+    await api(`/${endpoint}/${encodeURIComponent(id)}${removeRecord ? '/record' : ''}`, 'DELETE');
+    deleted = true;
+    if (!state || epoch !== viewEpoch) return;
+    $('#confirmation').close(); pendingDeletion = null;
+    if (removeRecord) {
+      ++stateLoadSequence;
+      state[entity] = state[entity].filter(item => item.id !== id);
+      render();
+    }
     await reload(); toast(message);
   } catch (error) {
     if (deleted) toast(`${message} The list could not be refreshed. ${error.message}`);
@@ -607,6 +634,7 @@ document.addEventListener('click', event => {
   if (!button || button.disabled || !state) return;
   if (button.dataset.new === 'invites') createInvite();
   else if (button.dataset.new === 'shares' || button.dataset.edit === 'shares') editShare(button.dataset.id);
+  else if (button.dataset.removeRecord) confirmDeletion(button.dataset.removeRecord, button.dataset.id, true);
   else if (button.dataset.delete) confirmDeletion(button.dataset.delete, button.dataset.id);
   else if (button.hasAttribute('data-copy-connection')) copyField('#connection-uri', 'Server link');
   else if (button.hasAttribute('data-copy-fingerprint')) copyField('#server-fingerprint', 'Server fingerprint');

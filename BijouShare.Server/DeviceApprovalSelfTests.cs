@@ -19,6 +19,7 @@ internal static class DeviceApprovalSelfTests
         }
         var root = Path.GetFullPath(Path.Combine("artifacts", "device-approval-tests", Guid.NewGuid().ToString("N")));
         var (store, options, fixtureDevice, fixtureKey, _) = ServerSelfTests.CreateFixture(root);
+        store.SetInviteOnly(false);
         using var identity = KeyAgreement.NewKey();
         using var wrongIdentity = KeyAgreement.NewKey();
         var privateKey = identity.ExportPkcs8PrivateKey();

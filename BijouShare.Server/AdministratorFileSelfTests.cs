@@ -20,6 +20,7 @@ internal static class AdministratorFileSelfTests
         try
         {
             store.Update(state => { state.Groups.Add(new(groupId, "Restricted writers")); return true; });
+            store.SetInviteOnly(false);
             store.QueueRegistration(registration);
             var device = store.ApproveDevice(deviceId, [StateStore.AdministratorGroupId, groupId], registration.DeviceId);
             store.Update(state => { state.Shares.Add(new(shareId, "NewShare", directory, true)); return true; });

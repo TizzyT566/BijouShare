@@ -37,7 +37,9 @@ const deviceWorkspace = (() => {
     const query = filterable ? draft.filter.trim().toLocaleLowerCase() : '';
     const matches = group => group.name.toLocaleLowerCase().includes(query);
     const choices = state.groups.map(group => `<label data-group-option ${matches(group) ? '' : 'hidden'}><input type="checkbox" name="group" value="${escapeHtml(group.id)}" ${selected.has(group.id) ? 'checked' : ''}><span>${escapeHtml(group.name)}</span></label>`).join('');
-    const block = (pending ? !device.rejected : device.enabled) ? `<button type="button" class="quiet danger device-block" data-delete="${pending ? 'pendingDevices' : 'devices'}" data-id="${escapeHtml(device.id)}" aria-label="Block ${escapeHtml(device.name)}">Block device</button>` : '';
+    const blocked = pending ? device.rejected : !device.enabled;
+    const action = blocked ? 'Forget' : 'Block';
+    const deviceAction = `<button type="button" class="quiet danger device-block" ${blocked ? 'data-remove-record' : 'data-delete'}="${pending ? 'pendingDevices' : 'devices'}" data-id="${escapeHtml(device.id)}" aria-label="${action} device ${escapeHtml(device.name)}">${action} device</button>`;
     return `<form class="device-form" id="device-panel-${safeKey}" data-device-form="${safeKey}" data-kind="${kind}" data-id="${escapeHtml(device.id)}" aria-labelledby="device-name-${safeKey}" aria-busy="${draft.busy}">
       <fieldset class="device-inputs" ${draft.busy ? 'disabled' : ''}><legend class="sr-only">${pending ? 'Device approval' : 'Device settings'}</legend>
         <div class="device-fields">
@@ -56,7 +58,7 @@ const deviceWorkspace = (() => {
           </div>
         </div>
         <p class="error" role="alert">${escapeHtml(draft.error)}</p>
-        <div class="device-form-actions">${block}<button type="button" class="quiet" data-device-cancel>Cancel</button>
+        <div class="device-form-actions">${deviceAction}<button type="button" class="quiet" data-device-cancel>Cancel</button>
           ${inviteRequired ? '' : `<button type="submit" class="primary">${pending ? 'Approve device' : 'Save changes'}</button>`}</div>
       </fieldset>
     </form>`;

@@ -21,6 +21,7 @@ internal static class DeviceStateSelfTests
         }
         var options = new ServerOptions { DataDirectory = Path.Combine(root, "device-state") };
         var store = new StateStore(options);
+        store.SetInviteOnly(false);
         var allow = new AppGroup(Guid.NewGuid(), "Allow");
         var deny = new AppGroup(Guid.NewGuid(), "Deny");
         var share = new ExportShare(Guid.NewGuid(), "Fixture", root, true);
@@ -124,6 +125,7 @@ internal static class DeviceStateSelfTests
             "A returning pending device refreshes last-seen at a bounded persistence interval");
 
         var queue = new StateStore(new ServerOptions { DataDirectory = Path.Combine(root, "queue-bound") });
+        queue.SetInviteOnly(false);
         queue.Update(state =>
         {
             for (var index = 0; index < 256; index++)

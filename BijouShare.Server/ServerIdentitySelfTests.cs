@@ -79,6 +79,7 @@ internal static class ServerIdentitySelfTests
         using var pendingKey = KeyAgreement.NewKey();
         var pendingRequest = TestRegistration.Create("Existing blocked request",
             Convert.ToBase64String(pendingKey.ExportSubjectPublicKeyInfo()));
+        renamed.SetInviteOnly(false);
         renamed.QueueRegistration(pendingRequest);
         renamed.RejectDevice(TestRegistration.RecordId(pendingRequest.DeviceId));
         var statePath = Path.Combine(data, "state.json");
@@ -88,6 +89,11 @@ internal static class ServerIdentitySelfTests
             current.Permissions(device, share.Id, "") == Permission.FullControl,
             "Current state reload retains both device keys, memberships, access rules and rejected requests");
         var validBytes = File.ReadAllBytes(statePath);
+        var previousState = JsonNode.Parse(validBytes)!.AsObject();
+        previousState.Remove("inviteOnly");
+        PrivateStorage.AtomicWrite(statePath, System.Text.Encoding.UTF8.GetBytes(previousState.ToJsonString(Wire.Json)));
+        check(!new StateStore(options).Read(s => s.InviteOnly),
+            "Upgrading a server that predates the invite-only setting preserves manual enrollment");
         var missingId = JsonNode.Parse(validBytes)!;
         missingId.AsObject().Remove("serverId");
         var missingBytes = System.Text.Encoding.UTF8.GetBytes(missingId.ToJsonString(Wire.Json));

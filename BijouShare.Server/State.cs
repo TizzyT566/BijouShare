@@ -49,8 +49,10 @@ public sealed record AccessRule(Guid Id, Guid GroupId, Guid ShareId, string Path
 public sealed record Device(Guid Id, string Name, Guid[] GroupIds, string ClientPublicKey,
     bool Enabled, string PublicIdentity, string ClientMlKemPublicKey)
 {
+    // A legacy enrollment has a stable marker across reloads. Every fresh approval gets a new one.
+    public Guid EnrollmentId { get; init; } = Id;
     public bool HasSameIdentity(Device authenticated) =>
-        Id == authenticated.Id &&
+        Id == authenticated.Id && EnrollmentId == authenticated.EnrollmentId &&
         PublicIdentity == authenticated.PublicIdentity && ClientPublicKey == authenticated.ClientPublicKey &&
         ClientMlKemPublicKey == authenticated.ClientMlKemPublicKey;
 }
@@ -358,6 +360,20 @@ public sealed partial class StateStore
         return true;
     });
 
+    public bool RemoveRejectedRequest(Guid id) => Update(s =>
+    {
+        if (s.PendingDevices.RemoveAll(d => d.Id == id && d.Rejected) == 0)
+            throw new ArgumentException("Only a rejected device request can be removed. Refresh the device list.");
+        return true;
+    });
+
+    public bool RemoveBlockedDevice(Guid id) => Update(s =>
+    {
+        if (s.Devices.RemoveAll(d => d.Id == id && !d.Enabled) == 0)
+            throw new ArgumentException("Only a blocked device can be removed. Refresh the device list.");
+        return true;
+    });
+
     // Fixture construction only; production approval consumes a request through ApproveDevice.
     internal Device Enroll(EnrollmentRequest request, Guid[] groupIds) => Update(s =>
     {
@@ -375,7 +391,10 @@ public sealed partial class StateStore
     private static Device CompleteEnrollment(ServerState state, DeviceBinding binding, string name, Guid[] groups)
     {
         EnsureIdentityAvailable(state, binding);
-        var device = new Device(binding.Id, name, groups.ToArray(), binding.Ecdh, true, binding.Digest, binding.Kem);
+        var device = new Device(binding.Id, name, groups.ToArray(), binding.Ecdh, true, binding.Digest, binding.Kem)
+        {
+            EnrollmentId = Guid.NewGuid()
+        };
         state.PendingDevices.RemoveAll(d => d.ClientPublicKey == binding.Ecdh);
         state.Devices.Add(device);
         return device;
@@ -448,6 +467,7 @@ public sealed partial class StateStore
         {
             var created = new ServerState
             {
+                InviteOnly = true,
                 Groups = [new(AdministratorGroupId, AdministratorGroupName)],
                 ServerName = name,
                 ServerPublicKey = Convert.ToBase64String(publicKey),
@@ -577,8 +597,8 @@ public sealed partial class StateStore
         {
             ValidateName(device.Name);
             ValidateStoredBinding(device.Id, device.ClientPublicKey, device.ClientMlKemPublicKey, device.PublicIdentity);
-            if (device.Id == Guid.Empty)
-                throw new ArgumentException("Missing device ID.");
+            if (device.Id == Guid.Empty || device.EnrollmentId == Guid.Empty)
+                throw new ArgumentException("Missing device or enrollment ID.");
             ValidateGroups(s, device.GroupIds);
         }
         foreach (var pending in s.PendingDevices)

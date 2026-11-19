@@ -93,6 +93,10 @@ internal static class InviteSelfTests
             "Concurrent enrollment atomically consumes the final invite use exactly once");
         Status(() => store.RedeemInvite(Request(), single.Code), "InvalidInvite", "An exhausted invite cannot approve another device");
         var pending = Request("Waiting laptop");
+        Status(() => store.QueueRegistration(pending), "InviteRequired", "A new server requires an invite by default");
+        Check(store.FindPendingDevice(pending.DeviceId) is null && new StateStore(options).Read(s => s.InviteOnly),
+            "The default survives a restart and does not queue uninvited devices");
+        store.SetInviteOnly(false);
         store.QueueRegistration(pending);
         var promoted = store.RedeemInvite(pending, unlimited.Code);
         Check(store.FindPendingDevice(promoted.Id) is null && promoted.GroupIds.SequenceEqual(groups),
@@ -104,7 +108,6 @@ internal static class InviteSelfTests
         store.QueueRegistration(waiting);
         var waitingId = TestRegistration.RecordId(waiting.DeviceId);
         var previousRequest = store.FindPendingDevice(waitingId);
-        Check(!store.Read(s => s.InviteOnly), "Servers initially accept manual enrollment requests");
         store.SetInviteOnly(true);
         Check(new StateStore(options).Read(s => s.InviteOnly), "Invite-only enrollment survives a server restart");
         revision = store.Revision;
@@ -127,6 +130,33 @@ internal static class InviteSelfTests
         var revoked = store.CreateInvite("Revoked", groups, null, null);
         store.RevokeInvite(revoked.Invite.Id);
         Status(() => store.RedeemInvite(Request(), revoked.Code), "InvalidInvite", "A revoked invite cannot approve a device");
+
+        revision = store.Revision;
+        Reject(() => store.RemoveBlockedDevice(promoted.Id), "An enabled device cannot be removed");
+        Reject(() => store.RemoveRejectedRequest(waitingId), "A waiting request cannot be removed");
+        Reject(() => store.RemoveRevokedInvite(unlimited.Invite.Id), "An active invite cannot be removed");
+        Reject(() => store.RemoveRevokedInvite(expired.Invite.Id), "An expired invite must be revoked before removal");
+        Reject(() => store.RemoveRevokedInvite(single.Invite.Id), "An exhausted invite must be revoked before removal");
+        Check(store.Revision == revision, "Ineligible record removal leaves state unchanged");
+        var rejectedId = TestRegistration.RecordId(rejected.DeviceId);
+        store.RemoveBlockedDevice(first.Id);
+        store.RemoveRejectedRequest(rejectedId);
+        store.RemoveRevokedInvite(revoked.Invite.Id);
+        reloaded = new StateStore(options);
+        Check(reloaded.FindRegisteredDevice(first.Id) is null && reloaded.FindPendingDevice(rejectedId) is null &&
+            reloaded.Read(state => state.Invites.All(i => i.Id != revoked.Invite.Id && i.CodeHash != revoked.Invite.CodeHash)),
+            "Removed device, request and invite records stay absent after restart");
+        Status(() => store.QueueRegistration(request), "InviteRequired", "A forgotten blocked device must satisfy the current enrollment policy");
+        Status(() => store.RedeemInvite(Request(), revoked.Code), "InvalidInvite", "Removing a revoked invite never makes the old code usable");
+        var noGroups = store.CreateInvite("Fresh membership", [], 1, null);
+        var reenrolled = store.RedeemInvite(request, noGroups.Code);
+        Check(reenrolled.Id == first.Id && !reenrolled.HasSameIdentity(first) && reenrolled.GroupIds.Length == 0 &&
+            new StateStore(options).Identity(first.Id).HasSameIdentity(reenrolled),
+            "Enrollment with the same keys gets a persistent new session binding and only the new groups");
+        var legacy = Wire.Decode<Device>(Wire.Encode(new { first.Id, first.Name, first.GroupIds, first.ClientPublicKey, first.Enabled,
+            first.PublicIdentity, first.ClientMlKemPublicKey }));
+        Check(legacy.EnrollmentId == legacy.Id && Wire.Decode<Device>(Wire.Encode(legacy)).HasSameIdentity(legacy) &&
+            !legacy.HasSameIdentity(reenrolled), "Older approved device records retain a stable enrollment binding across reloads");
 
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         using var audit = new AuditLog(store, NullLogger<AuditLog>.Instance);
@@ -279,6 +309,37 @@ internal static class InviteSelfTests
                 Check(store.ApproveDevice(waitingId, groups, waiting.DeviceId).Enabled &&
                     !new StateStore(options).Read(s => s.InviteOnly),
                     "Disabling invite-only enrollment restores manual approval of earlier requests and persists the decision");
+                Check(!store.QueueRegistration(rejected) && store.FindPendingDevice(rejectedId) is { Rejected: false },
+                    "A forgotten rejected fingerprint can submit a fresh request when manual enrollment is enabled");
+
+                using var oldSocket = new TcpClient();
+                using var oldTransport = await AuthenticatedClient.ConnectDeviceAsync(oldSocket, "127.0.0.1", options.Port,
+                    id, "Invited network laptop", privateKey, identityKem, deadline.Token, store.ServerId);
+                using var oldSession = new RpcClientSession(oldTransport);
+                var oldHandle = await oldSession.CallAsync(new() { Operation = "Open", Path = "/Team/example.txt",
+                    Access = AccessMask.ReadData, Share = FileShare.ReadWrite }, deadline.Token);
+                var previous = store.FindRegisteredDevice(id)!;
+                store.Update(state =>
+                {
+                    var index = state.Devices.FindIndex(d => d.Id == previous.Id);
+                    return state.Devices[index] = state.Devices[index] with { Enabled = false };
+                });
+                store.RemoveBlockedDevice(previous.Id);
+                using var newSocket = new TcpClient();
+                using var newTransport = await AuthenticatedClient.ConnectDeviceAsync(newSocket, "127.0.0.1", options.Port,
+                    id, "Re-enrolled laptop", privateKey, identityKem, deadline.Token, store.ServerId, unlimited.Code);
+                using var newSession = new RpcClientSession(newTransport);
+                Check((await newSession.CallAsync(new() { Operation = "List" }, deadline.Token)).Entries!.Any(e => e.Name == "Team"),
+                    "A fresh authenticated session can use the groups granted on re-enrollment");
+                try
+                {
+                    await oldSession.CallAsync(new() { Operation = "Read", Handle = oldHandle.Handle, Count = 1 }, deadline.Token);
+                    throw new InvalidOperationException("A prior session read an old handle after the same fingerprint re-enrolled.");
+                }
+                catch (RemoteException ex) when (ex.Code == "AccessDenied")
+                {
+                    Check(true, "An authenticated session and open handle from a removed enrollment stay revoked after re-enrollment");
+                }
             }
             finally { CryptographicOperations.ZeroMemory(privateKey); }
         }

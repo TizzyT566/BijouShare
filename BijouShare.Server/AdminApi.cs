@@ -190,6 +190,8 @@ public static class AdminApi
             }));
         api.MapDelete("/invites/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "RevokeInvite", id.ToString(), () => { store.RevokeInvite(id); return true; }));
+        api.MapDelete("/invites/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "RemoveRevokedInvite", id.ToString(), () => store.RemoveRevokedInvite(id)));
         api.MapPut("/shares/{id:guid}", (Guid id, ExportShare share, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "Share", share.Name, () => store.Update(s =>
             {
@@ -241,6 +243,10 @@ public static class AdminApi
             }));
         api.MapDelete("/pending-devices/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "RejectDevice", id.ToString(), () => { store.RejectDevice(id); return true; }));
+        api.MapDelete("/pending-devices/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "RemoveRejectedRequest", id.ToString(), () => store.RemoveRejectedRequest(id)));
+        api.MapDelete("/devices/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "RemoveBlockedDevice", id.ToString(), () => store.RemoveBlockedDevice(id)));
         api.MapPut("/devices/{id:guid}", (Guid id, DeviceUpdate update, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "Device", id.ToString(), () => store.Update(s =>
             {
