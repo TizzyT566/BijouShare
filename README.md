@@ -28,7 +28,7 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 
 ### Device enrollment and invites
 
-- **Connect from a link.** Open a `wad://` link from a webpage or paste it into the client console for a specific drive. Links carry the full server fingerprint and can include an invite code.
+- **Connect with a Web Attached Drive (WAD) link.** Open a `wad://` link from a webpage or paste it into the client console to connect a server to a drive letter you choose. The link carries the full server fingerprint and an optional invite code. Once connected, the client transfers files over BijouShare’s encrypted connection.
 - **Approve devices manually.** Review a pending device’s name, fingerprint, and first and last contact times. Choose its groups when approving it. To remove a blocked device or rejected request, expand its name in **Devices** and select **Forget device**. This clears the block and discards any previous group memberships. The device must enroll again under the current enrollment policy.
 - **Issue several invites at once.** Assign groups to each invite, choose a use limit or unlimited uses, and set an expiration or let it run indefinitely. Copy the code when it is issued. In **Invites**, select **Remove** beside a **Used up** or **Revoked** invite to clear its record. To retire a code that still has uses remaining, select **Revoke** first. Devices already enrolled keep their groups.
 - **Require an invite for new devices.** New servers start in invite-only mode. A new device needs a valid invite to enroll. The client explains a rejection in its console and sends a tray notification. Previously approved devices can reconnect with their existing identity.
