@@ -21,7 +21,7 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 ### Windows drives and file operations
 
 - **Share a file, folder, or entire drive.** Give each share a display name and enable or disable it from the server console.
-- **Use fixed drive letters in Explorer and Windows apps.** Client setup starts with zero drives. Add available letters as needed and choose which servers belong on each drive.
+- **Use fixed drive letters in Explorer and Windows apps.** Client setup starts with zero drives. Choose a letter and a name for each drive, then add its servers. Rename a drive in File Explorer or on its tab in the client console. Existing drives keep the name BijouShare until you rename them.
 - **Browse several servers on one drive.** Each server gets a folder named `ServerName_First16FingerprintCharacters`, with its shares underneath.
 - **Manage files in place.** Browse and copy files, create folders, edit or resize files, rename items, and delete them according to the device’s permissions. Applications can also read and set supported attributes and timestamps.
 - **Coordinate simultaneous access.** Multiple readers can open a file. The server allows one writable handle per file, honors Windows sharing flags, and supports byte-range locks.
@@ -37,6 +37,7 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 ### Groups and permissions
 
 - **Assign access through groups.** A device can belong to several groups. Devices with no groups have no share access. Manage memberships from **Devices** and edit share permissions directly from **Groups**.
+- **Set permissions for current and future shares.** In **Groups**, choose **All (built-in)** to cover every current and future share. Access applies only while a share is enabled. Select **Include files and folders below this path** to cover its contents as well. Explicit denies take precedence. The built-in target adds no folder in Explorer. A physical share named **All** remains individually selectable and appears at its usual path.
 - **Scope rules by path.** Apply a rule to a whole share, one file or folder, or a folder and its descendants. The server combines matching grants across groups, and explicit denies take precedence.
 - **Separate editing from deletion.** Control listing, reading and writing data, creating files and folders, renaming, deleting, reading and changing attributes, and reading permissions. The **Read and write** preset lets devices create and edit while leaving rename and delete as separate choices.
 - **Grant administrator access explicitly.** The permanent **Administrator** group grants full control on enabled shares, including newly added ones. Matching denies from another group still apply. Membership requires manual assignment and is unavailable through invites.
@@ -94,10 +95,10 @@ flowchart LR
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.22-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.24-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.22-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive** and pick an unused letter.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.24-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.
@@ -113,7 +114,7 @@ For unattended installation, run either installer from an elevated terminal with
 To switch an **already installed** server to the built-in local Windows Administrator account, finish any active transfers and run this from the folder containing Server Setup:
 
 ```powershell
-.\BijouShare.Server-2.0.22-win-x64-Setup.exe /serviceaccount
+.\BijouShare.Server-2.0.24-win-x64-Setup.exe /serviceaccount
 ```
 
 Approve elevation and enter the displayed account’s Windows password. Setup checks that Windows permits a service logon, changes the account, restarts the server, and reports when it is running. The built-in Administrator must be enabled and have a password. Setup recognizes a renamed account by its Windows identity. The web console has its own administrator login.

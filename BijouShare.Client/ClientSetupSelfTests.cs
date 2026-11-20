@@ -166,13 +166,13 @@ internal static class ClientSetupSelfTests
         saved.AddServer("127.0.0.1", 7443, null);
         check(saved.ForServer(saved.ServerSnapshot()[0]).GetInviteCode() is null && saved.ServerSnapshot()[0].TrustedServerId == fingerprint,
             "A plain connection link clears the earlier invite and retains verified trust");
-        saved.AddDrive("N:");
+        saved.AddDrive("N:", "Primary");
         check(saved.ServerSnapshot(@"N:\").Length == 1, "The first explicit drive receives the staged server");
         saved.RemoveServer("127.0.0.1", 7443);
         saved = ClientSettings.Load(path);
         check(saved.SetupComplete && saved.ServerSnapshot().Length == 0 && saved.DeviceId == id,
             "Removing the last server persists an empty configured drive");
-        saved.AddDrive("P:");
+        saved.AddDrive("P:", "Archive");
         saved.AddServer("nas", 7443, null, trustedServerId: fingerprint);
         try
         {
@@ -191,7 +191,14 @@ internal static class ClientSetupSelfTests
         saved.RemoveServer("nas", 7443);
         saved.RemoveDrive("N:");
         saved = ClientSettings.Load(path);
-        check(saved.DriveSnapshot().SequenceEqual(["P:\\"]) && saved.ServerSnapshot("P:\\").Single().Host == "archive",
-            "Removing the empty primary drive preserves the promoted drive's servers");
+        check(saved.DriveSnapshot().SequenceEqual(["P:\\"]) && saved.GetDriveName("P:") == "Archive" &&
+            saved.DriveNames.Count == 1 && saved.ServerSnapshot("P:\\").Single().Host == "archive",
+            "Removing the empty primary drive preserves the promoted drive's name and servers");
+        var legacy = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(path))!.AsObject();
+        legacy.Remove("driveNames");
+        File.WriteAllText(path, legacy.ToJsonString());
+        saved = ClientSettings.Load(path);
+        check(saved.GetDriveName("P:") == ClientSettings.DefaultDriveName,
+            "Existing profiles without labels retain the original BijouShare volume name");
     }
 }

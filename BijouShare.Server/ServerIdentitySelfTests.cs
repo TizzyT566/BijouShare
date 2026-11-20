@@ -150,7 +150,7 @@ internal static class ServerIdentitySelfTests
         var oldOptions = new ServerOptions { DataDirectory = Path.Combine(root, "unsupported-state") };
         PrivateStorage.SecureDirectory(oldOptions.DataDirectory);
         var oldPath = Path.Combine(oldOptions.DataDirectory, "state.json");
-        foreach (var unsupported in new[] { "{}", "{\"schemaVersion\":1}", "{\"schemaVersion\":5}", "{\"schemaVersion\":7}" })
+        foreach (var unsupported in new[] { "{}", "{\"schemaVersion\":1}", "{\"schemaVersion\":5}", "{\"schemaVersion\":8}" })
         {
             var input = System.Text.Encoding.UTF8.GetBytes(unsupported);
             PrivateStorage.AtomicWrite(oldPath, input);

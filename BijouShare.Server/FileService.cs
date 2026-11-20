@@ -941,7 +941,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                             return (Permission.None, Permission.None);
                         var allow = Permission.None;
                         var deny = Permission.None;
-                        foreach (var rule in s.Rules.Where(x => x.GroupId == group.Id && x.ShareId == scope.Share.Id))
+                        foreach (var rule in s.Rules.Where(x => x.GroupId == group.Id && x.AppliesToShare(scope.Share.Id)))
                         {
                             var matching = rule.MatchingPermissions(relative);
                             allow |= matching.Allow;

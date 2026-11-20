@@ -62,6 +62,7 @@ public static class BackendSelfTests
         Reject(() => store.Enroll(TestRegistration.Create("Unknown group device", Convert.ToBase64String(unknownUserKey.ExportSubjectPublicKeyInfo())), [Guid.NewGuid()]), "Approval cannot bind an unknown group");
         var loaded = new StateStore(options);
         Check(loaded.Identity(device.Id).HasSameIdentity(device), "Device key pairs survive validated state reloads");
+        AllSharesRegressions(store, group, device, Check, Reject);
         DeviceStateSelfTests.Run(root, Check);
 
         using var replacement = KeyAgreement.NewKey();
@@ -87,6 +88,60 @@ public static class BackendSelfTests
         foreach (var path in new[] { @"\\server\share", @"\\?\C:\share", @"C:\file:stream", "relative" })
             Reject(() => StateStore.NormalizeLocalSharePath(path), "Unsupported share roots fail before filesystem access: " + path);
         Console.WriteLine($"Backend: {count} checks passed.");
+    }
+
+    private static void AllSharesRegressions(StateStore store, AppGroup group, Device device,
+        Action<bool, string> check, Action<Action, string> reject)
+    {
+        var first = new ExportShare(Guid.NewGuid(), "All", @"C:\Alpha", true);
+        var next = new ExportShare(Guid.NewGuid(), "Beta", @"C:\Beta", true);
+        var baseline = new AccessRule(Guid.NewGuid(), group.Id, StateStore.AllSharesId, "",
+            Permission.FullControl & ~Permission.Delete, Permission.Delete, true);
+        var exception = new AccessRule(Guid.NewGuid(), group.Id, first.Id, "private", Permission.Delete, Permission.ReadData, true);
+        store.Update(s => { s.Shares.Add(first); return true; });
+        check(store.Permissions(device, first.Id, "") == Permission.None, "All carries no implicit permissions");
+        store.Update(s => { s.Rules.AddRange([baseline, exception]); return true; });
+        store.Update(s => { s.Shares.Add(next); return true; });
+        check(store.Permissions(device, first.Id, "private/file") == (Permission.FullControl & ~(Permission.Delete | Permission.ReadData)) &&
+            store.Permissions(device, next.Id, "private/file") == (Permission.FullControl & ~Permission.Delete),
+            "A real share named All can have its own deny, while the aggregate All rule covers future shares");
+        check(store.Permissions(device with { GroupIds = [group.Id, StateStore.AdministratorGroupId] }, next.Id, "") ==
+            (Permission.FullControl & ~Permission.Delete), "All denies still apply to Administrator group members");
+        reject(() => store.Update(s => { s.Rules.Add(baseline with { Id = Guid.NewGuid() }); return true; }),
+            "A group cannot have duplicate All permission assignments");
+        reject(() => store.Update(s => { s.Rules[0] = baseline with { Path = "private" }; return true; }),
+            "All rules reject ambiguous named paths");
+        reject(() => store.Update(s => { s.Shares.Add(first with { Name = "Alias", Id = StateStore.AllSharesId }); return true; }),
+            "A physical path cannot claim the All share identifier");
+        store.Update(s =>
+        {
+            s.Rules[0] = baseline with { Inherit = false };
+            s.Shares[1] = next with { Enabled = false };
+            return true;
+        });
+        check(store.Permissions(device, first.Id, "") != Permission.None && store.Permissions(device, first.Id, "child") == Permission.None &&
+            store.Permissions(device, next.Id, "") == Permission.None, "Root-only All rules honor inheritance and disabled exports");
+
+        var options = new ServerOptions { DataDirectory = Path.Combine(store.DataDirectory, "legacy-share-policy") };
+        PrivateStorage.SecureDirectory(options.DataDirectory);
+        var statePath = Path.Combine(options.DataDirectory, "state.json");
+        var legacy = store.Read(s => Wire.Decode<ServerState>(Wire.Encode(s)));
+        legacy.SchemaVersion = 6;
+        legacy.Shares = [first with { Id = StateStore.AllSharesId, Name = "aLL" }, next];
+        legacy.Rules = [baseline];
+        PrivateStorage.AtomicWrite(statePath, Wire.Encode(legacy));
+        var migrated = new StateStore(options);
+        var rekeyed = migrated.Read(s => s.Shares.Single(share => share.LocalPath == first.LocalPath));
+        check(rekeyed.Name == "aLL" && rekeyed.Id != StateStore.AllSharesId &&
+            migrated.Permissions(device, rekeyed.Id, "child") == (Permission.FullControl & ~Permission.Delete) &&
+            migrated.Permissions(device, next.Id, "") == Permission.None &&
+            new StateStore(options).Read(s => s.Shares.Contains(rekeyed) && s.Rules.Single().ShareId == rekeyed.Id),
+            "Upgrade preserves an existing All export's name, data path and scoped rules even if its ID collides");
+        legacy.Shares.RemoveAt(0);
+        var invalid = Wire.Encode(legacy);
+        PrivateStorage.AtomicWrite(statePath, invalid);
+        reject(() => _ = new StateStore(options), "A legacy orphan rule cannot become an All grant during upgrade");
+        check(File.ReadAllBytes(statePath).SequenceEqual(invalid), "Invalid legacy state is preserved unchanged");
     }
 
     private static void AuditLifecycleRegressions(string root, Action<bool, string> check)

@@ -9,6 +9,7 @@ internal static class AdministratorFileSelfTests
     public static void Run(string root, StateStore store, FileService files, Action<bool, string> check)
     {
         var shareId = Guid.NewGuid();
+        var namedAllId = Guid.NewGuid();
         var groupId = Guid.NewGuid();
         var session = Guid.NewGuid();
         var directory = Directory.CreateDirectory(Path.Combine(root, "administrator-files")).FullName;
@@ -25,6 +26,15 @@ internal static class AdministratorFileSelfTests
             var device = store.ApproveDevice(deviceId, [StateStore.AdministratorGroupId, groupId], registration.DeviceId);
             store.Update(state => { state.Shares.Add(new(shareId, "NewShare", directory, true)); return true; });
             RpcResponse Call(RpcRequest request) => files.Execute(session, deviceId, request, device);
+
+            check(Call(new() { Operation = "List" }).Entries!.All(entry => entry.Name != "All"),
+                "The built-in All permission target never appears in the mounted server root");
+            var namedAll = Directory.CreateDirectory(Path.Combine(root, "physical-all")).FullName;
+            File.WriteAllText(Path.Combine(namedAll, "physical.txt"), "physical share");
+            store.Update(state => { state.Shares.Add(new(namedAllId, "All", namedAll, true)); return true; });
+            check(Call(new() { Operation = "List" }).Entries!.Count(entry => entry.Name == "All") == 1 &&
+                Call(new() { Operation = "List", Path = "/All" }).Entries!.Single().Name == "physical.txt",
+                "A physical share named All exposes only its own directory through the file service");
 
             var listed = Call(new() { Operation = "List" }).Entries!.Single(entry => entry.Name == "NewShare");
             var opened = Call(new()
@@ -105,7 +115,7 @@ internal static class AdministratorFileSelfTests
                 state.Devices.RemoveAll(item => item.Id == deviceId);
                 state.PendingDevices.RemoveAll(item => item.Id == deviceId);
                 state.Groups.RemoveAll(item => item.Id == groupId);
-                state.Shares.RemoveAll(item => item.Id == shareId);
+                state.Shares.RemoveAll(item => item.Id == shareId || item.Id == namedAllId);
                 state.Rules.RemoveAll(item => item.ShareId == shareId);
                 return true;
             });

@@ -57,30 +57,54 @@ function newDriveView(mountPoint) {
   tab.id = 'tab-' + id;
   tab.setAttribute('role', 'tab');
   tab.setAttribute('aria-controls', id);
-  const title = 'Drive ' + mountPoint.slice(0, 2);
-  tab.setAttribute('aria-label', title);
   const icon = document.createElement('span');
   icon.className = 'bi bi-drives';
   icon.setAttribute('aria-hidden', 'true');
   const label = document.createElement('span');
-  const prefix = document.createElement('span');
-  prefix.className = 'tab-drive-prefix';
-  prefix.textContent = 'Drive ';
-  label.append(prefix, mountPoint.slice(0, 2));
-  tab.append(icon, label);
+  label.className = 'tab-drive-name';
+  const letter = document.createElement('span');
+  letter.textContent = mountPoint.slice(0, 2);
+  letter.className = 'tab-drive-letter';
+  tab.append(icon, label, letter);
   $('#drive-tabs').append(tab);
 
   const panel = $('#drive-template').content.firstElementChild.cloneNode(true);
   panel.id = id;
   panel.dataset.mountPoint = mountPoint;
   panel.setAttribute('aria-labelledby', tab.id);
-  panel.querySelector('.drive-title').textContent = title;
+  const rename = panel.querySelector('.rename-drive');
+  const form = panel.querySelector('.rename-drive-form');
+  form.id = id + '-rename';
+  rename.setAttribute('aria-controls', form.id);
+  function toggleRename(open) {
+    form.hidden = !open;
+    rename.setAttribute('aria-expanded', String(open));
+    if (open) {
+      form.elements.name.value = label.textContent;
+      form.querySelector('.rename-error').textContent = '';
+      form.elements.name.focus();
+      form.elements.name.select();
+    } else rename.focus();
+  }
+  rename.addEventListener('click', () => toggleRename(form.hidden));
+  form.querySelector('.cancel-rename').addEventListener('click', () => toggleRename(false));
+  form.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); toggleRename(false); }
+  });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    await submit(form.querySelector('[type="submit"]'), form.querySelector('.rename-error'), async () => {
+      render(await api('/drives', 'PUT', {mountPoint, name:form.elements.name.value}));
+      toggleRename(false);
+      toast('Drive renamed.');
+    });
+  });
   const remove = panel.querySelector('.remove-drive');
   remove.setAttribute('aria-label', 'Remove drive ' + mountPoint.slice(0, 2));
   panel.querySelector('.remove-help').id = id + '-remove-help';
   remove.setAttribute('aria-describedby', id + '-remove-help');
   $('#drive-panels').append(panel);
-  return {tab, panel, signature:''};
+  return {tab, label, panel, signature:''};
 }
 
 function selectView(id, remember = true) {
@@ -91,7 +115,7 @@ function selectView(id, remember = true) {
     tab.setAttribute('aria-selected', String(selected));
     tab.tabIndex = selected ? 0 : -1;
     document.getElementById(panelId).hidden = !selected;
-    if (selected) $('#view-name').textContent = tab.textContent.trim();
+    if (selected) $('#view-name').textContent = tab.getAttribute('aria-label') || tab.textContent.trim();
   }
   $('#refresh').hidden = !id.startsWith('drive-');
   if (remember) history.replaceState(null, '', '#' + id);
@@ -102,6 +126,12 @@ function renderDrive(view, drive, servers) {
   const signature = JSON.stringify([drive, servers, state.mountPoint, state.drives.length]);
   if (signature === view.signature) return;
   view.signature = signature;
+  const name = drive.name ?? 'BijouShare';
+  const title = name + ' (' + drive.mountPoint.slice(0, 2) + ')';
+  view.label.textContent = name;
+  view.tab.title = title;
+  view.tab.setAttribute('aria-label', title);
+  panel.querySelector('.drive-title').textContent = title;
   panel.querySelector('.drive-status').textContent = drive.error ? 'Mount needs attention' : drive.mounted ? 'Mounted in File Explorer' : 'Mounting…';
   panel.querySelector('.mount-icon').className = 'mount-icon bi bi-' + (drive.error ? 'alert' : drive.mounted ? 'check' : 'clock');
   const notice = panel.querySelector('.drive-notice');
@@ -315,7 +345,8 @@ $('#add-drive').addEventListener('submit', async event => {
   const mountPoint = $('#new-letter').value;
   if (!mountPoint) return;
   await submit($('#add-drive-button'), $('#drives-error'), async () => {
-    render(await api('/drives', 'POST', {mountPoint}));
+    render(await api('/drives', 'POST', {mountPoint, name:$('#new-drive-name').value}));
+    $('#new-drive-name').value = '';
     const view = driveViews.get(mountPoint);
     if (view) {
       selectView(view.panel.id);

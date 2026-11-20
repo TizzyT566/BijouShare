@@ -86,12 +86,11 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         try
         {
             using var changes = new ConnectionChangeMonitor(logger);
-            var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>());
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    await MountAsync(dokan, mountPoint, connection, operations, changes, token);
+                    await MountAsync(dokan, mountPoint, connection, changes, token);
                 }
                 catch (Exception exception) when (!token.IsCancellationRequested)
                 {
@@ -105,22 +104,27 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         finally { driveState.Remove(mountPoint); }
     }
 
-    private async Task MountAsync(Dokan dokan, string mountPoint, MultiServerConnection connection, DriveOperations operations,
+    private async Task MountAsync(Dokan dokan, string mountPoint, MultiServerConnection connection,
         ConnectionChangeMonitor changes, CancellationToken stoppingToken)
     {
         if (Directory.GetLogicalDrives().Any(drive => drive.Equals(mountPoint, StringComparison.OrdinalIgnoreCase)))
             throw new IOException($"Drive {mountPoint} is already in use. Choose an unused drive letter.");
+        var initialName = settings.GetDriveName(mountPoint);
+        var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>(), initialName);
         using var instance = await CreateMountAsync(dokan, mountPoint, operations, stoppingToken);
+        using var label = new MountedDriveLabel(mountPoint, initialName);
 
         driveState.SetMounted(mountPoint);
         using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var heartbeat = HeartbeatAsync(connection, changes, heartbeatCancellation.Token);
         try
         {
-            await MonitorMountAsync(connection, instance, mountPoint, changes, stoppingToken);
+            await MonitorMountAsync(connection, instance, mountPoint, changes, label, stoppingToken);
         }
         finally
         {
+            if (instance.IsFileSystemRunning() && settings.DriveSnapshot().Contains(mountPoint))
+                label.Synchronize(settings, logger);
             driveState.Remove(mountPoint);
             await heartbeatCancellation.CancelAsync();
             try { await heartbeat; }
@@ -175,8 +179,8 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         entries.MoveNext();
     }
 
-    private static async Task MonitorMountAsync(MultiServerConnection connection, DokanInstance instance, string mountPoint,
-        ConnectionChangeMonitor changes, CancellationToken token)
+    private async Task MonitorMountAsync(MultiServerConnection connection, DokanInstance instance, string mountPoint,
+        ConnectionChangeMonitor changes, MountedDriveLabel label, CancellationToken token)
     {
         var previous = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var absentSamples = 0;
@@ -212,6 +216,8 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 }
                 nextRootCheck = Environment.TickCount64 + (failedRootCheck ? 2_000 : 15_000);
             }
+            if (absentSamples == 0)
+                label.Synchronize(settings, logger);
             var current = connection.MountedServerFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var removed in previous.Except(current, previous.Comparer).ToArray())
                 if (instance.NotifyDelete(Path.Combine(mountPoint, removed), true))

@@ -27,17 +27,21 @@ function groupNameForm(edit, creating) {
     <button class="primary" type="submit">${creating ? 'Create group' : 'Save name'}</button>${groupButton('cancel', 'Cancel')}</form>`;
 }
 
+function targetName(target) {
+  return target.isAggregate ? target.name + ' (built-in)' : target.name;
+}
+
 function ruleSummary(rule, editing) {
   const share = state.shares.find(share => share.id === rule.shareId);
-  return `<section class="group-rule" aria-label="${escapeHtml(share.name)} permissions">
-    <div class="group-rule-heading"><h3>${icon('folder')}${escapeHtml(share.name)}${share.enabled ? '' : '<span class="pill off">Disabled</span>'}</h3>
+  return `<section class="group-rule" aria-label="${escapeHtml(targetName(share))} permissions">
+    <div class="group-rule-heading"><h3>${icon('folder')}${escapeHtml(targetName(share))}${share.enabled ? '' : '<span class="pill off">Disabled</span>'}</h3>
     <div class="group-actions">${groupButton('edit-rule', 'Edit rule', {ruleId: rule.id, disabled: editing})}${groupButton('delete-rule', 'Delete rule', {ruleId: rule.id, disabled: editing})}</div></div>
-    <ul class="group-path-list">${[rule, ...rule.additionalScopes].map(scope => `<li><div><strong>${escapeHtml(scope.path || 'Share root')}</strong><small>${scope.inherit ? 'Includes descendants' : 'This path only'}</small></div>
+    <ul class="group-path-list">${[rule, ...rule.additionalScopes].map(scope => `<li><div><strong>${escapeHtml(scope.path || (share.isAggregate ? 'Every share root' : 'Share root'))}</strong><small>${scope.inherit ? 'Includes descendants' : 'This path only'}</small></div>
     <div><small>Allow</small> ${escapeHtml(permissionText(scope.allow))}</div><div><small>Deny</small> ${escapeHtml(permissionText(scope.deny))}</div></li>`).join('')}</ul></section>`;
 }
 
 function ruleOptions(items, id) {
-  return items.map(item => `<option value="${escapeHtml(item.id)}"${item.id === id ? ' selected' : ''}>${escapeHtml(item.name)}${item.enabled === false ? ' (disabled)' : ''}</option>`).join('');
+  return items.map(item => `<option value="${escapeHtml(item.id)}"${item.id === id ? ' selected' : ''}>${escapeHtml(targetName(item))}${item.enabled === false ? ' (disabled)' : ''}</option>`).join('');
 }
 
 function permissionMatrix(scope) {
@@ -49,18 +53,17 @@ function permissionMatrix(scope) {
     }).join('')}</tbody></table>`).join('')}</div>`;
 }
 
-function ruleForm(edit) {
+function ruleForm(groupId, edit) {
   const scope = edit.scopes[edit.index];
-  const shares = groupShares(edit.groupId, edit.id);
-  const groups = edit.existing ? state.groups.filter(group => !group.isAdministrator && groupShares(group.id, edit.id).length) : [];
-  const validGroup = state.groups.some(group => !group.isAdministrator && group.id === edit.groupId);
-  const invalidTarget = !validGroup || !shares.some(share => share.id === edit.shareId);
+  const shares = groupShares(groupId, edit.id);
+  const invalidTarget = !shares.some(share => share.id === edit.shareId);
+  const aggregate = shares.some(share => share.id === edit.shareId && share.isAggregate);
   return `<form class="group-rule-form" data-group-form="rule" aria-label="${edit.existing ? 'Edit' : 'Add'} permission rule">
-    <div class="group-rule-fields">${edit.existing ? `<label>Group<select name="ruleGroup" required>${!groups.some(group => group.id === edit.groupId) ? '<option value="">Choose a group</option>' : ''}${ruleOptions(groups, edit.groupId)}</select></label>` : ''}<label>Share<select name="ruleShare" required>${invalidTarget ? '<option value="">Choose a share</option>' : ''}${ruleOptions(shares, edit.shareId)}</select></label></div>
+    <div class="group-rule-fields"><label>Share<select name="ruleShare" required>${invalidTarget ? '<option value="">Choose a share</option>' : ''}${ruleOptions(shares, edit.shareId)}</select></label></div>
     <div class="group-scope-editor"><div class="group-scope-nav"><h3>Paths</h3><div class="group-scope-list" role="group" aria-label="Permission paths">${edit.scopes.map((item, index) =>
-      `<button type="button" data-group-action="scope" data-scope-index="${index}" aria-pressed="${index === edit.index}"><strong>${escapeHtml(item.path || 'Share root')}</strong><small>${item.inherit ? 'Includes descendants' : 'This path only'}</small></button>`).join('')}</div>${groupButton('add-path', `${icon('plus')}Add path`)}</div>
-    <div class="group-scope-fields"><div class="group-scope-heading"><label>Relative path<input name="rulePath" value="${escapeHtml(scope.path)}" maxlength="2048" placeholder="Share root" spellcheck="false"></label>
-    ${edit.scopes.length > 1 ? groupButton('remove-path', 'Remove path') : ''}</div><p class="hint">Leave empty for the share root. Separate folders with /.</p>
+      `<button type="button" data-group-action="scope" data-scope-index="${index}" aria-pressed="${index === edit.index}"><strong>${escapeHtml(item.path || (aggregate ? 'Every share root' : 'Share root'))}</strong><small>${item.inherit ? 'Includes descendants' : 'This path only'}</small></button>`).join('')}</div>${aggregate ? '' : groupButton('add-path', `${icon('plus')}Add path`)}</div>
+    <div class="group-scope-fields"><div class="group-scope-heading">${aggregate ? '' : `<label>Relative path<input name="rulePath" value="${escapeHtml(scope.path)}" maxlength="2048" placeholder="Share root" spellcheck="false"></label>`}
+    ${edit.scopes.length > 1 ? groupButton('remove-path', 'Remove path') : ''}</div><p class="hint">${aggregate ? 'This rule applies to every current and future share. Select an individual share to set permissions on a specific path.' : 'Leave empty for the share root. Separate folders with /.'}</p>
     <label class="check"><input type="checkbox" name="descendants"${scope.inherit ? ' checked' : ''}>Include files and folders below this path</label>
     <div class="group-presets" role="group" aria-label="Replace path permissions"><span>Presets</span>${[['read','Read only'],['write','Read and write'],['full','Full control'],['clear','Clear']].map(([value, label]) =>
       `<button type="button" data-group-action="preset" data-preset-value="${value}"${value === 'write' ? ' title="Includes creating and editing. Excludes delete and rename."' : ''}>${label}</button>`).join('')}</div>
@@ -71,7 +74,9 @@ function ruleForm(edit) {
 function groupDeletion(group, rules, edit, members) {
   const isGroup = edit.kind === 'delete-group';
   const invites = state.invites.filter(invite => invite.groupIds.includes(group.id)).length;
-  const name = isGroup ? group.name : nameOf(state.shares, rules.find(rule => rule.id === edit.id)?.shareId);
+  const rule = rules.find(rule => rule.id === edit.id);
+  const share = state.shares.find(share => share.id === rule?.shareId);
+  const name = isGroup ? group.name : share ? targetName(share) : 'share';
   const detail = isGroup
     ? `Deleting this group removes ${groupCount(rules.length, 'rule')} and its membership from ${groupCount(members, 'device')} and ${groupCount(invites, 'invite')}.`
     : 'Removing a deny can grant access through another matching rule.';
@@ -92,11 +97,10 @@ function renderGroup(group) {
     else {
       const shares = groupShares(group.id);
       detail = `<div class="group-rule-heading"><h3>Share permissions</h3>${groupButton('add-rule', `${icon('plus')}Add rule`, { disabled: Boolean(edit) || !shares.length })}</div>`;
-      if (!state.shares.length) detail += '<p class="group-note">Add a <a href="#shares">share</a> to assign permissions.</p>';
-      else if (!rules.length && !addingRule) detail += '<p class="group-note">This group has no share permissions.</p>';
-      if (addingRule) detail += ruleForm(edit);
+      if (!rules.length && !addingRule) detail += '<p class="group-note">This group has no share permissions.</p>';
+      if (addingRule) detail += ruleForm(group.id, edit);
       for (const rule of rules) {
-        if (edit?.kind === 'rule' && edit.id === rule.id) detail += ruleForm(edit);
+        if (edit?.kind === 'rule' && edit.id === rule.id) detail += ruleForm(group.id, edit);
         else {
           detail += ruleSummary(rule, Boolean(edit));
           if (edit?.kind === 'delete-rule' && edit.id === rule.id) detail += groupDeletion(group, rules, edit, members);
@@ -162,8 +166,8 @@ function startRule(key, rule) {
   const empty = {path: '', inherit: true, allow: 0, deny: 0};
   const scopes = rule ? [rule, ...rule.additionalScopes].map(({path, inherit, allow, deny}) => ({path, inherit, allow, deny})) : [empty];
   const available = groupShares(key);
-  return {kind: 'rule', existing: Boolean(rule), id: rule?.id ?? crypto.randomUUID(), groupId: key,
-    shareId: rule?.shareId ?? (available.length === 1 ? available[0].id : ''), scopes, index: 0};
+  return {kind: 'rule', existing: Boolean(rule), id: rule?.id ?? crypto.randomUUID(),
+    shareId: rule?.shareId ?? (available.length === 1 && !available[0].isAggregate ? available[0].id : ''), scopes, index: 0};
 }
 
 function applyGroupPreset(scope, preset) {
@@ -248,12 +252,15 @@ groupsContent.addEventListener('input', event => {
   switch (input.name) {
     case 'rulePath': scope.path = input.value; current.querySelector('strong').textContent = scope.path || 'Share root'; break;
     case 'descendants': scope.inherit = input.checked; current.querySelector('small').textContent = scope.inherit ? 'Includes descendants' : 'This path only'; break;
-    case 'ruleShare': edit.shareId = input.value; row.querySelector('.group-save [type="submit"]').disabled = !input.value; break;
-    case 'ruleGroup': {
-      edit.groupId = input.value;
-      const shares = groupShares(edit.groupId, edit.id);
-      if (!shares.some(share => share.id === edit.shareId)) edit.shareId = shares.length === 1 ? shares[0].id : '';
-      refreshGroupEditor(key, '[name="ruleGroup"]');
+    case 'ruleShare': {
+      const target = state.shares.find(share => share.id === input.value);
+      if (target?.isAggregate && (edit.scopes.length > 1 || edit.scopes[0].path)) {
+        input.value = edit.shareId;
+        row.querySelector('.group-error').textContent = 'To switch this rule to All, remove additional paths and clear the relative path first.';
+        break;
+      }
+      edit.shareId = input.value;
+      refreshGroupEditor(key, '[name="ruleShare"]');
       break;
     }
     case 'allow':
@@ -299,8 +306,7 @@ groupsContent.addEventListener('submit', async event => {
       message = key === 'new' ? 'Group created.' : 'Group renamed.';
     } else if (edit.kind === 'rule') {
       const [first, ...additionalScopes] = edit.scopes;
-      await api(`/rules/${edit.id}`, 'PUT', {id: edit.id, groupId: edit.groupId, shareId: edit.shareId, ...first, additionalScopes});
-      savedKey = edit.groupId;
+      await api(`/rules/${edit.id}`, 'PUT', {id: edit.id, groupId: key, shareId: edit.shareId, ...first, additionalScopes});
       message = 'Permissions saved.';
     } else {
       const entity = edit.kind === 'delete-group' ? 'groups' : 'rules';

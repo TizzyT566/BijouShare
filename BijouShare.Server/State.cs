@@ -20,6 +20,7 @@ public sealed record AccessRule(Guid Id, Guid GroupId, Guid ShareId, string Path
     Permission Allow, Permission Deny, bool Inherit)
 {
     public AccessScope[] AdditionalScopes { get; init; } = [];
+    internal bool AppliesToShare(Guid id) => ShareId == id || ShareId == StateStore.AllSharesId;
 
     internal IEnumerable<AccessScope> Scopes()
     {
@@ -61,7 +62,7 @@ public sealed record PendingDevice(Guid Id, string Name, string ClientPublicKey,
 public sealed record AdminCredential(string Name, byte[] Salt, byte[] Hash, string Algorithm = "PBKDF2-HMAC-SHA3-256");
 public sealed class ServerState
 {
-    public int SchemaVersion { get; set; } = 6;
+    public int SchemaVersion { get; set; } = 7;
     public int? FilePort { get; set; }
     public int? WebPort { get; set; }
     public bool InviteOnly { get; set; }
@@ -87,6 +88,8 @@ public sealed partial class StateStore
 {
     public static readonly Guid AdministratorGroupId = new("7a336850-eff3-4a22-9bc8-a3972474f10c");
     public const string AdministratorGroupName = "Administrator";
+    public static readonly Guid AllSharesId = new("d8109392-5a11-4b55-a461-001cbf206da3");
+    public const string AllSharesName = "All";
     private readonly ReaderWriterLockSlim gate = new(LockRecursionPolicy.SupportsRecursion);
     private long revision;
     public long Revision => Interlocked.Read(ref revision);
@@ -110,7 +113,12 @@ public sealed partial class StateStore
         PrivateStorage.SecureDirectory(DataDirectory, includeLocalService: true);
         path = System.IO.Path.Combine(DataDirectory, "state.json");
         state = File.Exists(path) ? LoadState(File.ReadAllBytes(path)) : CreateState();
+        var upgraded = state.SchemaVersion == 6;
+        if (upgraded)
+            UpgradeShareTargets(state);
         Validate(state, validatePrivateKeys: true);
+        if (upgraded)
+            PrivateStorage.AtomicWrite(path, Wire.Encode(state));
         if (state.FilePort is { } filePort)
             options.Port = filePort;
     }
@@ -119,9 +127,26 @@ public sealed partial class StateStore
         using var document = JsonDocument.Parse(bytes);
         if (document.RootElement.ValueKind != JsonValueKind.Object ||
             !document.RootElement.TryGetProperty("schemaVersion", out var version) ||
-            version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number != 6)
-            throw new InvalidDataException("Unsupported server state format. Configure a new data directory for BijouShare v6.");
+            version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number is not (6 or 7))
+            throw new InvalidDataException("Unsupported server state format.");
         return Wire.Decode<ServerState>(bytes);
+    }
+
+    private static void UpgradeShareTargets(ServerState s)
+    {
+        // In v6 every rule had to reference an actual export. An orphan must never turn into a wildcard grant.
+        Validate(s, legacyShares: true);
+        var index = s.Shares.FindIndex(share => share.Id == AllSharesId);
+        if (index >= 0)
+        {
+            Guid newId;
+            do { newId = Guid.NewGuid(); } while (s.Shares.Any(share => share.Id == newId));
+            s.Shares[index] = s.Shares[index] with { Id = newId };
+            for (var i = 0; i < s.Rules.Count; i++)
+                if (s.Rules[i].ShareId == AllSharesId)
+                    s.Rules[i] = s.Rules[i] with { ShareId = newId };
+        }
+        s.SchemaVersion = 7;
     }
     public T Read<T>(Func<ServerState, T> read)
     {
@@ -276,6 +301,8 @@ public sealed partial class StateStore
         var relative = NormalizeRelative(path);
         if (relative.Length == 0)
             return "";
+        if (shareId == AllSharesId)
+            throw new ArgumentException("Choose an individual share to assign permissions to a named path.");
         var share = state.Shares.SingleOrDefault(x => x.Id == shareId) ?? throw new ArgumentException("Unknown share.");
         if (File.Exists(share.LocalPath))
             throw new ArgumentException("A file share has only its root permission path.");
@@ -292,7 +319,7 @@ public sealed partial class StateStore
             return Permission.None;
         var allow = device.GroupIds.Contains(AdministratorGroupId) ? Permission.FullControl : Permission.None;
         var deny = Permission.None;
-        foreach (var rule in s.Rules.Where(x => x.ShareId == shareId && device.GroupIds.Contains(x.GroupId)))
+        foreach (var rule in s.Rules.Where(x => x.AppliesToShare(shareId) && device.GroupIds.Contains(x.GroupId)))
         {
             var matched = rule.MatchingPermissions(relative);
             allow |= matched.Allow;
@@ -494,13 +521,13 @@ public sealed partial class StateStore
         }
         finally { CryptographicOperations.ZeroMemory(seed); }
     }
-    private static void Validate(ServerState s, bool validatePrivateKeys = false)
+    private static void Validate(ServerState s, bool validatePrivateKeys = false, bool legacyShares = false)
     {
         if (s.FilePort is < 1 or > 65535 || s.WebPort is < 1 or > 65535)
             throw new ArgumentException("Ports must be between 1 and 65535.");
         if (s.FilePort.HasValue && s.FilePort == s.WebPort)
             throw new ArgumentException("The file service and web UI must use different ports.");
-        if (s.SchemaVersion != 6 || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
+        if (s.SchemaVersion != (legacyShares ? 6 : 7) || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
             s.Groups.Any(x => x is null) || s.Shares.Any(x => x is null) ||
             s.Rules.Any(x => x is null) || s.Devices.Any(x => x is null) || s.PendingDevices.Any(x => x is null) ||
             s.PendingDevices.Count > 4096 || s.PendingDevices.Count(device => !device.Rejected) > 256)
@@ -571,16 +598,19 @@ public sealed partial class StateStore
         }
         foreach (var share in s.Shares)
         {
+            if (!legacyShares && share.Id == AllSharesId)
+                throw new ArgumentException("The built-in All share cannot be replaced, renamed or disabled.");
             if (share.Id == Guid.Empty || NormalizeRelative(share.Name) != share.Name || share.Name.Contains('/'))
                 throw new ArgumentException("Share names must be single Windows file names.");
             NormalizeLocalSharePath(share.LocalPath);
         }
         foreach (var rule in s.Rules)
         {
+            var allShares = !legacyShares && rule.ShareId == AllSharesId;
             if (rule.GroupId == AdministratorGroupId)
                 throw new ArgumentException("Administrator already has automatic full control on every share.");
             if (rule.Id == Guid.Empty || rule.AdditionalScopes is null ||
-                s.Groups.All(x => x.Id != rule.GroupId) || s.Shares.All(x => x.Id != rule.ShareId))
+                s.Groups.All(x => x.Id != rule.GroupId) || (!allShares && s.Shares.All(x => x.Id != rule.ShareId)))
                 throw new ArgumentException("Invalid group permission rule.");
             var inherited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var exact = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -589,6 +619,8 @@ public sealed partial class StateStore
                 if (scope is null || scope.Path != NormalizeRelative(scope.Path) ||
                     ((scope.Allow | scope.Deny) & ~Permission.FullControl) != 0 || (scope.Allow & scope.Deny) != 0)
                     throw new ArgumentException("Invalid permission path or conflicting allow and deny flags.");
+                if (allShares && scope.Path.Length != 0)
+                    throw new ArgumentException("Choose an individual share to assign permissions to a named path.");
                 if (!(scope.Inherit ? inherited : exact).Add(scope.Path))
                     throw new ArgumentException("A permission path with the same inheritance already exists in this assignment.");
             }

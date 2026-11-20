@@ -311,7 +311,8 @@ function permissionText(mask) {
 }
 
 function renderOverview() {
-  const { groups, shares, devices, pendingDevices, activity } = state;
+  const { groups, devices, pendingDevices, activity } = state;
+  const shares = state.shares.filter(share => !share.isAggregate);
   const pending = pendingDevices.filter(device => !device.rejected).length;
   const metrics = [
     ['shares', 'folder', 'Shared locations', shares.length],
@@ -338,8 +339,9 @@ function renderOverview() {
 }
 
 function renderSharesTable(title = '') {
-  return table(['Name on virtual drive', 'Server path', 'Status', ''], state.shares.map(share =>
-    `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td class="mono">${escapeHtml(share.localPath)}</td><td>${enabled(share.enabled)}</td><td>${shareActions(share)}</td></tr>`), title, 'Add a file, folder, or drive to begin sharing.');
+  return table(['Share name', 'Server path', 'Status', ''], state.shares.map(share => share.isAggregate
+    ? `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td>All current and future shares</td><td><span class="pill">Built-in</span></td><td></td></tr>`
+    : `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td class="mono">${escapeHtml(share.localPath)}</td><td>${enabled(share.enabled)}</td><td>${shareActions(share)}</td></tr>`), title, 'Add a file, folder, or drive to begin sharing.');
 }
 
 const formattedFingerprint = value => String(value ?? '').match(/.{1,8}/g)?.join(' ') ?? '';

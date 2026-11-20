@@ -648,7 +648,14 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     throw new RemoteException("Exists");
                 const uint writable = AccessMask.GenericWrite | AccessMask.GenericAll | AccessMask.WriteData | AccessMask.AppendData |
                     AccessMask.WriteEa | AccessMask.WriteAttributes | AccessMask.Delete | AccessMask.DeleteChild | AccessMask.WriteDac | AccessMask.WriteOwner;
-                if (request.DeleteOnClose || request.Mode is not (FileMode.Open or FileMode.OpenOrCreate) || (request.Access & writable) != 0)
+                // SetVolumeLabelW opens the volume root with FILE_WRITE_DATA | SYNCHRONIZE.
+                // Windows may include FILE_READ_ATTRIBUTES on an ordinary root handle.
+                // The driver handles the label; data writes to the namespace still fail.
+                const uint labelOpen = AccessMask.WriteData | 0x100000;
+                bool opensVolumeLabel = target is null && request.Mode == FileMode.Open &&
+                    (request.Access & ~AccessMask.ReadAttributes) == labelOpen;
+                if (request.DeleteOnClose || request.Mode is not (FileMode.Open or FileMode.OpenOrCreate) ||
+                    ((request.Access & writable) != 0 && !opensVolumeLabel))
                     throw new RemoteException("AccessDenied");
                 return new()
                 {

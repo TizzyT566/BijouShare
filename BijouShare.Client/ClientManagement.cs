@@ -32,6 +32,7 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
             drives = drives.Select(mountPoint => new
             {
                 mountPoint,
+                name = settings.GetDriveName(mountPoint),
                 mounted = drive.IsMounted(mountPoint),
                 error = drive.ErrorFor(mountPoint)
             }).ToArray(),
@@ -115,7 +116,9 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
         finally { changes.Release(); }
     }
 
-    public async Task ChangeDriveAsync(string mountPoint, bool remove, CancellationToken token)
+    public enum DriveChange { Add, Rename, Remove }
+
+    public async Task ChangeDriveAsync(string mountPoint, DriveChange change, string? name, CancellationToken token)
     {
         await changes.WaitAsync(token);
         try
@@ -123,15 +126,23 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
             if (!settings.SetupComplete)
                 throw new ArgumentException("Complete device setup first.");
             var mount = ClientSettings.NormalizeMountPoint(mountPoint);
-            if (remove)
-                settings.RemoveDrive(mount);
-            else
+            switch (change)
             {
-                RequireFreeLetter(mount);
-                settings.AddDrive(mount);
+                case DriveChange.Rename:
+                    settings.RenameDrive(mount, name ?? "");
+                    return;
+                case DriveChange.Add:
+                    RequireFreeLetter(mount);
+                    settings.AddDrive(mount, name ?? "");
+                    break;
+                case DriveChange.Remove:
+                    settings.RemoveDrive(mount);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(change));
             }
             connections.Synchronize();
-            if (!remove)
+            if (change == DriveChange.Add)
                 connections.RequestRefresh();
         }
         finally { changes.Release(); }

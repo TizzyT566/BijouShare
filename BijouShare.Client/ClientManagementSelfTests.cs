@@ -49,7 +49,7 @@ internal static class ClientManagementSelfTests
                 "Web setup persists the chosen name without mounting a drive or connecting an unassigned server");
             try
             {
-                await management.ChangeDriveAsync(Path.GetPathRoot(Environment.SystemDirectory)!, false, CancellationToken.None);
+                await management.ChangeDriveAsync(Path.GetPathRoot(Environment.SystemDirectory)!, ClientManagement.DriveChange.Add, "Projects", CancellationToken.None);
                 throw new InvalidOperationException("An occupied drive letter was accepted.");
             }
             catch (ArgumentException)
@@ -60,8 +60,24 @@ internal static class ClientManagementSelfTests
             var available = ClientManagement.AvailableDriveLetters().FirstOrDefault();
             if (available is not null)
             {
-                await management.ChangeDriveAsync(available, false, CancellationToken.None);
+                foreach (var invalid in new[] { null, "", "  ", "Name?", new string('x', 33) })
+                {
+                    try
+                    {
+                        await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Add, invalid, CancellationToken.None);
+                        throw new InvalidOperationException("An invalid drive name was accepted.");
+                    }
+                    catch (ArgumentException) { }
+                }
+                check(settings.DriveSnapshot().Length == 0, "The backend requires a valid name before adding a drive");
+                await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Add, "Projects", CancellationToken.None);
                 var router = connections.ForDrive(available);
+                await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Rename, "Media Library", CancellationToken.None);
+                check(!settings.TryRenameDrive(available, "Projects", "Obsolete") &&
+                    ClientSettings.Load(path).GetDriveName(available) == "Media Library" &&
+                    Encoding.UTF8.GetString(Wire.Encode(management.Snapshot())).Contains("Media Library") &&
+                    ReferenceEquals(router, connections.ForDrive(available)),
+                    "Renaming persists, updates the console and preserves the mounted router despite a stale Explorer observation");
                 var configured = Wire.Encode(settings);
                 await router.RefreshAsync(CancellationToken.None);
                 check(router.Call(new() { Operation = "List" }).Response.Entries is { Count: 0 } && !router.Statuses.Single().Connected &&
@@ -84,8 +100,9 @@ internal static class ClientManagementSelfTests
                 check(operations.FindFilesWithPattern("\\", "*.txt", out var matchingEntries, new MockDokanFileInfo()) == NtStatus.Success &&
                     matchingEntries.Count == 0,
                     "Empty-root dot entries respect native wildcard filtering");
-                await management.ChangeDriveAsync(available, true, CancellationToken.None);
-                check(connections.Snapshot().Length == 0 && ClientSettings.Load(path).DriveSnapshot().Length == 0,
+                await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Remove, null, CancellationToken.None);
+                check(connections.Snapshot().Length == 0 && ClientSettings.Load(path).DriveSnapshot().Length == 0 &&
+                    ClientSettings.Load(path).DriveNames.Count == 0 && !settings.TryRenameDrive(available, "Media Library", "Stale"),
                     "Removing the last empty drive leaves a persistent zero-drive client");
             }
             check(ClientActivation.PipeName(directory) == ClientActivation.PipeName(directory.ToUpperInvariant()) &&

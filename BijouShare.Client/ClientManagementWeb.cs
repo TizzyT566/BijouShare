@@ -9,7 +9,7 @@ namespace BijouShare.Client;
 public static class ClientManagementWeb
 {
     public sealed record DeviceUpdate(string DeviceName);
-    public sealed record DriveRequest(string MountPoint);
+    public sealed record DriveRequest(string MountPoint, string? Name = null);
     public sealed record ServerRequest(string Uri, string? MountPoint = null);
     public sealed record ServerRemoval(string Host, int Port, string? MountPoint = null);
 
@@ -82,9 +82,11 @@ public static class ClientManagementWeb
         app.MapPut("/api/device", (DeviceUpdate update, ClientManagement management, CancellationToken token) =>
             Change(() => management.UpdateDeviceAsync(update.DeviceName, token), management));
         app.MapPost("/api/drives", (DriveRequest request, ClientManagement management, CancellationToken token) =>
-            Change(() => management.ChangeDriveAsync(request.MountPoint, remove: false, token), management));
+            Change(() => management.ChangeDriveAsync(request.MountPoint, ClientManagement.DriveChange.Add, request.Name, token), management));
+        app.MapPut("/api/drives", (DriveRequest request, ClientManagement management, CancellationToken token) =>
+            Change(() => management.ChangeDriveAsync(request.MountPoint, ClientManagement.DriveChange.Rename, request.Name, token), management));
         app.MapPost("/api/drives/remove", (DriveRequest request, ClientManagement management, CancellationToken token) =>
-            Change(() => management.ChangeDriveAsync(request.MountPoint, remove: true, token), management));
+            Change(() => management.ChangeDriveAsync(request.MountPoint, ClientManagement.DriveChange.Remove, null, token), management));
         app.MapPost("/api/servers", (ServerRequest request, ClientManagement management, CancellationToken token) =>
             Change(() => management.AddServerAsync(WadUri.Parse(request.Uri), request.MountPoint, token), management));
         app.MapPost("/api/servers/remove", (ServerRemoval request, ClientManagement management, CancellationToken token) =>

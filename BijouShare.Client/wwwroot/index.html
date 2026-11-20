@@ -73,10 +73,11 @@
             </div>
           </div>
           <div class="panel configure">
-            <div class="section-title"><span class="tile"><span class="bi bi-drives" aria-hidden="true"></span></span><div><h2>Drive letter</h2><p class="muted">Choose an available letter for this Windows profile.</p></div></div>
+            <div class="section-title"><span class="tile"><span class="bi bi-drives" aria-hidden="true"></span></span><h2>Drive details</h2></div>
             <form id="add-drive" class="action-form">
-              <label class="sr-only" for="new-letter">Drive letter</label>
-              <div class="input-action"><select id="new-letter" name="mountPoint" required></select>
+              <div class="drive-fields">
+                <label>Drive name<input id="new-drive-name" name="name" maxlength="32" required autocomplete="off"></label>
+                <label>Drive letter<select id="new-letter" name="mountPoint" required></select></label>
                 <button id="add-drive-button" type="submit" class="primary"><span class="bi bi-plus" aria-hidden="true"></span>Add drive</button>
               </div>
               <p id="letter-help" class="hint" hidden>No drive letters are available. Free a letter in Windows to add a drive.</p>
@@ -133,7 +134,12 @@
         <div class="list-heading"><h2>Servers on this drive</h2><span class="server-total"></span></div>
         <div class="server-list" aria-live="polite"></div>
       </section>
-      <div class="drive-actions"><button class="remove-drive quiet" type="button">Remove drive</button><small class="remove-help hint"></small></div>
+      <div class="drive-actions"><button class="rename-drive" type="button" aria-expanded="false">Rename drive</button><button class="remove-drive quiet" type="button">Remove drive</button><small class="remove-help hint"></small></div>
+      <form class="rename-drive-form" hidden>
+        <label>Drive name<input name="name" maxlength="32" required autocomplete="off"></label>
+        <button type="submit" class="primary">Save name</button><button type="button" class="cancel-rename">Cancel</button>
+        <p class="rename-error error" role="alert"></p>
+      </form>
       <p class="remove-drive-error error" role="alert"></p>
     </section>
   </template>

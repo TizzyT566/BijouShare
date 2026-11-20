@@ -16,6 +16,7 @@ public static class AdminApi
     public sealed record DeviceApproval(Guid[] GroupIds, string Fingerprint);
     public sealed record DeviceUpdate(bool Enabled, Guid[] GroupIds);
     public sealed record InviteCreation(string Name, Guid[] GroupIds, int? MaxUses, DateTimeOffset? ExpiresUtc);
+    private sealed record ShareSummary(Guid Id, string Name, string? LocalPath, bool Enabled, bool IsAggregate);
     public sealed record PermissionRuleUpdate(Guid Id, Guid GroupId, Guid ShareId, string Path,
         Permission Allow, Permission Deny, bool Inherit, AccessScope[]? AdditionalScopes = null);
     public sealed record Setup(string ServerName, string AdminName, string Password, string ConfirmPassword);
@@ -112,7 +113,8 @@ public static class AdminApi
                 group.Name,
                 isAdministrator = group.Id == StateStore.AdministratorGroupId
             }),
-            s.Shares,
+            shares = s.Shares.Select(share => new ShareSummary(share.Id, share.Name, share.LocalPath, share.Enabled, false))
+                .Prepend(new(StateStore.AllSharesId, StateStore.AllSharesName, null, true, true)),
             s.Rules,
             devices = s.Devices.Select(d => new
             {
@@ -195,6 +197,8 @@ public static class AdminApi
         api.MapPut("/shares/{id:guid}", (Guid id, ExportShare share, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "Share", share.Name, () => store.Update(s =>
             {
+                if (id == StateStore.AllSharesId)
+                    throw new ArgumentException("The built-in All share cannot be edited.");
                 if (id != share.Id)
                     throw new ArgumentException("ID mismatch.");
                 var localPath = ValidateExportPath(share.LocalPath, store.DataDirectory);
@@ -207,6 +211,8 @@ public static class AdminApi
         api.MapDelete("/shares/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "DeleteShare", id.ToString(), () => store.Update(s =>
             {
+                if (id == StateStore.AllSharesId)
+                    throw new ArgumentException("The built-in All share cannot be deleted.");
                 s.Shares.RemoveAll(x => x.Id == id);
                 s.Rules.RemoveAll(x => x.ShareId == id);
                 return true;

@@ -7,7 +7,8 @@ using DokanAccess = DokanNet.FileAccess;
 
 namespace BijouShare.Client;
 
-public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveOperations> logger) : IDokanOperations
+public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveOperations> logger,
+    string initialVolumeName = ClientSettings.DefaultDriveName) : IDokanOperations
 {
     private sealed class Context(Guid handle, long generation)
     {
@@ -347,7 +348,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
     public NtStatus GetVolumeInformation(out string volumeLabel, out FileSystemFeatures features, out string fileSystemName,
         out uint maximumComponentLength, IDokanFileInfo info)
     {
-        volumeLabel = "BijouShare";
+        volumeLabel = initialVolumeName;
         fileSystemName = "BijouShare";
         maximumComponentLength = 255;
         features = FileSystemFeatures.CasePreservedNames | FileSystemFeatures.UnicodeOnDisk;

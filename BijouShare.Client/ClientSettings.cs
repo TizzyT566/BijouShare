@@ -116,6 +116,8 @@ public sealed class ClientSettings
     public int IdentityFormat { get; set; }
     public string MountPoint { get; set; } = "";
     public List<string> AdditionalMountPoints { get; set; } = [];
+    public Dictionary<string, string> DriveNames { get; set; } = [];
+    public const string DefaultDriveName = "BijouShare";
     public int RequestTimeoutSeconds { get; set; } = 30;
     internal bool IsConfigured => endpoint is not null || Servers.Count > 0;
     [System.Text.Json.Serialization.JsonIgnore]
@@ -180,9 +182,48 @@ public sealed class ClientSettings
                 Servers.Where(server => (server.MountPoint ?? MountPoint) == mountPoint).ToArray();
     }
 
-    public void AddDrive(string mountPoint)
+    public string GetDriveName(string mountPoint)
+    {
+        lock (persistenceGate)
+            return DriveNames.GetValueOrDefault(NormalizeMountPoint(mountPoint), DefaultDriveName);
+    }
+
+    public void RenameDrive(string mountPoint, string name)
+    {
+        if (!TryRenameDrive(mountPoint, null, name))
+            throw new ArgumentException("Unknown drive.");
+    }
+
+    internal bool TryRenameDrive(string mountPoint, string? expectedName, string newName)
     {
         mountPoint = NormalizeMountPoint(mountPoint);
+        ValidateDriveName(newName);
+        lock (persistenceGate)
+        {
+            if (!DriveSnapshot().Contains(mountPoint))
+                return false;
+            var previous = DriveNames.GetValueOrDefault(mountPoint);
+            var current = previous ?? DefaultDriveName;
+            if (expectedName is not null && current != expectedName)
+                return false;
+            if (current == newName)
+                return true;
+            DriveNames[mountPoint] = newName;
+            try { PersistChange(); }
+            catch
+            {
+                if (previous is null) DriveNames.Remove(mountPoint);
+                else DriveNames[mountPoint] = previous;
+                throw;
+            }
+        }
+        return true;
+    }
+
+    public void AddDrive(string mountPoint, string name = DefaultDriveName)
+    {
+        mountPoint = NormalizeMountPoint(mountPoint);
+        ValidateDriveName(name);
         lock (persistenceGate)
         {
             if (!SetupComplete)
@@ -194,9 +235,11 @@ public sealed class ClientSettings
                 MountPoint = mountPoint;
             else
                 AdditionalMountPoints.Add(mountPoint);
+            DriveNames.Add(mountPoint, name);
             try { PersistChange(); }
             catch
             {
+                DriveNames.Remove(mountPoint);
                 if (first)
                     MountPoint = "";
                 else
@@ -215,11 +258,17 @@ public sealed class ClientSettings
                 throw new ArgumentException("Unknown drive.");
             if (ServerSnapshot(mountPoint).Length != 0)
                 throw new ArgumentException("Disconnect this drive's servers before removing it.");
+            var hadName = DriveNames.Remove(mountPoint, out var name);
             if (AdditionalMountPoints.Count == 0)
             {
                 MountPoint = "";
                 try { PersistChange(); }
-                catch { MountPoint = mountPoint; throw; }
+                catch
+                {
+                    MountPoint = mountPoint;
+                    if (hadName) DriveNames[mountPoint] = name!;
+                    throw;
+                }
                 return;
             }
             var oldPrimary = MountPoint;
@@ -237,6 +286,7 @@ public sealed class ClientSettings
             catch
             {
                 MountPoint = oldPrimary;
+                if (hadName) DriveNames[mountPoint] = name!;
                 AdditionalMountPoints.Insert(index, removedLetter);
                 foreach (var server in promoted)
                     server.MountPoint = removedLetter;
@@ -487,6 +537,10 @@ public sealed class ClientSettings
                 throw new InvalidDataException("Drive letters must be unique.");
             AdditionalMountPoints[index] = point;
         }
+        if (DriveNames is null || DriveNames.Keys.Any(letter => !drives.Contains(letter)))
+            throw new InvalidDataException("A drive name references an unknown drive.");
+        foreach (var label in DriveNames.Values)
+            ValidateDriveName(label);
         if (RequestTimeoutSeconds is < 5 or > 45)
             throw new InvalidDataException("RequestTimeoutSeconds must be between 5 and 45.");
         if (ManagementPort != 0 && ManagementPort is < 1024 or > 65535)
@@ -620,6 +674,13 @@ public sealed class ClientSettings
         if (mount.Length != 3 || !char.IsAsciiLetter(mount[0]) || mount[1..] != ":\\")
             throw new ArgumentException("MountPoint must be a drive letter, such as N:\\.");
         return char.ToUpperInvariant(mount[0]) + mount[1..];
+    }
+
+    public static void ValidateDriveName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name.Length > 32 || name != name.Trim() ||
+            name.Any(char.IsControl) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new ArgumentException("Use a drive name of 1–32 characters without surrounding spaces, control characters, or Windows filename separators and reserved characters.");
     }
 
     private static void ValidateName(string name, string label)

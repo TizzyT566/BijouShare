@@ -208,6 +208,11 @@ internal static class MultiServerSelfTests
         foreach (var path in new[] { "/", "/Office" })
             Expect("AccessDenied", () => router.Call(new() { Operation = "Open", Path = path, Access = AccessMask.GenericWrite }), check,
                 "The synthetic namespace rejects writable opens at " + path);
+        var labelOpen = new RpcRequest { Operation = "Open", Path = "/", Mode = FileMode.Open, Access = AccessMask.WriteData | 0x100000 };
+        check(router.Call(labelOpen).Response.Entry?.IsDirectory == true, "Explorer can open the volume root to set its label");
+        Expect("AccessDenied", () => router.Call(labelOpen with { Path = "/Office" }), check, "A server folder is not a volume-label handle");
+        Expect("AccessDenied", () => router.Call(labelOpen with { DeleteOnClose = true }), check, "A label open cannot delete the root");
+        Expect("IsDirectory", () => router.Call(new() { Operation = "Write", Path = "/" }), check, "A label open cannot write data to the root");
         check(office.Calls.IsEmpty && home.Calls.IsEmpty, "Rejected synthetic namespace mutations never reach a server");
 
         var shares = (await router.CallAsync(new()
