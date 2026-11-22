@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 using BijouShare.Shared;
 using Microsoft.Win32.SafeHandles;
 
@@ -21,17 +22,9 @@ internal static partial class UserProfileStorage
         if (!Path.GetFileName(directory).Equals(".bijoushare", StringComparison.OrdinalIgnoreCase))
             throw new UnauthorizedAccessException("The profile must belong to the signed-in Windows user.");
         var root = new DirectoryInfo(directory);
-        var driveRoot = Path.GetPathRoot(root.FullName)!;
-        if (driveRoot.StartsWith(@"\\", StringComparison.Ordinal) ||
-            new DriveInfo(driveRoot) is not { DriveType: not DriveType.Network, DriveFormat: "NTFS" or "ReFS" })
-            throw new IOException("Use a local NTFS or ReFS directory for the private client profile.");
+        RequireLocalAclVolume(root.FullName);
 
-        var security = new DirectorySecurity();
-        security.SetOwner(user);
-        security.SetAccessRuleProtection(true, false);
-        foreach (var trustee in new[] { user, SystemSid })
-            security.AddAccessRule(new FileSystemAccessRule(trustee, FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        var security = PrivateDirectorySecurity(user);
 
         PrepareParents(root.Parent!, user, security);
         if (!root.Exists)
@@ -41,8 +34,22 @@ internal static partial class UserProfileStorage
         // Recursive Set-Acl on a directory would also touch unvalidated descendants.
         var fileAcl = new RawSecurityDescriptor($"O:{user}D:P(A;;FA;;;{user})(A;;FA;;;SY)");
         var directoryAcl = new RawSecurityDescriptor($"O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)");
-        RepairTree(root.FullName, user, fileAcl, directoryAcl);
+        RepairTree(root.FullName, user, fileAcl, directoryAcl, isProfileRoot: true);
         return StorageLease.LockDirectory(directory);
+    }
+
+    internal static void RequireLocalAclVolume(string directory)
+    {
+        var driveRoot = Path.GetPathRoot(Path.GetFullPath(directory))!;
+        if (driveRoot.StartsWith(@"\\", StringComparison.Ordinal) || new DriveInfo(driveRoot).DriveType == DriveType.Network)
+            throw new IOException("Use a local NTFS or ReFS directory for the private client profile.");
+
+        var format = new StringBuilder(261);
+        if (!GetVolumeInformationW(driveRoot, 0, 0, out _, out _, out var flags, format, format.Capacity))
+            throw new IOException($"Cannot inspect the volume containing {directory}.", new Win32Exception(Marshal.GetLastPInvokeError()));
+        const uint persistentAcls = 0x00000008; // FILE_PERSISTENT_ACLS
+        if (format.ToString() is not ("NTFS" or "ReFS") || (flags & persistentAcls) == 0)
+            throw new IOException("The private client profile requires a local NTFS or ReFS volume with persistent Windows access control lists.");
     }
 
     private static void PrepareParents(DirectoryInfo directory, SecurityIdentifier user, DirectorySecurity newDirectoryAcl)
@@ -98,7 +105,8 @@ internal static partial class UserProfileStorage
         return (isDirectory, current);
     }
 
-    private static void RepairTree(string path, SecurityIdentifier user, RawSecurityDescriptor fileAcl, RawSecurityDescriptor directoryAcl)
+    private static void RepairTree(string path, SecurityIdentifier user, RawSecurityDescriptor fileAcl,
+        RawSecurityDescriptor directoryAcl, bool isProfileRoot = false)
     {
         const uint readControl = 0x20000, writeDacl = 0x40000, writeOwner = 0x80000;
         using var item = Open(path, readControl);
@@ -118,8 +126,51 @@ internal static partial class UserProfileStorage
         }
         if (isDirectory)
             foreach (var child in Directory.EnumerateFileSystemEntries(path))
-                RepairTree(child, user, fileAcl, directoryAcl);
+            {
+                if (isProfileRoot && Path.GetFileName(child).Equals(PrivateMountDirectory.ContainerName, StringComparison.OrdinalIgnoreCase))
+                {
+                    // The physical container is private. Its children can be live filesystems.
+                    using var container = OpenPrivateDirectory(child, user);
+                }
+                else
+                    RepairTree(child, user, fileAcl, directoryAcl);
+            }
     }
+
+    internal static DirectorySecurity PrivateDirectorySecurity(SecurityIdentifier user)
+    {
+        var security = new DirectorySecurity();
+        security.SetOwner(user);
+        security.SetAccessRuleProtection(true, false);
+        foreach (var trustee in new[] { user, SystemSid })
+            security.AddAccessRule(new FileSystemAccessRule(trustee, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        return security;
+    }
+
+    internal static SafeFileHandle OpenPrivateDirectory(string path, SecurityIdentifier user, bool forDeletion = false)
+    {
+        const uint listDirectory = 1, readControl = 0x20000, delete = 0x10000;
+        var handle = Open(path, listDirectory | readControl | (forDeletion ? delete : 0));
+        try
+        {
+            var (isDirectory, acl) = Inspect(handle, path, user);
+            if (!isDirectory || acl.Owner != user || !acl.ControlFlags.HasFlag(ControlFlags.DiscretionaryAclProtected) ||
+                acl.DiscretionaryAcl is not { Count: 2 } rules || !rules.Cast<GenericAce>().Any(ace => GrantsFullControl(ace, user)) ||
+                !rules.Cast<GenericAce>().Any(ace => GrantsFullControl(ace, SystemSid)))
+                throw new UnauthorizedAccessException($"The mount directory must be private to this Windows account: {path}.");
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    private static bool GrantsFullControl(GenericAce ace, SecurityIdentifier sid) =>
+        ace is CommonAce { AceType: AceType.AccessAllowed, IsCallback: false } allow && allow.SecurityIdentifier == sid &&
+        allow.AccessMask == (int)FileSystemRights.FullControl && allow.AceFlags == (AceFlags.ObjectInherit | AceFlags.ContainerInherit);
 
     private const uint OwnerSecurity = 1, DaclSecurity = 4;
     private static RawSecurityDescriptor ReadSecurity(SafeFileHandle handle, string path)
@@ -161,6 +212,9 @@ internal static partial class UserProfileStorage
         FileMode mode, uint flags, nint template);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation info);
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumeInformationW(string root, nint label, int labelSize, out uint serial,
+        out uint maxComponent, out uint flags, StringBuilder format, int formatSize);
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool GetKernelObjectSecurity(SafeFileHandle handle, uint parts, [Out] byte[]? bytes, uint length, out uint needed);
     [DllImport("advapi32.dll", SetLastError = true)]

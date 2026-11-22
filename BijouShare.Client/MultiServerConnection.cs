@@ -28,6 +28,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
         public int Removed;
         public long FailureRevision;
         public bool InviteNoticeSent;
+        public bool RevocationReported;
         public bool HasConnected;
         public string? AuthenticatedIdentity;
         public long? DisconnectedAt;
@@ -69,6 +70,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     private readonly CancellationTokenSource lifetime = new();
     private int disposed;
     internal event Action<string>? InviteRequired;
+    internal event Action? EnrollmentRevoked;
     private static readonly DateTime NamespaceTime = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
     private const Permission NamespacePermissions = Permission.ListDirectory | Permission.ReadAttributes | Permission.ReadPermissions;
 
@@ -114,8 +116,12 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                     !reconnectAll && !ReferenceEquals(reconnect, server))
                     return retained;
                 var replacement = CreateTarget(settings, server, loggerFactory);
-                if (retained is not null && !ReferenceEquals(reconnect, server))
-                    replacement.InviteNoticeSent = retained.InviteNoticeSent;
+                if (retained is not null)
+                {
+                    replacement.RevocationReported = retained.RevocationReported;
+                    if (!ReferenceEquals(reconnect, server))
+                        replacement.InviteNoticeSent = retained.InviteNoticeSent;
+                }
                 return replacement;
             }).ToArray();
             removed.AddRange(existing.Except(next));
@@ -325,6 +331,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             try { next[index] = reconnect(); }
             catch (ArgumentException) when (target.VerificationToken.IsCancellationRequested) { return; }
             next[index].InviteNoticeSent = target.InviteNoticeSent;
+            next[index].RevocationReported = target.RevocationReported;
             Volatile.Write(ref target.Removed, 1);
             Volatile.Write(ref targets, next);
             routeStamps = [];
@@ -368,6 +375,7 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 if (target.FailureRevision == revision && Volatile.Read(ref target.Removed) == 0 && Volatile.Read(ref disposed) == 0)
                 {
                     target.InviteNoticeSent = false;
+                    target.RevocationReported = false;
                     target.HasConnected = true;
                     target.AuthenticatedIdentity = target.Identity;
                     if (target.DisconnectedAt.HasValue)
@@ -400,9 +408,10 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
     private void MarkUnavailable(Target target, string error)
     {
         var notify = false;
+        var revoked = false;
         lock (routeGate)
         {
-            if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0)
+            if (Volatile.Read(ref target.Removed) != 0 || Volatile.Read(ref disposed) != 0 || target.VerificationToken.IsCancellationRequested)
                 return;
             target.FailureRevision++;
             if (error is "Disconnected" or "Timeout")
@@ -427,8 +436,26 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
                 target.InviteNoticeSent = true;
                 notify = true;
             }
+            // These enrollment responses follow the pinned server's encrypted handshake.
+            // A stored folder identity is populated only after a previous admission.
+            if (!target.RevocationReported && (target.HasConnected || target.Endpoint?.FolderName is not null) &&
+                error is "DeviceBlocked" or "DeviceRejected" or "PendingApproval" or "InviteRequired")
+            {
+                target.RevocationReported = true;
+                revoked = true;
+            }
             Volatile.Write(ref target.Status, new(target.Name, false, error));
             RefreshRoutes();
+        }
+        if (revoked)
+        {
+            try { EnrollmentRevoked?.Invoke(); }
+            catch
+            {
+                // A failed grant-store write must be retried on the next authenticated rejection.
+                lock (routeGate) target.RevocationReported = false;
+                throw;
+            }
         }
         if (notify)
             InviteRequired?.Invoke(target.Address);

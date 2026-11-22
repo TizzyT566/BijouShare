@@ -5,14 +5,28 @@ namespace BijouShare.Client;
 
 public sealed class ClientDriveState
 {
-    private sealed record Status(bool Mounted, string? Error);
+    private sealed record Status(bool Mounted, string? Error, MountAliasPipe? Alias = null, bool ExplorerElevation = false);
     private readonly ConcurrentDictionary<string, Status> statuses = new(StringComparer.OrdinalIgnoreCase);
 
     public void SetMounted(string letter) => statuses[letter] = new(true, null);
+    internal void SetMounted(string letter, MountAliasPipe alias, bool explorerElevation) =>
+        statuses[letter] = new(true, null, alias, explorerElevation);
     public void SetError(string letter, string? error) => statuses[letter] = new(false, error);
     public void Remove(string letter) => statuses.TryRemove(letter, out _);
     public bool IsMounted(string letter) => statuses.TryGetValue(letter, out var status) && status.Mounted;
     public string? ErrorFor(string letter) => statuses.TryGetValue(letter, out var status) ? status.Error : null;
+    internal bool SupportsExplorerElevation(string letter) => statuses.GetValueOrDefault(letter)?.ExplorerElevation == true;
+    internal (string State, string? Error) ElevatedStatus(string letter) => statuses.GetValueOrDefault(letter)?.Alias?.Status ?? ("Disabled", null);
+    internal void EnableElevated(string letter)
+    {
+        var alias = statuses.GetValueOrDefault(letter)?.Alias ?? throw new ArgumentException("Mount this drive before allowing elevated apps.");
+        alias.Enable();
+    }
+    internal void RevokeElevated(string letter, ClientSettings settings, bool serverKick = false)
+    {
+        if (statuses.GetValueOrDefault(letter)?.Alias is { } alias) alias.Disable(serverKick);
+        else MountAliasPipe.Forget(settings, letter);
+    }
 }
 
 public sealed class ClientManagement(ClientSettings settings, DriveConnections connections, ClientDriveState drive)
@@ -29,12 +43,21 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
             settings.DeviceName,
             settings.SetupComplete,
             mountPoint = primary,
-            drives = drives.Select(mountPoint => new
+            canOfferElevatedAccess = MountAliasPipe.CanOfferElevatedAccess,
+            drives = drives.Select(mountPoint =>
             {
-                mountPoint,
-                name = settings.GetDriveName(mountPoint),
-                mounted = drive.IsMounted(mountPoint),
-                error = drive.ErrorFor(mountPoint)
+                var elevated = drive.ElevatedStatus(mountPoint);
+                return new
+                {
+                    mountPoint,
+                    name = settings.GetDriveName(mountPoint),
+                    mounted = drive.IsMounted(mountPoint),
+                    error = drive.ErrorFor(mountPoint),
+                    elevatedAccess = elevated.State,
+                    elevatedAccessSaved = settings.ElevatedGrant(mountPoint).HasValue,
+                    explorerElevation = drive.SupportsExplorerElevation(mountPoint),
+                    elevatedError = elevated.Error
+                };
             }).ToArray(),
             cryptoSuite = Wire.CryptoSuite,
             cryptoProvider = HybridKem.ProviderName,
@@ -118,6 +141,22 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
 
     public enum DriveChange { Add, Rename, Remove }
 
+    public async Task SetElevatedAccessAsync(string mountPoint, bool enabled, CancellationToken token)
+    {
+        await changes.WaitAsync(token);
+        try
+        {
+            var mount = ClientSettings.NormalizeMountPoint(mountPoint);
+            if (!settings.SetupComplete || !settings.DriveSnapshot().Contains(mount))
+                throw new ArgumentException("Choose a configured drive.");
+            if (enabled)
+                drive.EnableElevated(mount);
+            else
+                drive.RevokeElevated(mount, settings);
+        }
+        finally { changes.Release(); }
+    }
+
     public async Task ChangeDriveAsync(string mountPoint, DriveChange change, string? name, CancellationToken token)
     {
         await changes.WaitAsync(token);
@@ -136,6 +175,8 @@ public sealed class ClientManagement(ClientSettings settings, DriveConnections c
                     settings.AddDrive(mount, name ?? "");
                     break;
                 case DriveChange.Remove:
+                    if (settings.ServerSnapshot(mount).Length == 0)
+                        drive.RevokeElevated(mount, settings);
                     settings.RemoveDrive(mount);
                     break;
                 default:

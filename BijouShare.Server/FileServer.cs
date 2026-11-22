@@ -285,15 +285,19 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                     try
                     {
                         // Only proven possession can add a request to the administrator's queue.
-                        store.QueueRegistration(new EnrollmentRequest(publicIdentity, hello.DeviceName!, hello.ClientPublicKey, kemPublicText));
-                        if (prior is null)
+                        if (store.QueueRegistration(new EnrollmentRequest(publicIdentity, hello.DeviceName!, hello.ClientPublicKey, kemPublicText)))
+                            result = "Disconnected"; // Approved during this pending handshake. Retry with a new challenge.
+                        else if (prior is null)
                             audit.Write(hello.DeviceName!, "DeviceRequested", publicIdentity);
                         else if (prior.Name != hello.DeviceName)
                             audit.Write(hello.DeviceName!, "DeviceRenamed", publicIdentity);
                     }
                     catch (RemoteException ex) { result = ex.Code; }
-                    catch (UnauthorizedAccessException) { result = store.FindPendingDevice(publicIdentity)?.Rejected == true ? "DeviceRejected" : "DeviceBlocked"; }
-                    catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException) { result = "DeviceBlocked"; }
+                    catch (UnauthorizedAccessException)
+                    {
+                        result = store.FindPendingDevice(publicIdentity)?.Rejected == true ? "DeviceRejected" : "ConfigurationError";
+                    }
+                    catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException) { result = "ConfigurationError"; }
                     await transport.SendAsync(RpcResponse.Fail(result), timeout.Token);
                     return;
                 }

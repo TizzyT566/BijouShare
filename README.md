@@ -93,12 +93,18 @@ flowchart LR
 
 **Services and storage.** The server service hosts the shares and web console even when everyone signs out. Its tray helper opens the console in the signed-in session. The client service starts a worker for each signed-in Windows user. Client keys and drive settings live under `%USERPROFILE%\.bijoushare`. The server stores its identity, approved devices, groups, and access rules under `%ProgramData%\BijouShare\Server` by default.
 
+**Using a drive with elevated apps.** Open the installed client from the tray, select the drive, and click **Allow elevated apps**. Approve the Windows prompt as the account that mounted the drive. Apps running as administrator in that account's linked session can then use the same drive letter and server permissions as Explorer. The client remembers this approval for the drive. After a reboot, sign-in, or remount, its Windows service restores the mapping for the same account. Sleep, Wi-Fi loss, and an offline server leave the approval in place. Choose **Turn off elevated access** to revoke it. If a previously approved server blocks the device or removes its enrollment, the client revokes elevated access for that drive when it receives the authenticated rejection. Other drives keep their own approvals.
+
+This option requires a Windows administrator account with UAC's paired normal and elevated sessions. If the letter is taken in the elevated session, the client reports the conflict. A Windows policy that requires entering fresh credentials can create a separate logon session outside that pair. [Microsoft's explanation of UAC and drive letters](https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/mapped-drives-not-available-from-elevated-command)
+
+**Launching from Explorer.** With elevated access enabled, right-click a shared executable and choose **Run as administrator**, or open it normally if the app requests elevation itself. On a local NTFS profile, BijouShare registers the volume at a private folder so Windows can resolve the executable during the UAC prompt. The drive letter stays in your sign-in session and its approved elevated session. If the client reports that your profile cannot support Explorer elevation, launch the executable from an already elevated terminal in its own folder.
+
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.24-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.28-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.24-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.28-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.
@@ -114,7 +120,7 @@ For unattended installation, run either installer from an elevated terminal with
 To switch an **already installed** server to the built-in local Windows Administrator account, finish any active transfers and run this from the folder containing Server Setup:
 
 ```powershell
-.\BijouShare.Server-2.0.24-win-x64-Setup.exe /serviceaccount
+.\BijouShare.Server-2.0.28-win-x64-Setup.exe /serviceaccount
 ```
 
 Approve elevation and enter the displayed account’s Windows password. Setup checks that Windows permits a service logon, changes the account, restarts the server, and reports when it is running. The built-in Administrator must be enabled and have a password. Setup recognizes a renamed account by its Windows identity. The web console has its own administrator login.

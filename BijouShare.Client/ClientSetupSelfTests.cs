@@ -185,20 +185,46 @@ internal static class ClientSetupSelfTests
                 "A link on another drive cannot replace or bypass an existing endpoint fingerprint");
         }
         saved.AddServer("archive", 7443, null, "P:", new string('a', 64));
+        var primaryGrant = Guid.NewGuid();
+        var archiveGrant = Guid.NewGuid();
+        saved.SetElevatedGrant("N:", primaryGrant);
+        saved.SetElevatedGrant("P:", archiveGrant);
         saved = ClientSettings.Load(path);
         check(saved.ServerSnapshot("N:\\").Single().Host == "nas" && saved.ServerSnapshot("P:\\").Single().Host == "archive",
             "Restart preserves the server namespace assigned to each drive");
+        check(saved.ElevatedGrant("n:") == primaryGrant && saved.ElevatedGrant("p:") == archiveGrant,
+            "Restart restores independent elevated access preferences for the configured drives");
+        check(!saved.ClearElevatedGrant("N:", archiveGrant) && saved.ElevatedGrant("N:") == primaryGrant,
+            "A stale kick cannot clear a newer drive approval");
+        using (var locked = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            try { saved.ClearElevatedGrant("N:", primaryGrant); throw new InvalidOperationException("A locked profile accepted a grant change."); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                check(saved.ElevatedGrant("N:") == primaryGrant && ClientSettings.Load(path).ElevatedGrant("N:") == primaryGrant,
+                    "A failed preference save restores the previous in-memory and on-disk grant");
+            }
+        }
+        check(saved.ClearElevatedGrant("P:", archiveGrant) && ClientSettings.Load(path).ElevatedGrant("P:") is null &&
+            saved.ElevatedGrant("N:") == primaryGrant, "Revoking the current grant clears only its drive across reloads");
+        saved.SetElevatedGrant("P:", archiveGrant);
         saved.RemoveServer("nas", 7443);
+        check(saved.ElevatedGrant("N:") == primaryGrant, "Removing a configured endpoint leaves the drive preference intact");
         saved.RemoveDrive("N:");
         saved = ClientSettings.Load(path);
         check(saved.DriveSnapshot().SequenceEqual(["P:\\"]) && saved.GetDriveName("P:") == "Archive" &&
             saved.DriveNames.Count == 1 && saved.ServerSnapshot("P:\\").Single().Host == "archive",
             "Removing the empty primary drive preserves the promoted drive's name and servers");
+        saved.AddDrive("N:");
+        check(saved.ElevatedGrant("N:") is null && saved.ElevatedGrant("P:") == archiveGrant,
+            "Reusing a drive letter does not inherit its deleted approval or disturb the promoted drive");
         var legacy = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(path))!.AsObject();
         legacy.Remove("driveNames");
+        legacy.Remove("elevatedDriveGrants");
         File.WriteAllText(path, legacy.ToJsonString());
         saved = ClientSettings.Load(path);
         check(saved.GetDriveName("P:") == ClientSettings.DefaultDriveName,
             "Existing profiles without labels retain the original BijouShare volume name");
+        check(saved.ElevatedGrant("P:") is null, "Existing profiles default to elevated access off");
     }
 }

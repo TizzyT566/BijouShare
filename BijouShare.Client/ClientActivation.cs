@@ -208,17 +208,28 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
         }
     }
 
-    private static int VerifyServerExecutable(NamedPipeClientStream pipe)
+    internal static int VerifyServerExecutable(NamedPipeClientStream pipe)
     {
-        if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var processId))
+        using var process = OpenVerifiedServerProcess(pipe, out int processId);
+        return processId;
+    }
+
+    internal static SafeProcessHandle OpenVerifiedServerProcess(NamedPipeClientStream pipe, out int processId)
+    {
+        if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var id))
             throw new IOException("Cannot verify the running client process.");
-        using var process = OpenProcess(0x1000, false, processId);
+        processId = checked((int)id);
+        var process = OpenProcess(0x1000, false, id);
         var path = new StringBuilder(32768);
         var length = (uint)path.Capacity;
-        if (process.IsInvalid || !QueryFullProcessImageName(process, 0, path, ref length) ||
-            !string.Equals(Path.GetFullPath(path.ToString()), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase))
-            throw new UnauthorizedAccessException("The client activation channel belongs to another executable. Open the installed client to manage connections.");
-        return checked((int)processId);
+        try
+        {
+            if (process.IsInvalid || !QueryFullProcessImageName(process, 0, path, ref length) ||
+                !string.Equals(Path.GetFullPath(path.ToString()), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException("The client activation channel belongs to another executable. Open the installed client to manage connections.");
+            return process;
+        }
+        catch { process.Dispose(); throw; }
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -230,7 +241,7 @@ public sealed class ClientActivation(ClientSettings settings, ClientManagement m
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryFullProcessImageName(SafeProcessHandle process, uint flags, StringBuilder name, ref uint size);
 
-    private static NamedPipeServerStream CreatePipe(string name)
+    internal static NamedPipeServerStream CreatePipe(string name)
     {
         var security = new PipeSecurity();
         security.SetAccessRuleProtection(true, false);

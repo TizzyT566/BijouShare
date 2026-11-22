@@ -102,6 +102,11 @@ internal static class DeviceApprovalSelfTests
         try
         {
             await RejectWrongPersistentKem(pending: true);
+            using (var locked = File.Open(Path.Combine(store.DataDirectory, "state.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                await ExpectStatus("ConfigurationError");
+                Check(store.FindPendingDevice(id) is null, "A failed enrollment write does not report an administrator kick");
+            }
             await ExpectStatus("PendingApproval");
             Check(store.FindPendingDevice(id) is { } pending && pending.Name == name && pending.ClientPublicKey == publicKey &&
                 store.FindRegisteredDevice(id) is null, "A proven unknown device queues exactly its public identity and remains unapproved");

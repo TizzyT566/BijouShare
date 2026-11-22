@@ -5,15 +5,17 @@ public sealed class DriveConnections : IDisposable
 {
     private readonly ClientSettings settings;
     private readonly ILoggerFactory loggers;
+    private readonly ClientDriveState? driveState;
     private readonly object gate = new();
     private readonly Dictionary<string, MultiServerConnection> routers = new(StringComparer.OrdinalIgnoreCase);
     private bool disposed;
     internal event Action<string, string>? InviteRequired;
 
-    public DriveConnections(ClientSettings settings, ILoggerFactory loggers)
+    public DriveConnections(ClientSettings settings, ILoggerFactory loggers, ClientDriveState? driveState = null)
     {
         this.settings = settings;
         this.loggers = loggers;
+        this.driveState = driveState;
         Synchronize();
     }
 
@@ -46,6 +48,7 @@ public sealed class DriveConnections : IDisposable
                 {
                     router = new MultiServerConnection(settings, loggers, letter);
                     router.InviteRequired += address => InviteRequired?.Invoke(letter, address);
+                    router.EnrollmentRevoked += () => driveState?.RevokeElevated(letter, settings, serverKick: true);
                     routers.Add(letter, router);
                 }
                 else if (settings.SetupComplete)

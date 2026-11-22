@@ -10,6 +10,7 @@ public static class ClientManagementWeb
 {
     public sealed record DeviceUpdate(string DeviceName);
     public sealed record DriveRequest(string MountPoint, string? Name = null);
+    public sealed record ElevatedAccessRequest(string MountPoint, bool? Enabled);
     public sealed record ServerRequest(string Uri, string? MountPoint = null);
     public sealed record ServerRemoval(string Host, int Port, string? MountPoint = null);
 
@@ -87,6 +88,9 @@ public static class ClientManagementWeb
             Change(() => management.ChangeDriveAsync(request.MountPoint, ClientManagement.DriveChange.Rename, request.Name, token), management));
         app.MapPost("/api/drives/remove", (DriveRequest request, ClientManagement management, CancellationToken token) =>
             Change(() => management.ChangeDriveAsync(request.MountPoint, ClientManagement.DriveChange.Remove, null, token), management));
+        app.MapPost("/api/drives/elevated-access", (ElevatedAccessRequest request, ClientManagement management, CancellationToken token) =>
+            Change(() => management.SetElevatedAccessAsync(request.MountPoint, request.Enabled ??
+                throw new ArgumentException("Specify whether elevated apps can access this drive."), token), management));
         app.MapPost("/api/servers", (ServerRequest request, ClientManagement management, CancellationToken token) =>
             Change(() => management.AddServerAsync(WadUri.Parse(request.Uri), request.MountPoint, token), management));
         app.MapPost("/api/servers/remove", (ServerRemoval request, ClientManagement management, CancellationToken token) =>

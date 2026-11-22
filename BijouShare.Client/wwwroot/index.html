@@ -134,7 +134,9 @@
         <div class="list-heading"><h2>Servers on this drive</h2><span class="server-total"></span></div>
         <div class="server-list" aria-live="polite"></div>
       </section>
-      <div class="drive-actions"><button class="rename-drive" type="button" aria-expanded="false">Rename drive</button><button class="remove-drive quiet" type="button">Remove drive</button><small class="remove-help hint"></small></div>
+      <div class="drive-actions"><button class="rename-drive" type="button" aria-expanded="false">Rename drive</button><button class="elevated-access" type="button" hidden>Allow elevated apps</button><button class="remove-drive quiet" type="button">Remove drive</button><small class="remove-help hint"></small></div>
+      <p class="elevated-status hint" role="status" hidden></p>
+      <p class="elevated-error error" role="alert"></p>
       <form class="rename-drive-form" hidden>
         <label>Drive name<input name="name" maxlength="32" required autocomplete="off"></label>
         <button type="submit" class="primary">Save name</button><button type="button" class="cancel-rename">Cancel</button>

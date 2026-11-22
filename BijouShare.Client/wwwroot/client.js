@@ -24,7 +24,7 @@ const descriptions = {
   ServerUpgradeRequired: ['Server update required', 'This server needs an update before it can appear on the drive.', 'blocked'],
   AuthenticationFailed: ['Authentication failed', 'The server could not prove its identity. Check the endpoint with its administrator.', 'blocked'],
   HybridUnavailable: ['Windows update required', 'This connection requires native Windows support for ML-KEM-768 and SHA3-256.', 'blocked'],
-  ConfigurationError: ['Configuration error', 'The client could not access or save its configuration. Check the service account and data directory.', 'blocked'],
+  ConfigurationError: ['Configuration error', 'The client or server could not access its saved configuration. Check the service log and data directory.', 'blocked'],
   Disconnected: ['Offline', 'Its drive folder is temporarily hidden. Retrying automatically; other connected servers stay available.', ''],
   Waiting: ['Connecting', 'Waiting for an authenticated connection.', 'waiting']
 };
@@ -103,6 +103,15 @@ function newDriveView(mountPoint) {
   remove.setAttribute('aria-label', 'Remove drive ' + mountPoint.slice(0, 2));
   panel.querySelector('.remove-help').id = id + '-remove-help';
   remove.setAttribute('aria-describedby', id + '-remove-help');
+  const elevated = panel.querySelector('.elevated-access');
+  const status = panel.querySelector('.elevated-status');
+  status.id = id + '-elevated-status';
+  elevated.setAttribute('aria-describedby', status.id);
+  elevated.addEventListener('click', async () => {
+    await submit(elevated, panel.querySelector('.elevated-error'), async () => {
+      render(await api('/drives/elevated-access', 'POST', {mountPoint, enabled:elevated.dataset.action === 'enable'}));
+    });
+  });
   $('#drive-panels').append(panel);
   return {tab, label, panel, signature:''};
 }
@@ -123,7 +132,7 @@ function selectView(id, remember = true) {
 
 function renderDrive(view, drive, servers) {
   const panel = view.panel;
-  const signature = JSON.stringify([drive, servers, state.mountPoint, state.drives.length]);
+  const signature = JSON.stringify([drive, servers, state.mountPoint, state.drives.length, state.canOfferElevatedAccess]);
   if (signature === view.signature) return;
   view.signature = signature;
   const name = drive.name ?? 'BijouShare';
@@ -137,6 +146,20 @@ function renderDrive(view, drive, servers) {
   const notice = panel.querySelector('.drive-notice');
   notice.hidden = !drive.error;
   notice.textContent = drive.error || '';
+  const elevated = panel.querySelector('.elevated-access');
+  const elevatedStatus = panel.querySelector('.elevated-status');
+  const pending = drive.elevatedAccess === 'Pending';
+  const enabled = drive.elevatedAccess === 'Enabled';
+  const saved = drive.elevatedAccessSaved;
+  elevated.hidden = !(saved || (state.canOfferElevatedAccess && drive.mounted));
+  elevated.dataset.action = pending || enabled || saved ? 'disable' : 'enable';
+  elevated.textContent = pending ? 'Cancel request' : enabled || saved ? 'Turn off elevated access' : 'Allow elevated apps';
+  elevatedStatus.hidden = elevated.hidden;
+  elevatedStatus.textContent = drive.elevatedError || (pending ? 'Waiting for Windows approval…' :
+    enabled ? (drive.explorerElevation ? 'Elevated apps can use this drive. Access is restored when you sign in again.' :
+      'Open programs on this drive from an elevated terminal. Explorer elevation requires a local NTFS profile with a supported path length.') :
+    saved ? (drive.mounted ? 'Restoring saved elevated access for this Windows account…' : 'Approval saved. Access will resume when the drive mounts.') :
+    'Allow elevated apps under your Windows account to use this drive after restart. Windows will ask for approval.');
   const connected = servers.filter(server => server.connected).length;
   panel.querySelector('.count').textContent = connected + (connected === 1 ? ' server connected' : ' servers connected');
   panel.querySelector('.server-total').textContent = String(servers.length);

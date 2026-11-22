@@ -10,6 +10,12 @@ namespace BijouShare.Client;
 public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveOperations> logger,
     string initialVolumeName = ClientSettings.DefaultDriveName) : IDokanOperations
 {
+    private int labelRootOpen;
+    internal MountLogonAccess? LogonAccess { private get; init; }
+
+    internal void ExpectLabelRootOpen() => Volatile.Write(ref labelRootOpen, 1);
+    internal bool FinishLabelRootOpen() => Interlocked.Exchange(ref labelRootOpen, 0) == 2;
+
     private sealed class Context(Guid handle, long generation)
     {
         public Guid Handle { get; } = handle;
@@ -91,7 +97,8 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             if ((options & FileOptions.Encrypted) != 0)
                 return unchecked((NtStatus)0xC00000BB);
             using var requestor = info.GetRequestor();
-            if (requestor?.User is not { } sid || !UserDriveSecurity.Owner.Equals(sid))
+            if (requestor?.User is not { } sid || !UserDriveSecurity.Owner.Equals(sid) ||
+                (LogonAccess is { } scope && !scope.Allows(requestor)))
                 return OpenDenied(access);
             var reply = Send(new()
             {
@@ -107,6 +114,11 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
             }, useHandle: false);
             info.IsDirectory = (reply.Response.Entry ?? throw new InvalidDataException("Missing open-file metadata.")).IsDirectory;
             info.Context = new Context(reply.Response.Handle, reply.Generation);
+            // Only the worker's synchronous, specially flagged volume-label open can bind its handle to this instance.
+            if (Volatile.Read(ref labelRootOpen) == 1 && fileName == @"\" && info.IsDirectory &&
+                info.ProcessId == Environment.ProcessId && mode == FileMode.Open && (options & FileOptions.RandomAccess) != 0 &&
+                share == (FileShare.ReadWrite | FileShare.Delete) && (access & DokanAccess.WriteData) != 0)
+                Interlocked.CompareExchange(ref labelRootOpen, 2, 1);
             return reply.Response.Existed && mode is FileMode.Create or FileMode.OpenOrCreate
                 ? DokanResult.AlreadyExists : NtStatus.Success;
         }
@@ -349,7 +361,8 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
         out uint maximumComponentLength, IDokanFileInfo info)
     {
         volumeLabel = initialVolumeName;
-        fileSystemName = "BijouShare";
+        // Windows uses the filesystem name when handling UAC executable launches (Dokany #678).
+        fileSystemName = "NTFS";
         maximumComponentLength = 255;
         features = FileSystemFeatures.CasePreservedNames | FileSystemFeatures.UnicodeOnDisk;
         return NtStatus.Success;

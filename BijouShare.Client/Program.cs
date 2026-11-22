@@ -8,6 +8,9 @@ using BijouShare.Shared;
 var startupStage = "opening the Windows user session";
 try
 {
+    if (args.Length > 0 && args[0] == "--elevated-drive")
+        return await ElevatedDriveHelper.RunAsync(args);
+
     var protocolLink = WadProtocol.ParseActivation(args);
     var commandLine = ClientCommandLine.Parse(protocolLink is null ? args : []);
     if (commandLine.Command == ClientCommand.Help)
@@ -28,6 +31,7 @@ try
             ContentRootPath = AppContext.BaseDirectory
         });
         service.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Client");
+        service.Services.AddHostedService<ElevatedDriveRestoreService>();
         service.Services.AddHostedService(provider => new UserSessionLauncher(
             provider.GetRequiredService<ILogger<UserSessionLauncher>>(), commandLine.NoBrowser));
         using var broker = service.Build();

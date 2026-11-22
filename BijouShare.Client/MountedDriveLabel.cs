@@ -9,23 +9,25 @@ namespace BijouShare.Client;
 internal sealed class MountedDriveLabel : IDisposable
 {
     private readonly SafeFileHandle root;
+    internal SafeFileHandle RootHandle => root;
     private readonly string mountPoint;
     private string synchronized;
     private string? lastError;
 
-    public MountedDriveLabel(string mountPoint, string initialName)
+    public MountedDriveLabel(string mountPoint, string initialName, DriveOperations operations, string? mountedRoot = null)
     {
         this.mountPoint = mountPoint;
         synchronized = initialName;
         // Keep the directory handle tied to this mount, even if Windows later reuses its letter.
-        const uint writeData = 2, openExisting = 3, backupSemantics = 0x02000000;
-        root = CreateFileW(mountPoint, writeData, FileShare.ReadWrite | FileShare.Delete, 0, openExisting, backupSemantics, 0);
+        const uint writeData = 2, readAttributes = 0x80, openExisting = 3, backupSemantics = 0x02000000, randomAccess = 0x10000000;
+        operations.ExpectLabelRootOpen();
+        bool observed;
+        try { root = CreateFileW(mountedRoot ?? mountPoint, writeData | readAttributes, FileShare.ReadWrite | FileShare.Delete, 0, openExisting, backupSemantics | randomAccess, 0); }
+        finally { observed = operations.FinishLabelRootOpen(); }
         try
         {
             if (root.IsInvalid) throw new Win32Exception(Marshal.GetLastPInvokeError());
-            var fs = new StringBuilder(64);
-            Read(fs);
-            if (fs.ToString() != "BijouShare") throw new IOException($"Drive {mountPoint} does not belong to BijouShare.");
+            if (!observed) throw new IOException($"Drive {mountPoint} no longer points to this BijouShare mount.");
         }
         catch { root.Dispose(); throw; }
     }
@@ -63,10 +65,10 @@ internal sealed class MountedDriveLabel : IDisposable
         }
     }
 
-    private string Read(StringBuilder? fileSystem = null)
+    private string Read()
     {
         var name = new StringBuilder(261);
-        if (!GetVolumeInformationByHandleW(root, name, name.Capacity, out _, out _, out _, fileSystem, fileSystem?.Capacity ?? 0))
+        if (!GetVolumeInformationByHandleW(root, name, name.Capacity, out _, out _, out _, null, 0))
             throw new Win32Exception(Marshal.GetLastPInvokeError());
         return name.ToString();
     }
@@ -83,6 +85,9 @@ internal sealed class MountedDriveLabel : IDisposable
     }
 
     public void Dispose() => root.Dispose();
+
+    internal static void NotifyDriveLetter(string path, bool added) =>
+        SHChangeNotify(added ? 0x100 /* SHCNE_DRIVEADD */ : 0x80 /* SHCNE_DRIVEREMOVED */, 5 /* SHCNF_PATHW */, path, 0);
 
     [StructLayout(LayoutKind.Sequential)] private struct IoStatusBlock { public nint Status; public nuint Information; }
     [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]

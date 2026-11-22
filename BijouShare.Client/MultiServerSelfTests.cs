@@ -17,11 +17,51 @@ internal static class MultiServerSelfTests
         await ServerPermissions(check);
         await FailureIsolation(check);
         await InviteNotices(check);
+        await EnrollmentLoss(check);
         await AuthenticatedNames(check);
         await OfflineRecovery(check);
         await WakeRecoveryWindow(check);
         await DeferredCloses(check);
         await ResumeDuringHandshake(check);
+    }
+
+    private static async Task EnrollmentLoss(Action<bool, string> check)
+    {
+        var remote = new FakeConnection(19);
+        using var router = new MultiServerConnection([("Archive", (IRemoteConnection)remote)]);
+        var revoked = 0;
+        router.EnrollmentRevoked += () => Interlocked.Increment(ref revoked);
+        async Task Probe(string? error)
+        {
+            remote.Failure = error;
+            await router.RefreshAsync(CancellationToken.None);
+        }
+        foreach (var code in new[] { "PendingApproval", "InviteRequired", "DeviceRejected", "DeviceBlocked" })
+            await Probe(code);
+        check(revoked == 0, "A new registration that has never been admitted cannot revoke drive access");
+        await Probe(null);
+        foreach (var code in new[] { "Disconnected", "Timeout", "ConfigurationError", "AccessDenied", "InvalidInvite" })
+            await Probe(code);
+        check(revoked == 0, "Transport loss, file permission denials, and transient enrollment errors preserve elevated access");
+        await Probe("PendingApproval");
+        await Probe("Disconnected");
+        await Probe("PendingApproval");
+        await Probe("InviteRequired");
+        check(revoked == 1, "An admitted device returning to enrollment reports one kick across subsequent outages and retries");
+        foreach (var code in new[] { "InviteRequired", "DeviceBlocked", "DeviceRejected" })
+        {
+            await Probe(null);
+            await Probe(code);
+        }
+        check(revoked == 4, "A fresh admission allows the drive to act on subsequent server blocks or enrollment withdrawals");
+        await Probe(null);
+        void FailOnce() => throw new IOException("Simulated grant-store write failure.");
+        router.EnrollmentRevoked += FailOnce;
+        try { await Probe("DeviceBlocked"); throw new InvalidOperationException("A failed revocation was acknowledged."); }
+        catch (IOException) { }
+        finally { router.EnrollmentRevoked -= FailOnce; }
+        await Probe("DeviceBlocked");
+        check(revoked == 6, "A failed revocation is retried when the server reaffirms the block");
     }
 
     private static async Task InviteNotices(Action<bool, string> check)

@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using DokanNet;
 using Microsoft.Extensions.Logging.Abstractions;
 using BijouShare.Shared;
@@ -11,6 +12,38 @@ namespace BijouShare.Client;
 
 internal static class ClientSelfTests
 {
+    private static void CheckMountLogonAccess(Action<bool, string> check)
+    {
+        using var owner = WindowsIdentity.GetCurrent();
+        using var anonymous = WindowsIdentity.GetAnonymous();
+        var access = new MountLogonAccess();
+        check(access.Allows(owner) && !access.Allows(anonymous) && !access.Allows(null),
+            "A mounted volume admits its Windows owner and rejects anonymous and missing caller tokens");
+        // Compare logon IDs without creating a second Windows logon or requesting elevation.
+        var otherLogon = ElevatedDriveAlias.AuthenticationId(owner.AccessToken) ^ long.MinValue;
+        check(!access.AllowsLogon(otherLogon), "A second logon of the same user has no drive access");
+
+        using var linked = ElevatedDriveAlias.OpenLinkedToken(owner.AccessToken);
+        using var counterpart = linked is null ? null : new WindowsIdentity(linked.DangerousGetHandle());
+        if (counterpart is not null && !new WindowsPrincipal(owner).IsInRole(WindowsBuiltInRole.Administrator))
+        {
+            check(!access.Allows(counterpart), "The owner's linked administrator starts without drive access");
+            access.SetElevatedAllowed(true);
+            check(access.Allows(owner) && access.Allows(counterpart) && !access.AllowsLogon(otherLogon),
+                "Enabling access admits exactly the owner's linked administrator logon");
+            access.SetElevatedAllowed(false);
+            check(access.Allows(owner) && !access.Allows(counterpart),
+                "Disabling elevated access revokes the paired logon and preserves the owner's access");
+        }
+        else
+        {
+            var rejected = false;
+            try { access.SetElevatedAllowed(true); }
+            catch (UnauthorizedAccessException) { rejected = true; }
+            check(rejected && access.Allows(owner), "A logon without a paired administrator retains ordinary drive access");
+        }
+    }
+
     public static async Task<int> RunAsync()
     {
         await ProtocolSelfTests.RunAsync();
@@ -36,6 +69,7 @@ internal static class ClientSelfTests
         ClientSetupSelfTests.Run(Check);
         await ClientSetupSelfTests.ActivationHandoff(Check);
         ClientProfileSelfTests.Run(Check);
+        CheckMountLogonAccess(Check);
         await ClientManagementSelfTests.RunAsync(Check);
 
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--data-dir", "--probe"]), "A missing CLI value cannot consume the next command");
@@ -115,8 +149,19 @@ internal static class ClientSelfTests
         finally { if (Directory.Exists(temp)) Directory.Delete(temp, true); }
 
         var remote = new ScriptedConnection();
-        var operations = new DriveOperations(remote, NullLogger<DriveOperations>.Instance);
+        var operations = new DriveOperations(remote, NullLogger<DriveOperations>.Instance, "Test drive");
         var info = new MockDokanFileInfo { WhatGetRequestorShouldReturn = System.Security.Principal.WindowsIdentity.GetCurrent() };
+        Check(operations.GetVolumeInformation(out var label, out var features, out var format, out _, info) == NtStatus.Success &&
+            label == "Test drive" && format == "NTFS" &&
+            features == (FileSystemFeatures.CasePreservedNames | FileSystemFeatures.UnicodeOnDisk),
+            "Windows sees a UAC-compatible filesystem name, the user's volume label and the supported filesystem capabilities");
+        var unrelatedRoot = Directory.CreateTempSubdirectory("BijouShare-label-test-");
+        try
+        {
+            Reject<IOException>(() => new MountedDriveLabel(unrelatedRoot.FullName, label, operations).Dispose(),
+                "A directory handle opened on another volume cannot be used to relabel it");
+        }
+        finally { unrelatedRoot.Delete(); }
         var handle = Guid.NewGuid();
         using var anonymous = System.Security.Principal.WindowsIdentity.GetAnonymous();
         Check(operations.CreateFile("\\", DokanNet.FileAccess.GenericRead, FileShare.ReadWrite,

@@ -117,6 +117,8 @@ public sealed class ClientSettings
     public string MountPoint { get; set; } = "";
     public List<string> AdditionalMountPoints { get; set; } = [];
     public Dictionary<string, string> DriveNames { get; set; } = [];
+    // Identifies separately authorized Windows grants. The profile alone cannot authorize elevation.
+    [JsonInclude] private Dictionary<string, Guid> ElevatedDriveGrants { get; set; } = [];
     public const string DefaultDriveName = "BijouShare";
     public int RequestTimeoutSeconds { get; set; } = 30;
     internal bool IsConfigured => endpoint is not null || Servers.Count > 0;
@@ -186,6 +188,43 @@ public sealed class ClientSettings
     {
         lock (persistenceGate)
             return DriveNames.GetValueOrDefault(NormalizeMountPoint(mountPoint), DefaultDriveName);
+    }
+
+    internal Guid? ElevatedGrant(string mountPoint)
+    {
+        lock (persistenceGate)
+            return ElevatedDriveGrants.TryGetValue(NormalizeMountPoint(mountPoint), out var grant) ? grant : null;
+    }
+
+    internal void SetElevatedGrant(string mountPoint, Guid? grant) => UpdateElevatedGrant(mountPoint, grant, null);
+
+    internal bool ClearElevatedGrant(string mountPoint, Guid expected) => UpdateElevatedGrant(mountPoint, null, expected);
+
+    private bool UpdateElevatedGrant(string mountPoint, Guid? grant, Guid? expected)
+    {
+        if (parent is not null)
+            throw new InvalidOperationException("Configure drive access on the root client settings.");
+        mountPoint = NormalizeMountPoint(mountPoint);
+        if (grant == Guid.Empty || expected == Guid.Empty)
+            throw new ArgumentException("A drive access grant requires a nonempty ID.");
+        lock (persistenceGate)
+        {
+            var previous = ElevatedGrant(mountPoint);
+            if (expected.HasValue && previous != expected) return false;
+            if (!DriveSnapshot().Contains(mountPoint))
+                throw new ArgumentException("Unknown drive.");
+            if (previous == grant) return false;
+            if (grant.HasValue) ElevatedDriveGrants[mountPoint] = grant.Value;
+            else ElevatedDriveGrants.Remove(mountPoint);
+            try { PersistChange(); }
+            catch
+            {
+                if (previous.HasValue) ElevatedDriveGrants[mountPoint] = previous.Value;
+                else ElevatedDriveGrants.Remove(mountPoint);
+                throw;
+            }
+            return true;
+        }
     }
 
     public void RenameDrive(string mountPoint, string name)
@@ -259,6 +298,7 @@ public sealed class ClientSettings
             if (ServerSnapshot(mountPoint).Length != 0)
                 throw new ArgumentException("Disconnect this drive's servers before removing it.");
             var hadName = DriveNames.Remove(mountPoint, out var name);
+            var hadGrant = ElevatedDriveGrants.Remove(mountPoint, out var grant);
             if (AdditionalMountPoints.Count == 0)
             {
                 MountPoint = "";
@@ -267,6 +307,7 @@ public sealed class ClientSettings
                 {
                     MountPoint = mountPoint;
                     if (hadName) DriveNames[mountPoint] = name!;
+                    if (hadGrant) ElevatedDriveGrants[mountPoint] = grant;
                     throw;
                 }
                 return;
@@ -287,6 +328,7 @@ public sealed class ClientSettings
             {
                 MountPoint = oldPrimary;
                 if (hadName) DriveNames[mountPoint] = name!;
+                if (hadGrant) ElevatedDriveGrants[mountPoint] = grant;
                 AdditionalMountPoints.Insert(index, removedLetter);
                 foreach (var server in promoted)
                     server.MountPoint = removedLetter;
@@ -539,6 +581,9 @@ public sealed class ClientSettings
         }
         if (DriveNames is null || DriveNames.Keys.Any(letter => !drives.Contains(letter)))
             throw new InvalidDataException("A drive name references an unknown drive.");
+        if (ElevatedDriveGrants is null || ElevatedDriveGrants.Any(item => !drives.Contains(item.Key) || item.Value == Guid.Empty) ||
+            ElevatedDriveGrants.Values.Distinct().Count() != ElevatedDriveGrants.Count)
+            throw new InvalidDataException("Invalid or duplicated drive access grant.");
         foreach (var label in DriveNames.Values)
             ValidateDriveName(label);
         if (RequestTimeoutSeconds is < 5 or > 45)

@@ -1,3 +1,7 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.IO.Pipes;
+using System.Security.Principal;
 using System.Text;
 using DokanNet;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -21,6 +25,18 @@ internal static class ClientManagementSelfTests
             var drive = new ClientDriveState();
             var management = new ClientManagement(settings, connections, drive);
             check(connections.Snapshot().Length == 0, "A fresh client has no drive workers");
+            var nonce = Guid.NewGuid();
+            var activation = new[] { "--elevated-drive", "W:", "123", nonce.ToString("N") };
+            check(ElevatedDriveHelper.TryParse(activation, out var letter, out var pid, out var proof) &&
+                letter == 'W' && pid == 123 && proof == nonce, "The elevated helper accepts a single drive letter, worker PID and request nonce");
+            foreach (var malformed in new[]
+            {
+                new[] { "--elevated-drive", @"W:\Windows", "123", nonce.ToString("N") },
+                new[] { "--elevated-drive", "W:", "-1", nonce.ToString("N") },
+                new[] { "--elevated-drive", "W:", "123", Guid.Empty.ToString("N") },
+                new[] { "--elevated-drive", "W:", "123", nonce.ToString("N"), "program.exe" }
+            })
+                check(!ElevatedDriveHelper.TryParse(malformed, out _, out _, out _), "Malformed elevated activation is rejected before opening any pipe");
             var invite = new string('A', 32);
             using var ec = KeyAgreement.NewKey();
             using var kem = HybridKem.Generate();
@@ -42,6 +58,15 @@ internal static class ClientManagementSelfTests
             var id = settings.DeviceId;
             var key = settings.PublicKey;
             await management.UpdateDeviceAsync("My configured laptop");
+            try
+            {
+                await management.SetElevatedAccessAsync(Path.GetPathRoot(Environment.SystemDirectory)!, true, CancellationToken.None);
+                throw new InvalidOperationException("An unconfigured letter accepted elevated access.");
+            }
+            catch (ArgumentException)
+            {
+                check(settings.DriveSnapshot().Length == 0, "Elevated access cannot target an arbitrary drive on the machine");
+            }
             var reloaded = ClientSettings.Load(path);
             check(reloaded.SetupComplete && reloaded.DeviceName == "My configured laptop" && reloaded.DriveSnapshot().Length == 0 &&
                 reloaded.DeviceId == id && reloaded.PublicKey == key && reloaded.ServerSnapshot().Length == 1 &&
@@ -71,6 +96,17 @@ internal static class ClientManagementSelfTests
                 }
                 check(settings.DriveSnapshot().Length == 0, "The backend requires a valid name before adding a drive");
                 await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Add, "Projects", CancellationToken.None);
+                try
+                {
+                    await management.SetElevatedAccessAsync(available, true, CancellationToken.None);
+                    throw new InvalidOperationException("An unmounted drive accepted elevated access.");
+                }
+                catch (ArgumentException)
+                {
+                    await management.SetElevatedAccessAsync(available, false, CancellationToken.None);
+                    check(drive.ElevatedStatus(available) == ("Disabled", null),
+                        "An unmounted drive rejects elevated access and accepts an explicit disable");
+                }
                 var router = connections.ForDrive(available);
                 await management.ChangeDriveAsync(available, ClientManagement.DriveChange.Rename, "Media Library", CancellationToken.None);
                 check(!settings.TryRenameDrive(available, "Projects", "Obsolete") &&
@@ -108,7 +144,77 @@ internal static class ClientManagementSelfTests
             check(ClientActivation.PipeName(directory) == ClientActivation.PipeName(directory.ToUpperInvariant()) &&
                 ClientActivation.PipeName(directory) != ClientActivation.PipeName(directory + "-other"),
                 "Client activation isolates data directories while preserving Windows path case equivalence");
+            await CheckMountHandoffAsync(path, check);
         }
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+    }
+
+    private static async Task CheckMountHandoffAsync(string path, Action<bool, string> check)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var root = File.OpenHandle(path);
+        var pipeName = $"BijouShare.test.{Guid.NewGuid():N}";
+        using var pipe = ClientActivation.CreatePipe(pipeName);
+        using var peer = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
+        using var process = Process.GetCurrentProcess();
+        var handshake = MountAliasPipe.AuthorizeMountAsync(pipe, process, root, 'A', timeout.Token);
+        await peer.ConnectAsync(timeout.Token);
+        var payload = new byte[sizeof(long)];
+        await peer.ReadExactlyAsync(payload, timeout.Token);
+        check(BinaryPrimitives.ReadInt64LittleEndian(payload) == root.DangerousGetHandle().ToInt64() &&
+            ClientActivation.VerifyServerExecutable(peer) == Environment.ProcessId,
+            "Only the bound root handle is offered by the expected local process");
+        await peer.WriteAsync(new byte[] { (byte)MountAliasReply.Ready }, timeout.Token);
+        var ack = new byte[1];
+        await peer.ReadExactlyAsync(ack, timeout.Token);
+        await handshake;
+        using var owner = WindowsIdentity.GetCurrent();
+        var expectedLogon = ElevatedDriveAlias.AuthenticationId(owner.AccessToken);
+        bool identified = false;
+        pipe.RunAsClient(() =>
+        {
+            using var caller = WindowsIdentity.GetCurrent(ifImpersonating: true);
+            identified = caller?.ImpersonationLevel == TokenImpersonationLevel.Identification &&
+                caller.User == owner.User && ElevatedDriveAlias.AuthenticationId(caller.AccessToken) == expectedLogon;
+        });
+        check(identified, "The restore pipe verifies the caller's SID and logon with an identification-only token");
+        pipe.Dispose();
+        check(ack[0] == (byte)MountAliasReply.Ready && await peer.ReadAsync(ack, timeout.Token) == 0,
+            "An acknowledged drive handoff ends as soon as the mount's pipe closes");
+
+        var secondName = $"BijouShare.test.{Guid.NewGuid():N}";
+        using var second = ClientActivation.CreatePipe(secondName);
+        using var wrongPeer = new NamedPipeClientStream(".", secondName, PipeDirection.InOut, PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
+        using var otherProcess = Process.GetProcessById(0);
+        var refused = MountAliasPipe.AuthorizeMountAsync(second, otherProcess, root, 'A', timeout.Token);
+        await wrongPeer.ConnectAsync(timeout.Token);
+        try
+        {
+            await refused;
+            throw new InvalidOperationException("A different client process obtained the drive handle.");
+        }
+        catch (IOException) { }
+        second.Dispose();
+        check(await wrongPeer.ReadAsync(ack, timeout.Token) == 0, "A different pipe client PID receives no mount proof");
+
+        var thirdName = $"BijouShare.test.{Guid.NewGuid():N}";
+        using var third = ClientActivation.CreatePipe(thirdName);
+        using var waitingPeer = new NamedPipeClientStream(".", thirdName, PipeDirection.InOut, PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var midHandshake = MountAliasPipe.AuthorizeMountAsync(third, process, root, 'A', stop.Token);
+        await waitingPeer.ConnectAsync(timeout.Token);
+        await waitingPeer.ReadExactlyAsync(payload, timeout.Token);
+        await stop.CancelAsync();
+        try
+        {
+            await midHandshake;
+            throw new InvalidOperationException("The worker acknowledged an interrupted mount handoff.");
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested && !timeout.IsCancellationRequested) { }
+        third.Dispose();
+        check(await waitingPeer.ReadAsync(ack, timeout.Token) == 0, "An unmount cancels a pending handoff without acknowledging it");
     }
 }

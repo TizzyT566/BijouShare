@@ -24,3 +24,35 @@ internal static class UserDriveSecurity
         options.VolumeSecurityDescriptorLength = descriptor.BinaryLength;
     }
 }
+
+internal sealed class MountLogonAccess
+{
+    private readonly SecurityIdentifier owner;
+    private readonly long ownerLogon;
+    private readonly long? administratorLogon;
+    private bool elevatedAllowed;
+
+    public MountLogonAccess()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        owner = identity.User ?? throw new UnauthorizedAccessException("The mount requires a Windows user SID.");
+        ownerLogon = ElevatedDriveAlias.AuthenticationId(identity.AccessToken);
+        administratorLogon = ElevatedDriveAlias.LinkedAdministratorLogon(identity);
+    }
+
+    public bool Allows(WindowsIdentity? caller)
+    {
+        if (caller?.User != owner) return false;
+        return AllowsLogon(ElevatedDriveAlias.AuthenticationId(caller.AccessToken));
+    }
+
+    internal bool AllowsLogon(long logon) =>
+        logon == ownerLogon || (Volatile.Read(ref elevatedAllowed) && administratorLogon == logon);
+
+    public void SetElevatedAllowed(bool allowed)
+    {
+        if (allowed && !administratorLogon.HasValue)
+            throw new UnauthorizedAccessException("This Windows sign-in has no linked administrator logon for the drive.");
+        Volatile.Write(ref elevatedAllowed, allowed);
+    }
+}

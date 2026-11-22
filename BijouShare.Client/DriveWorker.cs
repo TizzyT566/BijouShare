@@ -110,26 +110,39 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         if (Directory.GetLogicalDrives().Any(drive => drive.Equals(mountPoint, StringComparison.OrdinalIgnoreCase)))
             throw new IOException($"Drive {mountPoint} is already in use. Choose an unused drive letter.");
         var initialName = settings.GetDriveName(mountPoint);
-        var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>(), initialName);
-        using var instance = await CreateMountAsync(dokan, mountPoint, operations, stoppingToken);
-        using var label = new MountedDriveLabel(mountPoint, initialName);
-
-        driveState.SetMounted(mountPoint);
+        using var directory = CreatePrivateDirectory(mountPoint);
+        var access = directory is null ? null : new MountLogonAccess();
+        var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>(), initialName) { LogonAccess = access };
+        var mounted = await CreateMountAsync(dokan, mountPoint, directory, operations, initialName, stoppingToken);
+        using var instance = mounted.Instance;
+        using var label = mounted.Label;
+        using var letter = mounted.Letter;
         using var heartbeatCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var heartbeat = HeartbeatAsync(connection, changes, heartbeatCancellation.Token);
+        var alias = new MountAliasPipe(mountPoint[0], label.RootHandle, access, settings);
         try
         {
-            await MonitorMountAsync(connection, instance, mountPoint, changes, label, stoppingToken);
+            driveState.SetMounted(mountPoint, alias, directory is not null);
+            if (letter is not null) MountedDriveLabel.NotifyDriveLetter(mountPoint, added: true);
+            await MonitorMountAsync(connection, instance, mountPoint, directory?.MountPath ?? mountPoint, changes, label, alias, stoppingToken);
         }
         finally
         {
+            // Cancel pending consent before the mount disappears from the management state.
+            var closing = alias.DisposeAsync();
+            driveState.Remove(mountPoint);
+            await closing;
             if (instance.IsFileSystemRunning() && settings.DriveSnapshot().Contains(mountPoint))
                 label.Synchronize(settings, logger);
-            driveState.Remove(mountPoint);
             await heartbeatCancellation.CancelAsync();
             try { await heartbeat; }
             finally
             {
+                if (letter is not null)
+                {
+                    letter.Dispose();
+                    MountedDriveLabel.NotifyDriveLetter(mountPoint, added: false);
+                }
                 if (!stoppingToken.IsCancellationRequested)
                     connection.ResetAfterUnmount();
             }
@@ -138,16 +151,32 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
             throw new IOException("The virtual drive was unexpectedly unmounted.");
     }
 
-    private async Task<DokanInstance> CreateMountAsync(Dokan dokan, string mountPoint, DriveOperations operations, CancellationToken token)
+    private PrivateMountDirectory? CreatePrivateDirectory(string mountPoint)
+    {
+        if (!ElevatedDriveAlias.HasLinkedElevation || settings.SettingsPath is not { } path) return null;
+        try { return PrivateMountDirectory.Create(Path.GetDirectoryName(path)!, mountPoint[0]); }
+        catch (NotSupportedException ex)
+        {
+            logger.LogInformation("Mounting {Mount} in the current logon without a Windows volume path: {Reason}", mountPoint, ex.Message);
+            return null;
+        }
+    }
+
+    private async Task<(DokanInstance Instance, MountedDriveLabel Label, IDisposable? Letter)> CreateMountAsync(
+        Dokan dokan, string mountPoint, PrivateMountDirectory? directory, DriveOperations operations, string initialName, CancellationToken token)
     {
         await mountGate.WaitAsync(token);
         DokanInstance? instance = null;
+        MountedDriveLabel? label = null;
+        IDisposable? letter = null;
+        var root = directory?.MountPath ?? mountPoint;
         try
         {
             instance = new DokanInstanceBuilder(dokan).ConfigureOptions(o =>
             {
-                o.MountPoint = mountPoint;
+                o.MountPoint = root;
                 o.Options = DokanOptions.FixedDrive | DokanOptions.UserModeLock | DokanOptions.CurrentSession;
+                if (directory is not null) o.Options |= DokanOptions.MountManager;
                 UserDriveSecurity.Configure(o);
                 o.TimeOut = TimeSpan.FromSeconds(60);
             }).Build(operations);
@@ -159,14 +188,23 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    CheckRootReadable(mountPoint);
-                    return instance;
+                    CheckRootReadable(root);
+                    break;
                 }
                 catch (IOException) when (attempt < 20) { await Task.Delay(200, token); }
             }
+            label = new MountedDriveLabel(mountPoint, initialName, operations, root);
+            if (directory is not null)
+            {
+                letter = ElevatedDriveAlias.MountPrivateLetter(mountPoint, root, label.RootHandle);
+                CheckRootReadable(mountPoint);
+            }
+            return (instance, label, letter);
         }
         catch
         {
+            letter?.Dispose();
+            label?.Dispose();
             instance?.Dispose();
             throw;
         }
@@ -180,7 +218,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
     }
 
     private async Task MonitorMountAsync(MultiServerConnection connection, DokanInstance instance, string mountPoint,
-        ConnectionChangeMonitor changes, MountedDriveLabel label, CancellationToken token)
+        string notificationRoot, ConnectionChangeMonitor changes, MountedDriveLabel label, MountAliasPipe alias, CancellationToken token)
     {
         var previous = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var absentSamples = 0;
@@ -190,6 +228,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         while (!token.IsCancellationRequested && instance.IsFileSystemRunning())
         {
             var tick = Environment.TickCount64;
+            alias.RestoreIfDue();
             if (tick - lastTick > 45_000)
                 changes.NoteResume(tick);
             lastTick = tick;
@@ -220,10 +259,10 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 label.Synchronize(settings, logger);
             var current = connection.MountedServerFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var removed in previous.Except(current, previous.Comparer).ToArray())
-                if (instance.NotifyDelete(Path.Combine(mountPoint, removed), true))
+                if (instance.NotifyDelete(Path.Combine(notificationRoot, removed), true))
                     previous.Remove(removed);
             foreach (var added in current.Except(previous, previous.Comparer))
-                if (instance.NotifyCreate(Path.Combine(mountPoint, added), true))
+                if (instance.NotifyCreate(Path.Combine(notificationRoot, added), true))
                     previous.Add(added);
             await Task.Delay(TimeSpan.FromSeconds(1), token);
         }
@@ -300,7 +339,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
                 "AuthenticationFailed" => "Server authentication failed",
                 "ServerLinkRequired" => "Add a current connection link from this server",
                 "HybridUnavailable" => "Update Windows to a version with native CNG support for ML-KEM-768",
-                "ConfigurationError" => "Cannot access or persist this server's client configuration",
+                "ConfigurationError" => "The client or server could not access its saved configuration",
                 _ => "Waiting for server connection"
             };
             logger.LogInformation("Server {Server}: {State}", status.Name, message);
