@@ -7,7 +7,7 @@ using BijouShare.Shared;
 namespace BijouShare.Server;
 
 public sealed class FileServer(ServerOptions options, StateStore store, FileService files,
-    AuditLog audit, ILogger<FileServer> logger) : BackgroundService
+    AuditLog audit, ILogger<FileServer> logger, ServerTransfers? transfers = null) : BackgroundService
 {
     private readonly ConcurrentDictionary<Guid, Task> connections = new();
     private readonly FileSessionLeases leases = new(store, files, TimeProvider.System);
@@ -308,11 +308,16 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                     await transport.SendAsync(RpcResponse.Fail("DeviceBlocked"), timeout.Token);
                     return;
                 }
-                var readyIdentity = registration
-                    ? store.UpdateAuthenticatedDeviceName(device, hello.DeviceName!)
-                    : store.Identity(deviceId);
-                if (!readyIdentity.HasSameIdentity(device))
-                    throw new UnauthorizedAccessException();
+                if (registration)
+                    store.UpdateAuthenticatedDeviceName(device, hello.DeviceName!);
+                // Attach counters under the enrollment lock so a concurrent forget cannot recreate an old record.
+                var (readyIdentity, counters) = store.Read(_ =>
+                {
+                    var current = store.Identity(deviceId);
+                    if (!current.HasSameIdentity(device))
+                        throw new UnauthorizedAccessException();
+                    return (current, transfers?.ForDevice(current));
+                });
                 if (readyIdentity.Name != device.Name)
                     audit.Write(readyIdentity.Name, "DeviceRenamed", publicIdentity);
                 await transport.SendAsync(new RpcResponse
@@ -327,15 +332,16 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 if (hello.BinaryPayloads)
                 {
                     pipelineOwnsSession = true;
-                    await ServePipelinedAsync(transport, session, deviceId, device, actor, stoppingToken);
+                    await ServePipelinedAsync(transport, session, deviceId, device, actor, counters, stoppingToken);
                     return;
                 }
                 while (!stoppingToken.IsCancellationRequested)
                 {
                     timeout.CancelAfter(TimeSpan.FromSeconds(90));
                     var request = await transport.ReceiveAsync<RpcRequest>(timeout.Token);
-                    var result = ExecuteFileRequest(session, device, actor, request);
+                    var result = ExecuteFileRequest(session, device, actor, request, counters);
                     await transport.SendAsync(result, timeout.Token);
+                    counters?.ReadSent(result);
                     try
                     {
                         var current = store.Identity(deviceId);
@@ -361,12 +367,13 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
             }
         }
     }
-    private RpcResponse ExecuteFileRequest(Guid session, Device device, string actor, RpcRequest request, OperationReceipts? receipts = null)
+    private RpcResponse ExecuteFileRequest(Guid session, Device device, string actor, RpcRequest request,
+        ServerTransfers.Counters? counters, OperationReceipts? receipts = null)
     {
         try
         {
             request.Validate();
-            var response = files.Execute(session, device.Id, request, device, receipts);
+            var response = files.Execute(session, device.Id, request, device, receipts, counters);
             if (request.Operation == "List" && request.BasicDirectoryInfo && response.Entries is { } entries)
                 return response with { Entries = null, Items = entries.ConvertAll(DirectoryItem.FromEntry) };
             return response;
@@ -386,7 +393,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
     }
 
     private async Task ServePipelinedAsync(SecureTransport transport, Guid session, Guid deviceId, Device device,
-        string actor, CancellationToken stoppingToken)
+        string actor, ServerTransfers.Counters? counters, CancellationToken stoppingToken)
     {
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var owner = new FileSessionLeases.Owner(lifetime);
@@ -445,11 +452,12 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                         response = ExecuteFileRequest(session, device, actor, request with
                         {
                             BorrowReadBuffer = true
-                        }, lease?.Receipts);
+                        }, counters, lease?.Receipts);
                         await transport.SendAsync(response with
                         {
                             RequestId = request.RequestId
                         }, lifetime.Token);
+                        counters?.ReadSent(response);
                         var current = store.Identity(deviceId);
                         if (!current.HasSameIdentity(device))
                             lifetime.Cancel();

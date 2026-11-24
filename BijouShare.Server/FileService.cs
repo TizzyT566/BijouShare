@@ -76,7 +76,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
     public RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice = null) =>
         Execute(session, deviceId, request, authenticatedDevice, null);
 
-    internal RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice, OperationReceipts? receipts)
+    internal RpcResponse Execute(Guid session, Guid deviceId, RpcRequest request, Device? authenticatedDevice,
+        OperationReceipts? receipts, ServerTransfers.Counters? transfers = null)
     {
         RpcResponse Run()
         {
@@ -92,8 +93,8 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
                 return new();
             }
             if (receipts is not null && request.OutcomeId > 0)
-                return receipts.Execute(request, store.Revision, () => ExecuteLocked(session, device, request));
-            return ExecuteLocked(session, device, request);
+                return receipts.Execute(request, store.Revision, () => ExecuteLocked(session, device, request, transfers));
+            return ExecuteLocked(session, device, request, transfers);
         }
         // Read/data requests run concurrently; mutations and policy invalidation remain exclusive.
         if (request.Operation is "Read" or "Write" or "Flush" or "Stat" or "Ping" or "Security" or "Space")
@@ -137,7 +138,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         }
         finally { gate.ExitWriteLock(); }
     }
-    private RpcResponse ExecuteLocked(Guid session, Device device, RpcRequest request)
+    private RpcResponse ExecuteLocked(Guid session, Device device, RpcRequest request, ServerTransfers.Counters? transfers)
     {
         var principal = device; // Re-evaluated even on existing handles.
         if (request.Operation == "Ping")
@@ -186,7 +187,7 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
             "Stat" => new() { Entry = Stat(location, principal, handle) },
             "List" => List(session, location, principal, request),
             "Read" => Read(RequireHandle(handle), principal, request),
-            "Write" => Write(RequireHandle(handle), principal, request),
+            "Write" => Write(RequireHandle(handle), principal, request, transfers),
             "Flush" => Flush(RequireHandle(handle)),
             "Resize" => Resize(RequireHandle(handle), principal, request.Length),
             "Allocate" => Allocate(RequireHandle(handle), principal, request.Length),
@@ -679,10 +680,16 @@ public sealed class FileService(StateStore store, AuditLog audit) : IDisposable
         }
         catch { if (borrowed) ArrayPool<byte>.Shared.Return(buffer, clearArray: true); throw; }
     }
-    private RpcResponse Write(OpenHandle h, Device principal, RpcRequest request)
+    private RpcResponse Write(OpenHandle h, Device principal, RpcRequest request, ServerTransfers.Counters? transfers)
     {
         lock (h.WriteGate)
-            return WriteLocked(h, principal, request);
+        {
+            var response = WriteLocked(h, principal, request);
+            // Count the accepted length once, even if the acknowledgement is recovered from a receipt later.
+            if (response.Length > 0)
+                transfers?.AddWrite(response.Length);
+            return response;
+        }
     }
     private RpcResponse WriteLocked(OpenHandle h, Device principal, RpcRequest request)
     {

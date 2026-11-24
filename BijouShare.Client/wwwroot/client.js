@@ -3,6 +3,7 @@ const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 let state, csrf = '', busy = false, selectedRemoval = null, toastTimer;
 let stateSequence = 0, polling = false, activeView = '', letterSignature, pendingSignature;
+let transferChart, stopTransfers;
 const driveViews = new Map();
 const accessKey = 'bijoushare.managementAccess';
 const launch = new URLSearchParams(location.hash.slice(1));
@@ -29,11 +30,11 @@ const descriptions = {
   Waiting: ['Connecting', 'Waiting for an authenticated connection.', 'waiting']
 };
 
-async function api(path, method = 'GET', body) {
+async function api(path, method = 'GET', body, signal) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
-    const response = await fetch('/api' + path, {method, credentials:'same-origin', signal:controller.signal,
+    const response = await fetch('/api' + path, {method, credentials:'same-origin', signal:signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       headers:{'Content-Type':'application/json','X-CSRF-TOKEN':csrf, Authorization:'Bearer ' + (sessionStorage.getItem(accessKey) || '')}, body:body === undefined ? undefined : JSON.stringify(body)});
     if (response.status === 403 || response.status === 401) throw new Error('Click the BijouShare Client tray icon in your Windows session to manage your drives.');
     const result = await response.json();
@@ -127,7 +128,26 @@ function selectView(id, remember = true) {
     if (selected) $('#view-name').textContent = tab.getAttribute('aria-label') || tab.textContent.trim();
   }
   $('#refresh').hidden = !id.startsWith('drive-');
+  monitorTransfers(id === 'transfers');
   if (remember) history.replaceState(null, '', '#' + id);
+}
+
+function monitorTransfers(visible) {
+  if (!visible) {
+    stopTransfers?.();
+    stopTransfers = undefined;
+    return;
+  }
+  if (stopTransfers) return;
+  transferChart ??= new TransferChart($('#transfers-chart'), 'All drives');
+  const status = $('#transfers-status');
+  stopTransfers = watchTransfers(signal => api('/transfers', 'GET', undefined, signal), snapshot => {
+    transferChart.update(snapshot);
+    status.hidden = true;
+  }, error => {
+    status.textContent = error.message;
+    status.hidden = false;
+  });
 }
 
 function renderDrive(view, drive, servers) {
@@ -240,6 +260,7 @@ function render(next) {
   $('#setup').hidden = state.setupComplete;
   $('#dashboard').hidden = !state.setupComplete;
   if (!state.setupComplete) {
+    monitorTransfers(false);
     if (!previous || previous.setupComplete) {
       $('#setup-name').value = state.deviceName;
       $('#setup-name').focus();

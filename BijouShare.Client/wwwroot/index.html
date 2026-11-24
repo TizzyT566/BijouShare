@@ -8,6 +8,8 @@
   <link rel="icon" href="/bijou-mark.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/console.css">
   <link rel="stylesheet" href="/client.css">
+  <link rel="stylesheet" href="/transfer-monitor.css">
+  <script src="/transfer-monitor.js" defer></script>
   <script src="/client.js" defer></script>
 </head>
 <body>
@@ -48,6 +50,7 @@
         <div id="drive-tabs" role="presentation"></div>
         <button type="button" role="tab" id="tab-add" aria-controls="add" aria-selected="false" tabindex="-1"><span class="bi bi-plus" aria-hidden="true"></span>Add drive</button>
         <div class="rail-divider" role="presentation"></div>
+        <button type="button" role="tab" id="tab-transfers" aria-controls="transfers" aria-selected="false" tabindex="-1"><span class="bi bi-activity" aria-hidden="true"></span>Transfers</button>
         <button type="button" role="tab" id="tab-settings" aria-controls="settings" aria-selected="false" tabindex="-1"><span class="bi bi-settings" aria-hidden="true"></span>Device settings</button>
       </div>
       <div class="profile">
@@ -88,6 +91,12 @@
             <div class="section-title"><span class="tile"><span class="bi bi-clock" aria-hidden="true"></span></span><div><h2>Servers waiting for a drive</h2><p class="muted">These servers will connect when you add your first drive.</p></div></div>
             <ul id="pending-list"></ul><p id="pending-error" class="error" role="alert"></p>
           </div>
+        </section>
+
+        <section id="transfers" role="tabpanel" aria-labelledby="tab-transfers" hidden>
+          <div class="page-heading"><h1>Transfers</h1><p class="muted">File data read and written across all drives in your Windows profile.</p></div>
+          <p id="transfers-status" class="notice" role="status" hidden></p>
+          <div id="transfers-chart"></div>
         </section>
 
         <section id="settings" role="tabpanel" aria-labelledby="tab-settings" hidden>

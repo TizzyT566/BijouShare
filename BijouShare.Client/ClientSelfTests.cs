@@ -149,7 +149,8 @@ internal static class ClientSelfTests
         finally { if (Directory.Exists(temp)) Directory.Delete(temp, true); }
 
         var remote = new ScriptedConnection();
-        var operations = new DriveOperations(remote, NullLogger<DriveOperations>.Instance, "Test drive");
+        var transfers = new TransferMeter();
+        var operations = new DriveOperations(remote, NullLogger<DriveOperations>.Instance, "Test drive", transfers);
         var info = new MockDokanFileInfo { WhatGetRequestorShouldReturn = System.Security.Principal.WindowsIdentity.GetCurrent() };
         Check(operations.GetVolumeInformation(out var label, out var features, out var format, out _, info) == NtStatus.Success &&
             label == "Test drive" && format == "NTFS" &&
@@ -232,6 +233,20 @@ internal static class ClientSelfTests
         var buffer = new byte[3];
         Check(operations.ReadFile("\\Team\\test.bin", buffer, out read, 0, info) == NtStatus.Success && read == 2 && buffer[0] == 9,
             "Short reads stop at EOF with the correct byte count");
+        var transferred = transfers.Totals();
+        Check(transferred.ReadBytes == 2 && transferred.WriteBytes == largeWrite.Length + 3,
+            "Client transfer totals count validated file payload once across short and chunked I/O, excluding failed requests");
+        var secondRemote = new ScriptedConnection
+        {
+            Respond = request => request.Offset == 0
+                ? new() { Length = request.DataCount }
+                : throw new RemoteException("AccessDenied")
+        };
+        var secondDrive = new DriveOperations(secondRemote, NullLogger<DriveOperations>.Instance, "Second drive", transfers);
+        var partialStatus = secondDrive.WriteFile("\\backup.bin", largeWrite, out var partial, 0, new MockDokanFileInfo());
+        Check(partialStatus == NtStatus.AccessDenied && partial == Wire.LegacyMaxChunk &&
+            transfers.Totals().WriteBytes == transferred.WriteBytes + partial,
+            "A second drive contributes acknowledged chunks to the same client totals even when a later chunk fails");
 
         var directoryInfo = new MockDokanFileInfo { IsDirectory = true };
         remote.Respond = request => request.Offset == 0

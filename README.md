@@ -63,6 +63,7 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 - **Manage both services from a browser.** System tray icons open the client and server consoles. Each client drive has its own tab showing mount status, connected servers, fingerprints, and connection errors, with a manual refresh option.
 - **Control access to management.** The client console listens on loopback and requires the signed-in user’s access token for management requests. Server setup runs locally, administrator sign-in is rate-limited, and remote administration requires HTTPS.
 - **Review activity and diagnose failures.** The server console shows the latest 200 audit events, and the server keeps daily logs. Error details can identify a missing group permission, a Windows storage denial, or the device holding a conflicting file handle.
+- **Monitor file transfers.** Open **Transfers** on the client for activity across this Windows user’s drives. The server **Overview** shows all devices combined, then each enrolled device. Each graph plots one minute of read, write, and combined speeds in one-second intervals. The separate byte counters persist across restarts. Reads measure file data sent to a client and writes measure file data received from it. Folder listings, protocol overhead, and reads served entirely from a local cache are excluded.
 - **Change listening ports at runtime.** Administrators can change the file-service port and, on a directly managed web endpoint, the console port. The browser waits for the new web address and then redirects. Existing file connections can finish on the old file port.
 - **Install interactively or unattended.** Separate x64 installers register each role as an automatic Windows service. They support silent setup, unattended setup with progress, repair, and uninstall. The client installer checks for the Dokan runtime and driver.
 - **Check connectivity from the command line.** The client’s `--probe` command reports enrollment status and lists authorized shares without mounting a drive.
@@ -101,10 +102,10 @@ This option requires a Windows administrator account with UAC's paired normal an
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.28-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.29-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.28-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.29-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.
@@ -120,7 +121,7 @@ For unattended installation, run either installer from an elevated terminal with
 To switch an **already installed** server to the built-in local Windows Administrator account, finish any active transfers and run this from the folder containing Server Setup:
 
 ```powershell
-.\BijouShare.Server-2.0.28-win-x64-Setup.exe /serviceaccount
+.\BijouShare.Server-2.0.29-win-x64-Setup.exe /serviceaccount
 ```
 
 Approve elevation and enter the displayed account’s Windows password. Setup checks that Windows permits a service logon, changes the account, restarts the server, and reports when it is running. The built-in Administrator must be enabled and have a password. Setup recognizes a renamed account by its Windows identity. The web console has its own administrator login.

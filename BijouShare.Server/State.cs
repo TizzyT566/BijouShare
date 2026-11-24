@@ -394,12 +394,20 @@ public sealed partial class StateStore
         return true;
     });
 
-    public bool RemoveBlockedDevice(Guid id) => Update(s =>
+    public bool RemoveBlockedDevice(Guid id, Action<Guid>? onRemoved = null)
     {
-        if (s.Devices.RemoveAll(d => d.Id == id && !d.Enabled) == 0)
-            throw new ArgumentException("Only a blocked device can be removed. Refresh the device list.");
+        var enrollment = Update(s =>
+        {
+            var index = s.Devices.FindIndex(d => d.Id == id && !d.Enabled);
+            if (index < 0)
+                throw new ArgumentException("Only a blocked device can be removed. Refresh the device list.");
+            var removed = s.Devices[index];
+            s.Devices.RemoveAt(index);
+            return removed.EnrollmentId;
+        });
+        onRemoved?.Invoke(enrollment);
         return true;
-    });
+    }
 
     // Fixture construction only; production approval consumes a request through ApproveDevice.
     internal Device Enroll(EnrollmentRequest request, Guid[] groupIds) => Update(s =>

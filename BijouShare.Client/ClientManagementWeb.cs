@@ -1,4 +1,5 @@
 using System.Net;
+using BijouShare.Shared;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -80,6 +81,7 @@ public static class ClientManagementWeb
             csrfToken = antiforgery.GetAndStoreTokens(context).RequestToken
         }));
         app.MapGet("/api/state", (ClientManagement management) => Results.Ok(management.Snapshot()));
+        app.MapGet("/api/transfers", (TransferMeter transfers) => Results.Ok(transfers.Snapshot()));
         app.MapPut("/api/device", (DeviceUpdate update, ClientManagement management, CancellationToken token) =>
             Change(() => management.UpdateDeviceAsync(update.DeviceName, token), management));
         app.MapPost("/api/drives", (DriveRequest request, ClientManagement management, CancellationToken token) =>

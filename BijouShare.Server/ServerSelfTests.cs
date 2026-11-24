@@ -45,6 +45,7 @@ public static class ServerSelfTests
             count++;
             Console.WriteLine("PASS: " + label);
         }
+        await TransferMeterSelfTests.RunAsync(root, Check);
         AdministratorFileSelfTests.Run(root, store, files, Check);
         var session = Guid.NewGuid();
         var second = Guid.NewGuid();
@@ -1247,12 +1248,17 @@ public static class ServerSelfTests
     private static async Task NetworkTests(ServerOptions options, StateStore store, FileService files, AuditLog audit, Device device,
         byte[] privateKey, byte[] serverPublic, HybridKem identityKem, Action<bool, string> check)
     {
-        using var service = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance);
+        var totalsPath = Path.Combine(store.DataDirectory, "transfer-totals.json");
+        var ledger = new TransferLedger(totalsPath, NullLogger.Instance);
+        var transfers = new ServerTransfers(ledger);
+        using var service = new FileServer(options, store, files, audit, NullLogger<FileServer>.Instance, transfers);
         await service.StartAsync(CancellationToken.None);
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
         {
             await FileSessionSelfTests.RunAsync(options, store, files, device, privateKey, identityKem, check, deadline.Token);
+            check(transfers.Snapshot(store).Aggregate is { ReadBytes: 7, WriteBytes: 5 },
+                "Resuming file sessions counts successful reads and counts a replayed append only once");
             using var socket = new TcpClient();
             using var transport = await AuthenticatedClient.ConnectAsync(socket, "127.0.0.1", options.Port, device.PublicIdentity!, privateKey,
                 identityKem, store.ServerId, deadline.Token, binaryPayloads: false);
@@ -1378,6 +1384,13 @@ public static class ServerSelfTests
                 var parallelPings = await Task.WhenAll(Enumerable.Range(0, 32).Select(_ => Call(new() { Operation = "Ping" })));
                 check(parallelPings.All(x => x.Error is null), "The request window remains usable after concurrent IO and close");
             }
+            var summary = transfers.Snapshot(store);
+            check(summary.Aggregate.ReadBytes == 7 + 64 * 4096 + 7 + 5 + 3 &&
+                summary.Aggregate.WriteBytes == 5 + Wire.MaxChunk + 5 &&
+                summary.Devices.Single(d => d.Id == device.Id).Traffic.ReadBytes == summary.Aggregate.ReadBytes &&
+                summary.Devices.Where(d => d.Id != device.Id).All(d => d.Traffic is { ReadBytes: 0, WriteBytes: 0 }),
+                "Concurrent binary replies count actual file bytes, including a short read and zero-byte EOF");
+            await ServerTransferSelfTests.CheckDeviceAccountingAsync(options, store, device, transfers, ledger, totalsPath, check, deadline.Token);
             store.Update(s => { var d = s.Devices.Single(x => x.Id == device.Id); s.Devices[s.Devices.IndexOf(d)] = d with { Enabled = false }; return true; });
             await transport.SendAsync(new RpcRequest(), deadline.Token);
             check((await transport.ReceiveAsync<RpcResponse>(deadline.Token)).Error == "AccessDenied", "Revocation affects an already authenticated connection");

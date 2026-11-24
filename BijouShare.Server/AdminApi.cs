@@ -93,6 +93,7 @@ public static class AdminApi
                 return settings;
             }));
         api.MapPost("/logout", async (HttpContext context) => { await context.SignOutAsync(); return Results.Ok(); });
+        api.MapGet("/transfers", (StateStore store, ServerTransfers transfers) => Results.Ok(transfers.Snapshot(store)));
         api.MapGet("/state", (StateStore store, AuditLog audit, ServerOptions options, WebPortListener web, HttpContext context) => store.Read(s => Results.Ok(new
         {
             s.ServerName,
@@ -251,8 +252,8 @@ public static class AdminApi
             Save(context, audit, "RejectDevice", id.ToString(), () => { store.RejectDevice(id); return true; }));
         api.MapDelete("/pending-devices/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "RemoveRejectedRequest", id.ToString(), () => store.RemoveRejectedRequest(id)));
-        api.MapDelete("/devices/{id:guid}/record", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
-            Save(context, audit, "RemoveBlockedDevice", id.ToString(), () => store.RemoveBlockedDevice(id)));
+        api.MapDelete("/devices/{id:guid}/record", (Guid id, StateStore store, ServerTransfers transfers, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "RemoveBlockedDevice", id.ToString(), () => store.RemoveBlockedDevice(id, transfers.Forget)));
         api.MapPut("/devices/{id:guid}", (Guid id, DeviceUpdate update, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "Device", id.ToString(), () => store.Update(s =>
             {

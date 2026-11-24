@@ -8,7 +8,7 @@ using DokanAccess = DokanNet.FileAccess;
 namespace BijouShare.Client;
 
 public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveOperations> logger,
-    string initialVolumeName = ClientSettings.DefaultDriveName) : IDokanOperations
+    string initialVolumeName = ClientSettings.DefaultDriveName, TransferMeter? transfers = null) : IDokanOperations
 {
     private int labelRootOpen;
     internal MountLogonAccess? LogonAccess { private get; init; }
@@ -201,6 +201,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                     throw new InvalidDataException("Server returned more bytes than requested.");
                 data.CopyTo(buffer, count);
                 count += data.Length;
+                transfers?.AddRead(data.Length);
                 if (data.Length < size)
                     break;
                 info.TryResetTimeout(60000);
@@ -233,6 +234,7 @@ public sealed class DriveOperations(IRemoteConnection connection, ILogger<DriveO
                 if (reply.Response.Length < 0 || reply.Response.Length > size || (reply.Response.Length == 0 && !info.PagingIo))
                     throw new InvalidDataException("Server returned an invalid write acknowledgement.");
                 count += (int)reply.Response.Length;
+                transfers?.AddWrite(reply.Response.Length);
                 if (reply.Response.Length < size)
                     break;
                 info.TryResetTimeout(60000);

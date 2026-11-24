@@ -14,6 +14,10 @@ internal static class ClientWorkerHost
         var access = new ClientManagementAccess();
         builder.Services.AddSingleton(access);
         builder.Services.AddSingleton(settings);
+        builder.Services.AddSingleton(services => new TransferLedger(Path.Combine(directory, "transfer-stats.json"),
+            services.GetRequiredService<ILogger<TransferLedger>>()));
+        builder.Services.AddSingleton(services => services.GetRequiredService<TransferLedger>().For("client"));
+        builder.Services.AddHostedService<TransferCheckpointService>();
         builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(directory, "web-keys")))
             .ProtectKeysWithDpapi(false).SetApplicationName("BijouShare.Client");
         builder.Services.AddSingleton<DriveConnections>();

@@ -114,6 +114,10 @@ try
     builder.Services.AddSingleton(options);
     builder.Services.AddSingleton(store);
     builder.Services.AddSingleton<AuditLog>();
+    builder.Services.AddSingleton(sp => new TransferLedger(Path.Combine(store.DataDirectory, "transfer-totals.json"),
+        sp.GetRequiredService<ILogger<TransferLedger>>()));
+    builder.Services.AddSingleton(sp => new ServerTransfers(sp.GetRequiredService<TransferLedger>()));
+    builder.Services.AddHostedService<TransferCheckpointService>();
     builder.Services.AddSingleton<FileService>();
     builder.Services.AddSingleton<FileServer>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<FileServer>());

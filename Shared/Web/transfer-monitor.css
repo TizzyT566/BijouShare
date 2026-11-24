@@ -1,0 +1,94 @@
+.transfer-chart {
+  min-width: 0;
+  container-type: inline-size;
+  background: var(--ui-panel);
+  border: 1px solid var(--ui-line);
+  border-radius: 10px;
+  color: var(--ui-text);
+}
+.transfer-chart > :is(h2, h3) {
+  margin: 0;
+  padding: 15px 18px 0;
+  overflow-wrap: anywhere;
+  color: var(--ui-text);
+  font-size: 16px;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -.02em;
+}
+.transfer-body {
+  display: grid;
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr) minmax(255px, 32%);
+  gap: 24px;
+  padding: 12px 18px 16px;
+}
+.transfer-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ui-muted);
+  font-size: 11px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+.transfer-history svg {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  height: 120px;
+  margin: 3px 0;
+  border: 1px solid #4a4a4d;
+  background-color: #131315;
+  background-image: linear-gradient(to right, #353538 1px, transparent 1px),
+                    linear-gradient(to top, #353538 1px, transparent 1px);
+  background-size: calc(100% / 12) 100%, 100% 25%;
+}
+.transfer-area { fill: #ffffff10; }
+.transfer-line { fill: none; vector-effect: non-scaling-stroke; }
+.transfer-line.transfer-total { stroke: #9d9da0; stroke-width: 2.8; }
+.transfer-line.transfer-read { stroke: #fafafa; stroke-width: 1.7; stroke-dasharray: 8 4; }
+.transfer-line.transfer-write { stroke: #d1d1d3; stroke-width: 2; stroke-dasharray: 1 5; stroke-linecap: round; }
+.transfer-values {
+  border-collapse: collapse;
+  table-layout: auto;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.transfer-values :is(th, td) {
+  padding: 7px 0 7px 8px;
+  border: 0;
+  background: none;
+  color: var(--ui-text);
+  white-space: normal;
+  text-align: right;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.transfer-values th:first-child { text-align: left; padding-left: 0; }
+.transfer-values tbody th { white-space: nowrap; font-weight: 500; }
+.transfer-values thead th { color: var(--ui-muted); font-weight: 500; font-size: 11px; letter-spacing: normal; }
+.transfer-values tbody tr { border-top: 1px solid var(--ui-line); }
+.transfer-values tbody td { overflow-wrap: anywhere; }
+.transfer-values tbody tr:last-child :is(th, td) { font-weight: 650; }
+.transfer-swatch {
+  display: inline-block;
+  width: 18px;
+  margin-right: 7px;
+  vertical-align: .25em;
+  border-top: 2px solid #9d9da0;
+}
+.transfer-swatch.transfer-read { border-top: 2px dashed #fafafa; }
+.transfer-swatch.transfer-write { border-top: 2px dotted #d1d1d3; }
+@container (max-width: 620px) {
+  .transfer-body { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .transfer-history svg { height: 92px; }
+  .transfer-values :is(th, td) { padding-block: 5px; }
+}
+@media (forced-colors: active) {
+  .transfer-line { stroke: CanvasText !important; }
+  .transfer-area { fill: none; }
+  .transfer-swatch { border-color: CanvasText !important; }
+}

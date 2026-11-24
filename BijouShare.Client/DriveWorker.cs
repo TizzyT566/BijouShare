@@ -5,7 +5,7 @@ using BijouShare.Shared;
 namespace BijouShare.Client;
 
 public sealed class DriveWorker(ClientSettings settings, DriveConnections connections, ILoggerFactory loggers,
-    ClientDriveState driveState, ILogger<DriveWorker> logger) : BackgroundService
+    ClientDriveState driveState, ILogger<DriveWorker> logger, TransferMeter transfers) : BackgroundService
 {
     private sealed record Mount(MultiServerConnection Router, CancellationTokenSource Stop, Task Worker);
     private readonly SemaphoreSlim mountGate = new(1, 1);
@@ -112,7 +112,7 @@ public sealed class DriveWorker(ClientSettings settings, DriveConnections connec
         var initialName = settings.GetDriveName(mountPoint);
         using var directory = CreatePrivateDirectory(mountPoint);
         var access = directory is null ? null : new MountLogonAccess();
-        var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>(), initialName) { LogonAccess = access };
+        var operations = new DriveOperations(connection, loggers.CreateLogger<DriveOperations>(), initialName, transfers) { LogonAccess = access };
         var mounted = await CreateMountAsync(dokan, mountPoint, directory, operations, initialName, stoppingToken);
         using var instance = mounted.Instance;
         using var label = mounted.Label;

@@ -15,6 +15,7 @@ let viewEpoch = 0, stateLoadSequence = 0;
 let devicePollBusy = false;
 let connectionHost = location.hostname;
 let setupRequired = false;
+let stopTransferMonitor;
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
@@ -75,12 +76,12 @@ function table(headers, rows, title = '', message = 'Add an item to get started.
     : empty('Nothing here yet', message)}</div>`;
 }
 
-async function api(path, method = 'GET', body) {
+async function api(path, method = 'GET', body, signal) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
   try {
     const response = await fetch('/api' + path, {
-      method, credentials: 'same-origin', signal: controller.signal,
+      method, credentials: 'same-origin', signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrf },
       body: body === undefined ? undefined : JSON.stringify(body)
     });
@@ -120,6 +121,8 @@ async function session() {
 }
 
 function showLogin() {
+  stopTransferMonitor?.();
+  stopTransferMonitor = null;
   viewEpoch++;
   stateLoadSequence++;
   state = null;
@@ -310,6 +313,41 @@ function permissionText(mask) {
     .map(permission => permissionLabels[permission.name] ?? permission.name).join(', ');
 }
 
+function monitorOverview() {
+  const aggregate = new TransferChart($('#all-transfers'), 'All device transfers');
+  const list = $('#device-transfers'), status = $('#transfer-status'), emptyList = $('#transfers-empty');
+  const cards = new Map();
+  return watchTransfers(signal => api('/transfers', 'GET', undefined, signal), ({aggregate: traffic, devices}) => {
+    aggregate.update(traffic);
+    status.hidden = true;
+    emptyList.hidden = devices.length !== 0;
+    const ids = new Set(devices.map(device => device.id));
+    for (const [id, card] of cards) {
+      if (!ids.has(id)) { card.host.remove(); cards.delete(id); }
+    }
+    const names = new Set(), repeatedNames = new Set();
+    for (const {name} of devices) {
+      if (names.has(name)) repeatedNames.add(name);
+      names.add(name);
+    }
+    devices.forEach(({id, name, traffic}, index) => {
+      const title = repeatedNames.has(name) ? name + ' · ' + id.slice(0, 8) : name;
+      let card = cards.get(id);
+      if (!card) {
+        const host = document.createElement('section');
+        card = {host, chart: new TransferChart(host, title, {headingLevel: 3})};
+        cards.set(id, card);
+      }
+      if (list.children[index] !== card.host) list.insertBefore(card.host, list.children[index] ?? null);
+      card.chart.setTitle(title);
+      card.chart.update(traffic);
+    });
+  }, () => {
+    status.textContent = 'Transfer updates interrupted. Retrying…';
+    status.hidden = false;
+  });
+}
+
 function renderOverview() {
   const { groups, devices, pendingDevices, activity } = state;
   const shares = state.shares.filter(share => !share.isAggregate);
@@ -327,8 +365,12 @@ function renderOverview() {
     const action = event.action.replace(/([a-z])([A-Z])/g, '$1 $2');
     return `<li><span class="row-icon">${icon(event.result === 'OK' ? 'activity' : 'alert')}</span><div class="row-copy"><strong>${escapeHtml(action)}</strong><small>${escapeHtml(event.actor)}${event.result === 'OK' ? '' : ' · ' + escapeHtml(event.result)}</small></div><time datetime="${escapeHtml(event.time)}" title="${escapeHtml(new Date(event.time).toLocaleString())}">${escapeHtml(new Date(event.time).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}))}</time></li>`;
   }).join('');
-  return `<section class="server-hero" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow">${icon('server')}Server overview</p><h1 id="overview-title" tabindex="-1">${escapeHtml(state.serverName)}</h1><div class="hero-meta"><span>${icon('network')}TCP <code>${state.filePort}</code></span><span class="hero-divider"></span><span>${icon('lock')}Encrypted file server</span></div>
+  return `<section class="server-hero overview-heading" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow">${icon('server')}Server overview</p><h1 id="overview-title" tabindex="-1">${escapeHtml(state.serverName)}</h1><div class="hero-meta"><span>${icon('network')}TCP <code>${state.filePort}</code></span><span class="hero-divider"></span><span>${icon('lock')}Encrypted file server</span></div>
       <div class="hero-actions">${newButton('Add share', 'shares')}<button type="button" data-new="invites">${icon('key')}Create invite</button></div></div></section>
+    <section id="all-transfers"></section>
+    <p id="transfer-status" class="hint" role="status">Waiting for transfer data…</p>
+    <section class="device-transfers-section" aria-labelledby="device-transfers-heading"><h2 id="device-transfers-heading">Transfers by device</h2>
+      <p id="transfers-empty" class="hint" hidden>No enrolled devices.</p><div id="device-transfers"></div></section>
     <div class="stats" aria-label="Server totals">${metrics.map(([target, symbol, label, value]) => `<a class="stat" href="#${target}"><span class="stat-label">${label}</span><strong>${value.toLocaleString()}</strong><span class="stat-symbol">${icon(symbol)}</span></a>`).join('')}</div>
     ${pending && !state.inviteOnly ? `<div class="callout approval-notice">${icon('clock')}<div><strong>${pending} device ${pending === 1 ? 'request awaits' : 'requests await'} approval</strong><span>Review the identities and assign their access groups.</span></div><a class="text-link" href="#devices">Review requests${icon('arrow')}</a></div>` : ''}
     <div class="overview-grid">
@@ -437,7 +479,9 @@ function render() {
       (state.storageAccount ? `<p class="hint">Windows accesses these paths as <strong>${escapeHtml(state.storageAccount)}</strong>. This account needs NTFS write access on each folder where devices can create files or folders.</p>` : ''),
     devices: renderDeviceWorkspace, invites: renderInvites, activity: renderActivity, settings: renderSettings
   };
+  stopTransferMonitor?.();
   $('#content').innerHTML = renderers[tab]();
+  stopTransferMonitor = tab === 'overview' ? monitorOverview() : null;
   $('#device-enrollment')?.addEventListener('submit', changeEnrollment);
   $('#rename-server')?.addEventListener('submit', changeServerName);
   $('#server-ports')?.addEventListener('submit', changeServerPorts);
