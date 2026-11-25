@@ -26,6 +26,12 @@
       <InstallExecuteSequence>
         <Custom Action="PrepareServiceStorage" Before="StartServices" Condition="$ServiceHost=3" />
       </InstallExecuteSequence>
+    <?elseif $(Role) = Client ?>
+      <CustomAction Id="CleanupNetworkFilters" FileRef="ServiceExe" ExeCommand="--cleanup-network-filters"
+                    Execute="deferred" Impersonate="no" Return="check" />
+      <InstallExecuteSequence>
+        <Custom Action="CleanupNetworkFilters" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      </InstallExecuteSequence>
     <?endif?>
 
     <Property Id="EXISTING_SERVICE" Secure="yes">

@@ -220,6 +220,22 @@ public static class ProtocolSelfTests
                     CryptographicOperations.ZeroMemory(slice.Buffer);
             }
         }
+        foreach (var relayFrame in new[] { new RelayFrame([]), new RelayFrame([], true), new RelayFrame([0, 17, 255]) })
+        {
+            var packet = RpcEncoding.Encode(relayFrame, true);
+            try
+            {
+                var decoded = RpcEncoding.Decode<RelayFrame>(packet.Buffer, packet.Length, true);
+                Check(relayFrame.End == decoded.End && relayFrame.Data.AsSpan().SequenceEqual(decoded.Data),
+                    "Network relay frames preserve payload bytes and distinguish empty datagrams from TCP shutdown");
+            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(packet.Buffer, clearArray:true); }
+        }
+        foreach (var invalid in new byte[][] { [1, 0], [3, 2], [3, 1, 42] })
+        {
+            try { RpcEncoding.Decode<RelayFrame>(invalid, invalid.Length, true); throw new InvalidOperationException("Invalid relay frame accepted."); }
+            catch (InvalidDataException) { Check(true, "Dedicated network streams reject invalid frame types and shutdown payloads"); }
+        }
         await RpcSessionSelfTests.RunAsync(material, Check);
         Console.WriteLine($"Protocol: {count} checks passed.");
         return 0;

@@ -96,6 +96,7 @@ public static class AuthenticatedClient
                 throw new CryptographicException("Invalid device name in session confirmation.");
             transport.RemoteDeviceName = name;
             transport.SupportsSessionResume = binaryPayloads && ready.SupportsSessionResume;
+            transport.SupportsNetworkServices = binaryPayloads && ready.SupportsNetworkServices;
             transport.RemoteUserName = ready.UserName ?? name;
             transport.RemoteIdentityPublicKey = server.GlobalIdentityPublicKey;
             transport.RemoteServerId = expectedServerId;

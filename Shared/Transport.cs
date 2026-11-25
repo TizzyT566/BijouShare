@@ -21,6 +21,7 @@ public sealed class SecureTransport : IDisposable
         get;
     }
     public bool SupportsSessionResume { get; internal set; }
+    public bool SupportsNetworkServices { get; internal set; }
     public string? RemoteUserName
     {
         get; internal set;
@@ -109,7 +110,8 @@ public sealed class SecureTransport : IDisposable
             var header = new byte[4];
             await stream.ReadExactlyAsync(header, token);
             var frameLength = BinaryPrimitives.ReadInt32BigEndian(header);
-            if (frameLength < 16 || frameLength > Wire.MaxFrame)
+            var maximum = typeof(T) == typeof(RelayFrame) ? RelayFrame.MaxStreamPayload + 2 + 16 : Wire.MaxFrame;
+            if (frameLength < 16 || frameLength > maximum)
                 throw new InvalidDataException("Invalid frame.");
             encrypted = ArrayPool<byte>.Shared.Rent(frameLength);
             await stream.ReadExactlyAsync(encrypted.AsMemory(0, frameLength), token);

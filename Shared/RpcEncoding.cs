@@ -7,6 +7,16 @@ internal static class RpcEncoding
 {
     public static (byte[] Buffer, int Length) Encode<T>(T message, bool binary)
     {
+        if (message is RelayFrame frame)
+        {
+            if (!binary || frame.Data == null || frame.Data.Length > RelayFrame.MaxStreamPayload || frame.End && frame.Data.Length != 0)
+                throw new InvalidDataException("Invalid network service frame.");
+            var buffer = ArrayPool<byte>.Shared.Rent(2 + frame.Data.Length);
+            buffer[0] = 3;
+            buffer[1] = frame.End ? (byte)1 : (byte)0;
+            frame.Data.CopyTo(buffer, 2);
+            return (buffer, 2 + frame.Data.Length);
+        }
         if (!binary)
         {
             // Legacy JSON needs a standalone array; optimized frames can copy the caller's exact slice directly.
@@ -65,6 +75,13 @@ internal static class RpcEncoding
     public static T Decode<T>(byte[] buffer, int length, bool binary)
     {
         var bytes = buffer.AsSpan(0, length);
+        if (typeof(T) == typeof(RelayFrame))
+        {
+            if (!binary || length < 2 || length > RelayFrame.MaxStreamPayload + 2 || bytes[0] != 3 ||
+                bytes[1] > 1 || bytes[1] == 1 && length != 2)
+                throw new InvalidDataException("Invalid network service frame.");
+            return (T)(object)new RelayFrame(bytes[2..].ToArray(), bytes[1] == 1);
+        }
         if (!binary)
             return System.Text.Json.JsonSerializer.Deserialize<T>(bytes, Wire.Json) ?? throw new InvalidDataException("Empty message.");
         if (bytes.Length < 9)

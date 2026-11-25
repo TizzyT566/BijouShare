@@ -72,6 +72,17 @@ public sealed record ClientKeyExchange(byte[] MlKemCiphertext);
 public sealed record ServerProof(byte[] Proof);
 public sealed record ClientProof(byte[] Proof);
 
+[Flags]
+public enum NetworkServiceProtocol { Tcp = 1, Udp = 2, Both = Tcp | Udp }
+[Flags]
+public enum NetworkServiceAccess { None = 0, Send = 1, Receive = 2, Both = Send | Receive }
+public sealed record NetworkServiceDescriptor(Guid Id, string Name, NetworkServiceProtocol Protocol, int Port, NetworkServiceAccess Access);
+public sealed record RelayFrame(byte[] Data, bool End = false)
+{
+    public const int MaxStreamPayload = 65536;
+    public const int MaxDatagramPayload = 65507;
+}
+
 // The server derives group permissions from the authenticated device. RPCs cannot select an identity.
 public sealed record RpcRequest
 {
@@ -115,6 +126,8 @@ public sealed record RpcRequest
     public bool TracksOutcome => Operation is "Open" or "Write" or "Flush" or "Resize" or "Allocate" or "Attributes"
         or "Times" or "Move" or "Lock" or "Unlock" or "Cleanup" or "Close";
     public string Operation { get; init; } = "Ping";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public NetworkServiceProtocol NetworkProtocol { get; init; }
     // Optional directory filter. Older servers ignore it and use their default page size.
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SearchPattern { get; init; }
@@ -203,8 +216,11 @@ public sealed record RpcRequest
             throw new ArgumentException("Enrollment is valid only during connection setup.");
         if (Operation is not ("Ping" or "Space" or "Open" or "Stat" or "List" or "Read" or "Write" or "Flush" or
             "Resize" or "Allocate" or "Attributes" or "Times" or "CanDelete" or "Move" or "Lock" or "Unlock" or
-            "Security" or "Cleanup" or "Close" or "GetOutcome" or "AbandonOpen"))
+            "Security" or "Cleanup" or "Close" or "GetOutcome" or "AbandonOpen" or "ListNetworkServices"))
             throw new RemoteException("Unsupported");
+        if (NetworkProtocol != 0 || Operation == "ListNetworkServices" &&
+            (Handle != Guid.Empty || Data is not null || Destination != null || Path != "\\" || Count != 0 || Offset != 0 || Length != 0))
+            throw new ArgumentException("Invalid network service request.");
         var receiptControl = Operation is "GetOutcome" or "AbandonOpen";
         if (OutcomeId < 0 || receiptControl && (OutcomeId == 0 || Data is not null || Handle != Guid.Empty) ||
             OutcomeId != 0 && !receiptControl && !TracksOutcome ||
@@ -238,6 +254,12 @@ public readonly record struct DirectoryItem(
 
 public sealed record RpcResponse
 {
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SupportsNetworkServices { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public NetworkServiceDescriptor[]? NetworkServices { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public NetworkServiceAccess NetworkAccess { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool SupportsSessionResume { get; init; }
     [JsonIgnore] internal int BorrowedCount { get; init; } = -1;

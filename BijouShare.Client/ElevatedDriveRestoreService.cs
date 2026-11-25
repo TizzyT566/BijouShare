@@ -60,7 +60,7 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
         finally { await Task.WhenAll(clients); }
     }
 
-    private static NamedPipeServerStream CreatePipe()
+    internal static NamedPipeServerStream CreatePipe(string? name = null)
     {
         var acl = new PipeSecurity();
         acl.SetAccessRuleProtection(true, false);
@@ -70,7 +70,7 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
         acl.AddAccessRule(new PipeAccessRule(SystemSid, PipeAccessRights.FullControl, AccessControlType.Allow));
         acl.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.InteractiveSid, null),
             ClientRights, AccessControlType.Allow));
-        return NamedPipeServerStreamAcl.Create(PipeName(Environment.ProcessId), PipeDirection.InOut, MaxConnections,
+        return NamedPipeServerStreamAcl.Create(name ?? PipeName(Environment.ProcessId), PipeDirection.InOut, MaxConnections,
             PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 512, 512, acl, HandleInheritability.None);
     }
 
@@ -93,11 +93,7 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
                 if (handle <= 0 || handle > uint.MaxValue || (handle & 3) != 0) return;
                 using var process = Process.GetProcessById(pid);
                 using var processPin = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
-                var image = new StringBuilder(32768);
-                int length = image.Capacity;
-                if (processPin.IsInvalid || !QueryFullProcessImageNameW(processPin, 0, image, ref length) ||
-                    !string.Equals(image.ToString(), MountAliasPipe.InstalledClient, StringComparison.OrdinalIgnoreCase))
-                    return;
+                if (!IsInstalledWorker(processPin)) return;
 
                 SecurityIdentifier? owner = null;
                 long logon = 0;
@@ -152,16 +148,7 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
         bool handedOff = false;
         try
         {
-            var pid = ServiceProcessId();
-            pipe = new NamedPipeClientStream(".", PipeName(pid), ClientRights, PipeOptions.Asynchronous,
-                TokenImpersonationLevel.Identification, HandleInheritability.None);
-            await pipe.ConnectAsync(startup.Token);
-            // The kernel reports both the pipe's server PID and SECURITY_DESCRIPTOR owner.
-            // An ordinary local process cannot assign SYSTEM as an object's owner.
-            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var connectedPid) || connectedPid != pid ||
-                pipe.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner ||
-                owner != SystemSid || ServiceProcessId() != pid)
-                throw new UnauthorizedAccessException("Windows could not verify the BijouShare Client service.");
+            pipe = await OpenVerifiedPipeAsync(PipeName, startup.Token);
             startup.Token.ThrowIfCancellationRequested();
             var transfer = SendRootAsync(pipe, letter, grant, root, gate);
             handedOff = true;
@@ -223,6 +210,31 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
         return status.ProcessId;
     }
 
+    internal static bool IsInstalledWorker(SafeProcessHandle pinned)
+    {
+        var image = new StringBuilder(32768);
+        int length = image.Capacity;
+        return !pinned.IsInvalid && QueryFullProcessImageNameW(pinned, 0, image, ref length) &&
+            string.Equals(image.ToString(), MountAliasPipe.InstalledClient, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static async Task<NamedPipeClientStream> OpenVerifiedPipeAsync(Func<int, string> pipeName, CancellationToken token)
+    {
+        int pid = ServiceProcessId();
+        var pipe = new NamedPipeClientStream(".", pipeName(pid), ClientRights, PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification, HandleInheritability.None);
+        try
+        {
+            await pipe.ConnectAsync(token);
+            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var connectedPid) || connectedPid != pid ||
+                pipe.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) is not SecurityIdentifier owner ||
+                owner != SystemSid || ServiceProcessId() != pid)
+                throw new UnauthorizedAccessException("Windows could not verify the BijouShare Client service.");
+            return pipe;
+        }
+        catch { pipe.Dispose(); throw; }
+    }
+
     private static IOException ServiceError() => new("Windows could not find the running BijouShare Client service.",
         new Win32Exception(Marshal.GetLastPInvokeError()));
     [StructLayout(LayoutKind.Sequential)]
@@ -246,7 +258,7 @@ internal sealed class ElevatedDriveRestoreService(ILogger<ElevatedDriveRestoreSe
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     private static extern bool QueryFullProcessImageNameW(SafeProcessHandle process, int flags, StringBuilder buffer, ref int length);
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out int pid);
+    internal static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out int pid);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out int pid);
 }

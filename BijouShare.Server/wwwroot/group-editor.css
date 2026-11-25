@@ -59,6 +59,8 @@
 .group-matrix :is(th:not(:first-child), td) { width: 37px; text-align: center; }
 .group-matrix input[type="checkbox"] { display: inline-block; margin: 0; vertical-align: middle; }
 .group-save { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 10px; justify-content: flex-end; }
+.network-permissions { margin-top: 14px; }
+.network-permissions .group-matrix { margin-top: 8px; grid-template-columns: minmax(0, 420px); }
 @media(max-width: 1050px) {
   .group-scope-editor { grid-template-columns: minmax(100px, 20%) minmax(0, 1fr); }
   .group-matrix { grid-template-columns: 1fr; gap: 0; }

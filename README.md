@@ -2,7 +2,7 @@
 
 # BijouShare
 
-BijouShare lets you share files, folders, and entire Windows drives across a LAN. On the client, shares open in File Explorer under a drive letter you choose. One drive can hold folders from several servers, and each Windows user has their own connections and device identity. Administrators use the server's web console to decide which devices can read, change, or delete files.
+BijouShare shares files, folders, entire Windows drives, and TCP or UDP services across a LAN. File shares open in Explorer under a drive letter you choose. Network services are available to local apps through a port you choose. Each Windows user has their own connections and device identity. Administrators manage access through groups in the server console.
 
 ## Screenshots
 
@@ -25,6 +25,14 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 - **Browse several servers on one drive.** Each server gets a folder named `ServerName_First16FingerprintCharacters`, with its shares underneath.
 - **Manage files in place.** Browse and copy files, create folders, edit or resize files, rename items, and delete them according to the device’s permissions. Applications can also read and set supported attributes and timestamps.
 - **Coordinate simultaneous access.** Multiple readers can open a file. The server allows one writable handle per file, honors Windows sharing flags, and supports byte-range locks.
+
+### Network services
+
+- **Share a TCP or UDP endpoint.** In the server console, open **Shares → Add share → Network service**. Enter a name, the destination host and port as seen from the server, and **TCP**, **UDP**, or **Both**. Network services appear in the client console, separate from File Explorer.
+- **Grant each direction separately.** In **Groups**, add a rule for the service. **Send** allows the client to send to the destination. **Receive** allows the destination to reply or send data to the client. Request-and-response services usually need both. Explicit denies take precedence across groups, including Administrator. A rule on the built-in **All** share can grant these directions for current and future services.
+- **Choose a local port per service.** In the client console, open **Network services**, enter an unused local port, and select **Start listener**. Point your app at `127.0.0.1` on that port. For example, a TCP service exported on port 8080 can listen locally on 18080. With **Both**, the same local port must be available for both protocols. Choose **Stop listener** to release the port or change it.
+- **Keep listeners private across sign-ins.** Enabled services and port choices are saved in your Windows profile. Before opening a port, the installed client service uses Windows Filtering Platform rules to restrict that port to your account’s security identifier (SID). Apps running as your account can use the listener. Windows blocks other accounts’ TCP connections and UDP traffic, including replies. If Windows cannot apply the rules, the port stays closed.
+- **Use UDP with local apps.** Each UDP app registers its local endpoint by sending a datagram to the listener. For receive-only access, its registration datagram stays on the client.
 
 ### Device enrollment and invites
 
@@ -80,8 +88,10 @@ The BijouShare **2.0.14** consoles are shown below with sample devices and share
 flowchart LR
     E["File Explorer"] <--> D["Dokan drive"]
     D <--> C["Client for this Windows user"]
+    A["Local app"] <-->|Loopback TCP or UDP| C
     C <-->|Encrypted LAN connection| S["BijouShare Server"]
     S <-->|Group permissions and NTFS access| F["Shared files and folders"]
+    S <-->|Send and receive permissions| N["Configured network service"]
 ```
 
 **Identity and encryption.** Each server and each Windows user's client profile keeps an ECDH P-256 key pair and an ML-KEM-768 key pair. Their full SHA3-256 public-key fingerprint stays the same across display-name changes. The client checks the server against the full fingerprint in its connection link, and both peers prove possession of their private keys. Each connection combines fresh ECDH and ML-KEM contributions to derive separate AES-256-GCM keys for sending and receiving file traffic.
@@ -89,6 +99,8 @@ flowchart LR
 **Access and concurrent use.** Devices inherit access through their groups. The server checks the applicable share and path rules for each operation. An explicit deny overrides an allow, including a grant from the permanent **Administrator** group. The server service also needs the Windows permissions required for the operation. Multiple readers can open a file, and the server allows one writable handle at a time, subject to Windows sharing flags.
 
 **Drive layout and reconnection.** Each server appears as a folder named after the server and the first 16 characters of its fingerprint, for example `N:\North-Archive_838cff90d76c4ed0\Projects`. After wake, the client keeps the folder visible briefly while it reconnects. If the server stays offline, the client hides its folder and keeps the drive mounted. The folder returns automatically when the server reconnects. Open files remain usable when the original file session resumes.
+
+**Network service transport.** Each local TCP connection or UDP peer gets a dedicated authenticated connection to the same BijouShare server port. The client selects a share by ID. The server looks up the configured destination, checks the device’s permissions, and opens a socket to that endpoint. UDP datagrams keep their message boundaries across the encrypted TCP connection. Encryption between the server and the destination depends on the service’s own protocol. Removing access closes the affected connections. After an outage, applications can open a new connection through the saved listener. Profiles with zero drives can connect using **Network services → Connect a server**.
 
 **Browsing media folders on a slow connection.** Directory listings contain names, sizes, attributes, and timestamps. Explorer may then read parts of photos or videos to generate thumbnails or preview a selected file. On the client, open **File Explorer → … → Options → View**, select **Always show icons, never thumbnails**, and click **Apply**. This affects Explorer for that Windows user across all drives. Turn off the **Preview pane** under **View → Show** (or press **Alt+P** if it is open). For video or music folders, use **Details** view with basic columns such as **Name**, **Size**, and **Date modified**. Media-specific columns such as **Length** can trigger additional file reads. BijouShare presents its mounts as fixed drives, so a Windows policy scoped only to network folders may miss them. [Windows thumbnail policies](https://learn.microsoft.com/windows/client-management/mdm/policy-csp-admx-thumbnails)
 
@@ -102,10 +114,10 @@ This option requires a Windows administrator account with UAC's paired normal an
 
 ## Setup
 
-1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.0.29-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
+1. **Install the server.** On the computer hosting the files, run `BijouShare.Server-2.1.0-win-x64-Setup.exe` and approve elevation. Choose **Local Service** or **Administrator** as the Windows service account. For Administrator, enter the password for the local Windows account shown. Open **BijouShare Server** from the system tray, under **Show hidden icons** if needed. Enter a server name, an administrator name, and a password of at least 14 characters. Sign in.
 2. **Publish a share.** Choose **Shares → Add share**, name the share, and enter its local path. Give the server's Windows account (by default, **LOCAL SERVICE**) the NTFS access it needs there. Under **Groups**, add a group and set its permissions for that share. [Changing the server service account](#changing-the-server-service-account)
 3. **Invite the client.** On **Overview**, enter a LAN hostname or IP address the client can reach. Under **Invites → Create invite**, select the group and set the use limit and expiration. Send the complete invite link through a trusted channel. It contains the server fingerprint and a code that approves the device.
-4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.0.29-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
+4. **Install the client.** After installing Dokan, run `BijouShare.Client-2.1.0-win-x64-Setup.exe` and approve elevation. Open **BijouShare Client** from the system tray or Start menu and choose a device name. Select **Add drive**, choose an unused letter, and enter a drive name.
 5. **Open the share.** Select that drive in the client sidebar, paste the invite under **Connect a server**, and click **Connect**. Once the status reads **Connected**, open the drive in File Explorer and browse to the server folder and share.
 
 For manual approval, open **Settings → Device enrollment**, turn off **Invite only**, and save. In step 3, send the connection link from **Overview → Connect a client → Copy link**. After the client connects, open **Devices**, choose its groups, and approve it. Turning **Invite only** back on pauses manual approval, including requests already waiting. Upgrades preserve your existing enrollment setting.
@@ -121,7 +133,7 @@ For unattended installation, run either installer from an elevated terminal with
 To switch an **already installed** server to the built-in local Windows Administrator account, finish any active transfers and run this from the folder containing Server Setup:
 
 ```powershell
-.\BijouShare.Server-2.0.29-win-x64-Setup.exe /serviceaccount
+.\BijouShare.Server-2.1.0-win-x64-Setup.exe /serviceaccount
 ```
 
 Approve elevation and enter the displayed account’s Windows password. Setup checks that Windows permits a service logon, changes the account, restarts the server, and reports when it is running. The built-in Administrator must be enabled and have a password. Setup recognizes a renamed account by its Windows identity. The web console has its own administrator login.

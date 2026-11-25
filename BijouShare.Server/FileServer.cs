@@ -11,6 +11,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
 {
     private readonly ConcurrentDictionary<Guid, Task> connections = new();
     private readonly FileSessionLeases leases = new(store, files, TimeProvider.System);
+    private readonly NetworkRelayServer networkRelays = new(store, audit, options);
     private readonly object listenerGate = new();
     private TcpListener? listener;
     private TaskCompletionSource portChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -323,6 +324,7 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                 await transport.SendAsync(new RpcResponse
                 {
                     SupportsSessionResume = hello.BinaryPayloads,
+                    SupportsNetworkServices = hello.BinaryPayloads,
                     DeviceName = readyIdentity.Name,
                     UserName = registration ? null : readyIdentity.Name
                 }, timeout.Token);
@@ -373,6 +375,8 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
         try
         {
             request.Validate();
+            if (request.Operation == "ListNetworkServices")
+                return new RpcResponse { NetworkServices = store.ListNetworkServices(device) };
             var response = files.Execute(session, device.Id, request, device, receipts, counters);
             if (request.Operation == "List" && request.BasicDirectoryInfo && response.Entries is { } entries)
                 return response with { Entries = null, Items = entries.ConvertAll(DirectoryItem.FromEntry) };
@@ -416,6 +420,12 @@ public sealed class FileServer(ServerOptions options, StateStore store, FileServ
                         throw new InvalidDataException("Invalid RPC request sequence.");
                     var first = previousId == 0;
                     previousId = request.RequestId;
+                    if (first && request.Operation == "OpenNetworkService")
+                    {
+                        await networkRelays.ServeAsync(transport, request, device, lifetime.Token);
+                        request.ReleasePayload();
+                        return;
+                    }
                     if (first && request.Operation == "ResumeSession")
                     {
                         if (request.Data is not null || request.InviteCode is not null)

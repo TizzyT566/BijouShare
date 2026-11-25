@@ -63,6 +63,7 @@ public static class BackendSelfTests
         var loaded = new StateStore(options);
         Check(loaded.Identity(device.Id).HasSameIdentity(device), "Device key pairs survive validated state reloads");
         AllSharesRegressions(store, group, device, Check, Reject);
+        NetworkServicePolicySelfTests.Run(store, group, device, Check, Reject);
         DeviceStateSelfTests.Run(root, Check);
 
         using var replacement = KeyAgreement.NewKey();

@@ -140,6 +140,10 @@ function Test-Msi($Database, [string]$Role, [string]$Version, [string]$Scratch) 
             $sequence.PrepareServiceStorage -lt $sequence.StartServices -and $conditions.PrepareServiceStorage -match '\$ServiceHost\s*=\s*3') 'Server prepares private storage as SYSTEM before first service start'
         Confirm-Check ($guards.Where({ $_.Description -match 'Dokan' }).Count -eq 0) 'Server package runs independently of the Dokan driver'
     } else {
+        $cleanup = @(Read-MsiTable $Database CustomAction @('Action','Type','Source','Target') | Where-Object Action -eq 'CleanupNetworkFilters')
+        Confirm-Check ($cleanup.Count -eq 1 -and [int]$cleanup[0].Type -eq 3090 -and $cleanup[0].Source -eq 'ServiceExe' -and
+            $cleanup[0].Target -eq '--cleanup-network-filters' -and $sequence.CleanupNetworkFilters -gt $sequence.StopServices -and
+            $sequence.CleanupNetworkFilters -lt $sequence.RemoveFiles -and $conditions.CleanupNetworkFilters -match 'NOT UPGRADINGPRODUCTCODE') 'Client removes its network listener filters on uninstall after stopping the service'
         Confirm-Check ($storageActions.Count -eq 0 -and $shortcut[0].Arguments -eq '--open-management' -and $shortcut[0].Component_ -eq $service.Component_) 'Client Start menu opens the signed-in user console'
         Confirm-Check ($registry.Where({ $_.Root -eq 2 -and $_.Key -eq 'Software\Classes\wad' -and $_.Name -eq 'URL Protocol' }).Count -eq 1) 'Client wad URI protocol'
         Confirm-Check ($registry.Where({ $_.Key -eq 'Software\Classes\wad\shell\open\command' -and $_.Value -match '^".+" --open-uri "%1"$' }).Count -eq 1) 'Client quotes and isolates the URI argument'

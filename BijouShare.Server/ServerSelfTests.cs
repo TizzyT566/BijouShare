@@ -1391,6 +1391,7 @@ public static class ServerSelfTests
                 summary.Devices.Where(d => d.Id != device.Id).All(d => d.Traffic is { ReadBytes: 0, WriteBytes: 0 }),
                 "Concurrent binary replies count actual file bytes, including a short read and zero-byte EOF");
             await ServerTransferSelfTests.CheckDeviceAccountingAsync(options, store, device, transfers, ledger, totalsPath, check, deadline.Token);
+            await NetworkRelaySelfTests.RunAsync(options, store, device, privateKey, identityKem, check, deadline.Token);
             store.Update(s => { var d = s.Devices.Single(x => x.Id == device.Id); s.Devices[s.Devices.IndexOf(d)] = d with { Enabled = false }; return true; });
             await transport.SendAsync(new RpcRequest(), deadline.Token);
             check((await transport.ReceiveAsync<RpcResponse>(deadline.Token)).Error == "AccessDenied", "Revocation affects an already authenticated connection");

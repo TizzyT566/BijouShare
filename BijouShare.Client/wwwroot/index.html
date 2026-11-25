@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/client.css">
   <link rel="stylesheet" href="/transfer-monitor.css">
   <script src="/transfer-monitor.js" defer></script>
+  <script src="/network-services.js" defer></script>
   <script src="/client.js" defer></script>
 </head>
 <body>
@@ -50,6 +51,7 @@
         <div id="drive-tabs" role="presentation"></div>
         <button type="button" role="tab" id="tab-add" aria-controls="add" aria-selected="false" tabindex="-1"><span class="bi bi-plus" aria-hidden="true"></span>Add drive</button>
         <div class="rail-divider" role="presentation"></div>
+        <button type="button" role="tab" id="tab-network-services" aria-controls="network-services" aria-selected="false" tabindex="-1"><span class="bi bi-network" aria-hidden="true"></span>Network services</button>
         <button type="button" role="tab" id="tab-transfers" aria-controls="transfers" aria-selected="false" tabindex="-1"><span class="bi bi-activity" aria-hidden="true"></span>Transfers</button>
         <button type="button" role="tab" id="tab-settings" aria-controls="settings" aria-selected="false" tabindex="-1"><span class="bi bi-settings" aria-hidden="true"></span>Device settings</button>
       </div>
@@ -91,6 +93,21 @@
             <div class="section-title"><span class="tile"><span class="bi bi-clock" aria-hidden="true"></span></span><div><h2>Servers waiting for a drive</h2><p class="muted">These servers will connect when you add your first drive.</p></div></div>
             <ul id="pending-list"></ul><p id="pending-error" class="error" role="alert"></p>
           </div>
+        </section>
+
+        <section id="network-services" role="tabpanel" aria-labelledby="tab-network-services" hidden>
+          <div class="page-heading"><h1>Network services</h1><p class="muted">Choose a local port, start a listener, then connect your app to that port on 127.0.0.1. Listeners start again after sign-in.</p></div>
+          <details class="network-connect">
+            <summary>Connect a server</summary>
+            <form id="network-connect-form">
+              <label>Connection or invite link<input name="uri" required placeholder="wad://server:7443/fingerprint#invite" autocomplete="off" spellcheck="false"></label>
+              <button type="submit" class="primary">Connect</button>
+              <p id="network-connect-error" class="error" role="alert"></p>
+            </form>
+          </details>
+          <p id="network-catalog-status" role="status" class="notice" hidden></p>
+          <p id="network-empty" class="muted">Loading shared services…</p>
+          <div id="network-service-list"></div>
         </section>
 
         <section id="transfers" role="tabpanel" aria-labelledby="tab-transfers" hidden>
@@ -163,5 +180,10 @@
     <div class="form-actions"><button id="cancel-remove" type="button">Cancel</button><button id="confirm-remove" type="button" class="primary">Disconnect server</button></div>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="listener-error" aria-labelledby="listener-error-title" aria-describedby="listener-error-text">
+    <h2 id="listener-error-title">Listener unavailable</h2>
+    <p id="listener-error-text" class="muted"></p>
+    <form method="dialog" class="form-actions"><button type="submit" class="primary" autofocus>OK</button></form>
+  </dialog>
 </body>
 </html>

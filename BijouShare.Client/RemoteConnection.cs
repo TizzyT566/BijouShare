@@ -111,6 +111,8 @@ public sealed class RemoteConnection(ClientSettings settings, ILogger<RemoteConn
         try
         {
             active = await GetConnectionAsync(expectedGeneration, routeIdentity, timeout.Token);
+            if (request.Operation == "ListNetworkServices" && !active.Session.SupportsNetworkServices)
+                throw new RemoteException("Unsupported");
             if (active.Unclaimed is { } opens && request.Operation is "Ping" or "Open")
             {
                 await opens.DrainAsync(active.Session, timeout.Token);

@@ -19,6 +19,8 @@ public sealed record AccessScope(string Path, Permission Allow, Permission Deny,
 public sealed record AccessRule(Guid Id, Guid GroupId, Guid ShareId, string Path,
     Permission Allow, Permission Deny, bool Inherit)
 {
+    public NetworkServiceAccess NetworkAllow { get; init; }
+    public NetworkServiceAccess NetworkDeny { get; init; }
     public AccessScope[] AdditionalScopes { get; init; } = [];
     internal bool AppliesToShare(Guid id) => ShareId == id || ShareId == StateStore.AllSharesId;
 
@@ -62,7 +64,7 @@ public sealed record PendingDevice(Guid Id, string Name, string ClientPublicKey,
 public sealed record AdminCredential(string Name, byte[] Salt, byte[] Hash, string Algorithm = "PBKDF2-HMAC-SHA3-256");
 public sealed class ServerState
 {
-    public int SchemaVersion { get; set; } = 7;
+    public int SchemaVersion { get; set; } = 8;
     public int? FilePort { get; set; }
     public int? WebPort { get; set; }
     public bool InviteOnly { get; set; }
@@ -78,6 +80,7 @@ public sealed class ServerState
     }
     public List<AppGroup> Groups { get; set; } = [];
     public List<ExportShare> Shares { get; set; } = [];
+    public List<NetworkServiceShare> NetworkServices { get; set; } = [];
     public List<AccessRule> Rules { get; set; } = [];
     public List<Device> Devices { get; set; } = [];
     public List<PendingDevice> PendingDevices { get; set; } = [];
@@ -113,9 +116,16 @@ public sealed partial class StateStore
         PrivateStorage.SecureDirectory(DataDirectory, includeLocalService: true);
         path = System.IO.Path.Combine(DataDirectory, "state.json");
         state = File.Exists(path) ? LoadState(File.ReadAllBytes(path)) : CreateState();
-        var upgraded = state.SchemaVersion == 6;
-        if (upgraded)
+        var upgraded = state.SchemaVersion < 8;
+        if (state.SchemaVersion == 6)
             UpgradeShareTargets(state);
+        if (upgraded)
+        {
+            if (state.NetworkServices is not { Count: 0 } || state.Rules is null || state.Rules.Any(rule =>
+                    rule is null || (rule.NetworkAllow | rule.NetworkDeny) != NetworkServiceAccess.None))
+                throw new InvalidDataException("Unexpected network permissions in an older state file.");
+            state.SchemaVersion = 8;
+        }
         Validate(state, validatePrivateKeys: true);
         if (upgraded)
             PrivateStorage.AtomicWrite(path, Wire.Encode(state));
@@ -127,7 +137,7 @@ public sealed partial class StateStore
         using var document = JsonDocument.Parse(bytes);
         if (document.RootElement.ValueKind != JsonValueKind.Object ||
             !document.RootElement.TryGetProperty("schemaVersion", out var version) ||
-            version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number is not (6 or 7))
+            version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var number) || number is not (6 or 7 or 8))
             throw new InvalidDataException("Unsupported server state format.");
         return Wire.Decode<ServerState>(bytes);
     }
@@ -535,8 +545,8 @@ public sealed partial class StateStore
             throw new ArgumentException("Ports must be between 1 and 65535.");
         if (s.FilePort.HasValue && s.FilePort == s.WebPort)
             throw new ArgumentException("The file service and web UI must use different ports.");
-        if (s.SchemaVersion != (legacyShares ? 6 : 7) || s.Groups is null || s.Shares is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
-            s.Groups.Any(x => x is null) || s.Shares.Any(x => x is null) ||
+        if (s.SchemaVersion != (legacyShares ? 6 : 8) || s.Groups is null || s.Shares is null || s.NetworkServices is null || s.Rules is null || s.Devices is null || s.PendingDevices is null ||
+            s.Groups.Any(x => x is null) || s.Shares.Any(x => x is null) || s.NetworkServices.Any(x => x is null) ||
             s.Rules.Any(x => x is null) || s.Devices.Any(x => x is null) || s.PendingDevices.Any(x => x is null) ||
             s.PendingDevices.Count > 4096 || s.PendingDevices.Count(device => !device.Rejected) > 256)
             throw new ArgumentException("State collections cannot be null or contain null entries.");
@@ -582,14 +592,14 @@ public sealed partial class StateStore
         foreach (var name in s.Groups.Select(x => x.Name).Concat(s.Shares.Select(x => x.Name)))
             ValidateName(name);
         Unique(s.Groups.Select(x => x.Id), "group ID");
-        Unique(s.Shares.Select(x => x.Id), "share ID");
+        Unique(s.Shares.Select(x => x.Id).Concat(s.NetworkServices.Select(x => x.Id)), "share ID");
         Unique(s.Rules.Select(x => x.Id), "rule ID");
         Unique(s.Rules.Select(x => (x.GroupId, x.ShareId)), "group/share permission assignment; edit the existing assignment to add a path");
         Unique(s.Devices.Select(x => x.Id).Concat(s.PendingDevices.Select(x => x.Id)), "device ID");
         Unique(s.Groups.Select(x => x.Name), "group name", StringComparer.OrdinalIgnoreCase);
         if (!s.Groups.Any(group => group.Id == AdministratorGroupId && group.Name == AdministratorGroupName))
             throw new ArgumentException("The built-in Administrator group cannot be removed or renamed.");
-        Unique(s.Shares.Select(x => x.Name), "share name", StringComparer.OrdinalIgnoreCase);
+        Unique(s.Shares.Select(x => x.Name).Concat(s.NetworkServices.Select(x => x.Name)), "share name", StringComparer.OrdinalIgnoreCase);
         Unique(s.Devices.Select(x => x.ClientPublicKey).Concat(s.PendingDevices.Select(x => x.ClientPublicKey)), "device ECDH key", StringComparer.Ordinal);
         Unique(s.Devices.Select(x => x.ClientMlKemPublicKey).Concat(s.PendingDevices.Select(x => x.ClientMlKemPublicKey)), "device ML-KEM key", StringComparer.Ordinal);
         if (s.Admin is { } admin)
@@ -612,14 +622,22 @@ public sealed partial class StateStore
                 throw new ArgumentException("Share names must be single Windows file names.");
             NormalizeLocalSharePath(share.LocalPath);
         }
+        foreach (var share in s.NetworkServices)
+            ValidateNetworkService(share);
         foreach (var rule in s.Rules)
         {
             var allShares = !legacyShares && rule.ShareId == AllSharesId;
+            var network = s.NetworkServices.Any(share => share.Id == rule.ShareId);
             if (rule.GroupId == AdministratorGroupId)
                 throw new ArgumentException("Administrator already has automatic full control on every share.");
             if (rule.Id == Guid.Empty || rule.AdditionalScopes is null ||
-                s.Groups.All(x => x.Id != rule.GroupId) || (!allShares && s.Shares.All(x => x.Id != rule.ShareId)))
+                s.Groups.All(x => x.Id != rule.GroupId) || (!allShares && !network && s.Shares.All(x => x.Id != rule.ShareId)))
                 throw new ArgumentException("Invalid group permission rule.");
+            if (((rule.NetworkAllow | rule.NetworkDeny) & ~NetworkServiceAccess.Both) != 0 || (rule.NetworkAllow & rule.NetworkDeny) != 0 ||
+                (!allShares && !network && (rule.NetworkAllow | rule.NetworkDeny) != NetworkServiceAccess.None))
+                throw new ArgumentException("Send and receive permissions require a network service or the built-in All share. Each direction can be allowed or denied once.");
+            if (network && (rule.Path != "" || rule.AdditionalScopes.Length != 0 || rule.Inherit || (rule.Allow | rule.Deny) != Permission.None))
+                throw new ArgumentException("Network service rules accept send and receive permissions only.");
             var inherited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var exact = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var scope in rule.Scopes())

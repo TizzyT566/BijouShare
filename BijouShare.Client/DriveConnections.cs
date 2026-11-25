@@ -57,6 +57,11 @@ public sealed class DriveConnections : IDisposable
         }
     }
 
+    internal IRemoteConnection? ConnectionFor(ServerEndpoint endpoint)
+    {
+        lock (gate) return routers.GetValueOrDefault(endpoint.MountPoint ?? settings.MountPoint)?.ConnectionFor(endpoint);
+    }
+
     public ServerConnectionStatus StatusFor(ServerEndpoint endpoint)
     {
         lock (gate)

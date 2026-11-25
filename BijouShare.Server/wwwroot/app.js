@@ -21,6 +21,12 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 const nameOf = (list, id) => list.find(item => item.id === id)?.name ?? 'Unknown';
 const enabled = value => `<span class="pill ${value ? '' : 'off'}">${value ? 'Enabled' : 'Disabled'}</span>`;
+const protocolLabel = protocol => ({1: 'TCP', 2: 'UDP', 3: 'TCP + UDP'})[protocol];
+function shareTarget(share) {
+  if (share.kind !== 'network') return share.localPath;
+  const host = share.host.includes(':') && !share.host.startsWith('[') ? '[' + share.host + ']' : share.host;
+  return `${host}:${share.port} · ${protocolLabel(share.protocol)}`;
+}
 const icon = name => `<span class="bi bi-${name}" aria-hidden="true"></span>`;
 const empty = (title, text) => `<div class="empty"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p></div>`;
 const heading = (title, text, action = '') => `<div class="page-heading"><div><h1 tabindex="-1">${title}</h1><p class="muted">${text}</p></div>${action}</div>`;
@@ -360,7 +366,7 @@ function renderOverview() {
       : ['devices', 'clock', 'Awaiting approval', pending]
   ];
   const listing = shares.slice(0, 4).map(share => `<li>
-    <span class="row-icon">${icon('folder')}</span><div class="row-copy"><strong>${escapeHtml(share.name)}</strong><small class="mono">${escapeHtml(share.localPath)}</small></div>${enabled(share.enabled)}</li>`).join('');
+    <span class="row-icon">${icon(share.kind === 'network' ? 'network' : 'folder')}</span><div class="row-copy"><strong>${escapeHtml(share.name)}</strong><small class="mono">${escapeHtml(shareTarget(share))}</small></div>${enabled(share.enabled)}</li>`).join('');
   const events = activity.slice(0, 3).map(event => {
     const action = event.action.replace(/([a-z])([A-Z])/g, '$1 $2');
     return `<li><span class="row-icon">${icon(event.result === 'OK' ? 'activity' : 'alert')}</span><div class="row-copy"><strong>${escapeHtml(action)}</strong><small>${escapeHtml(event.actor)}${event.result === 'OK' ? '' : ' · ' + escapeHtml(event.result)}</small></div><time datetime="${escapeHtml(event.time)}" title="${escapeHtml(new Date(event.time).toLocaleString())}">${escapeHtml(new Date(event.time).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}))}</time></li>`;
@@ -381,9 +387,9 @@ function renderOverview() {
 }
 
 function renderSharesTable(title = '') {
-  return table(['Share name', 'Server path', 'Status', ''], state.shares.map(share => share.isAggregate
-    ? `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td>All current and future shares</td><td><span class="pill">Built-in</span></td><td></td></tr>`
-    : `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td class="mono">${escapeHtml(share.localPath)}</td><td>${enabled(share.enabled)}</td><td>${shareActions(share)}</td></tr>`), title, 'Add a file, folder, or drive to begin sharing.');
+  return table(['Share name', 'Type', 'Target', 'Status', ''], state.shares.map(share => share.isAggregate
+    ? `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td>All shares</td><td>All current and future shares</td><td><span class="pill">Built-in</span></td><td></td></tr>`
+    : `<tr><td><strong>${escapeHtml(share.name)}</strong></td><td>${share.kind === 'network' ? 'Network service' : 'File system'}</td><td class="mono">${escapeHtml(shareTarget(share))}</td><td>${enabled(share.enabled)}</td><td>${shareActions(share)}</td></tr>`), title, 'Add a file system share or network service to begin sharing.');
 }
 
 const formattedFingerprint = value => String(value ?? '').match(/.{1,8}/g)?.join(' ') ?? '';
@@ -475,7 +481,7 @@ function render() {
   $('#crumb').textContent = label; document.title = `${state.serverName} · ${label} · BijouShare`;
   const renderers = {
     overview: renderOverview, groups: renderGroupWorkspace,
-    shares: () => heading('Shares', 'Files, folders, and entire drives, together under one virtual drive.', newButton('Add share', 'shares')) + renderSharesTable() +
+    shares: () => heading('Shares', 'Share files through a virtual drive or make a TCP or UDP service available on a client’s local port.', newButton('Add share', 'shares')) + renderSharesTable() +
       (state.storageAccount ? `<p class="hint">Windows accesses these paths as <strong>${escapeHtml(state.storageAccount)}</strong>. This account needs NTFS write access on each folder where devices can create files or folders.</p>` : ''),
     devices: renderDeviceWorkspace, invites: renderInvites, activity: renderActivity, settings: renderSettings
   };
@@ -606,16 +612,34 @@ $('#invite-result').addEventListener('close', clearInviteDetails);
 
 function editShare(id) {
   const existing = state.shares.find(share => share.id === id);
-  const share = existing ?? { id: crypto.randomUUID(), enabled: true };
-  const fields = field('name', 'Name on virtual drive', share.name) +
-    field('localPath', 'Absolute server path', share.localPath, 'Examples: D:\\, D:\\Team, or D:\\Reports\\summary.pdf') +
+  const share = existing ?? { id: crypto.randomUUID(), enabled: true, kind: 'filesystem' };
+  const network = share.kind === 'network';
+  const fields = (!existing ? `<label for="share-kind">Share type</label><select id="share-kind" name="kind"><option value="filesystem">File system</option><option value="network">Network service</option></select>` : '') +
+    field('name', 'Share name', share.name) +
+    `<fieldset class="share-fields" id="file-share-fields"${network ? ' hidden disabled' : ''}><legend class="sr-only">File system target</legend>${field('localPath', 'Absolute server path', share.localPath, 'Examples: D:\\, D:\\Team, or D:\\Reports\\summary.pdf')}</fieldset>
+    <fieldset class="share-fields" id="network-share-fields"${network ? '' : ' hidden disabled'}><legend class="sr-only">Network service target</legend>
+      <label for="service-host">Destination host</label><input id="service-host" name="host" maxlength="254" placeholder="printer.lan" value="${escapeHtml(share.host)}" required>
+      <label for="service-port">Destination port</label><input id="service-port" name="port" type="number" min="1" max="65535" step="1" value="${escapeHtml(share.port)}" required>
+      <label for="service-protocol">Protocol</label><select id="service-protocol" name="protocol">${[1, 2, 3].map(value => `<option value="${value}"${value === share.protocol ? ' selected' : ''}>${protocolLabel(value)}</option>`).join('')}</select>
+    </fieldset>` +
     `<label class="check"><input type="checkbox" name="enabled" ${share.enabled ? 'checked' : ''}>Enabled</label>`;
   openEditor(`${existing ? 'Edit' : 'Add'} share`, fields, async form => {
     const values = new FormData(form);
     const name = values.get('name').trim();
     if (!name) throw new Error('Enter a name with at least one non-space character.');
-    await api(`/shares/${share.id}`, 'PUT', { id: share.id, name, localPath: values.get('localPath').trim(), enabled: values.has('enabled') });
+    const common = { id: share.id, name, enabled: values.has('enabled') };
+    if ((values.get('kind') ?? share.kind) === 'network') {
+      await api(`/network-services/${share.id}`, 'PUT', {...common, host: values.get('host').trim(), port: Number(values.get('port')), protocol: Number(values.get('protocol'))});
+    } else {
+      await api(`/shares/${share.id}`, 'PUT', {...common, localPath: values.get('localPath').trim()});
+    }
     return 'Changes saved.';
+  });
+  $('#share-kind')?.addEventListener('change', event => {
+    const network = event.target.value === 'network';
+    const fileFields = $('#file-share-fields'), networkFields = $('#network-share-fields');
+    fileFields.hidden = fileFields.disabled = network;
+    networkFields.hidden = networkFields.disabled = !network;
   });
 }
 
@@ -624,7 +648,7 @@ function confirmDeletion(entity, id, removeRecord = false) {
   if (!item) return;
   const name = item.name;
   let title = `Delete ${entityNames[entity]}?`, detail = '', button = 'Delete';
-  if (entity === 'shares') { title = 'Remove share?'; button = 'Remove share'; detail = `Clients will lose this shared location and ${state.rules.filter(rule => rule.shareId === id).length} permission rule(s) will be removed. The server’s files remain in place.`; }
+  if (entity === 'shares') { title = 'Remove share?'; button = 'Remove share'; detail = (item.kind === 'network' ? 'Clients will lose access to this service. ' : 'Clients will lose this shared location. The server’s files remain in place. ') + `Removing the share also removes ${state.rules.filter(rule => rule.shareId === id).length} permission rule(s).`; }
   if (entity === 'devices') { title = 'Block device?'; button = 'Block device'; detail = 'This device loses access immediately. Its identity and groups are retained. Expand its name and select Enabled to allow it to reconnect.'; }
   if (entity === 'pendingDevices') { title = 'Block device?'; button = 'Block device'; detail = 'Blocked devices cannot enroll, even with a valid invite link.'; }
   if (entity === 'invites') { title = 'Revoke invite?'; button = 'Revoke invite'; detail = 'This code will no longer enroll devices. Devices already enrolled keep their current groups and permissions.'; }

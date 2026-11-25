@@ -95,6 +95,25 @@ code, .server-endpoint, .server-digest { font-family: var(--mono); }
 .panel { padding: 24px; }
 .page-heading { margin: 12px 0 26px; }
 .page-heading .muted { margin-top: 10px; }
+#network-catalog-status { white-space: pre-line; }
+.network-connect { margin: 0 0 18px; }
+.network-connect summary { cursor: pointer; font-weight: 600; }
+#network-connect-form { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+#network-connect-form label { flex: 1 1 235px; max-width: 650px; margin: 0; }
+#network-connect-form input { display: block; margin-top: 4px; }
+#network-service-list { display: grid; gap: 10px; padding-bottom: 24px; }
+.network-service-row { display: grid; grid-template-columns: minmax(0, 1fr) 92px auto; gap: 14px; align-items: end; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.network-service-info { align-self: center; overflow-wrap: anywhere; }
+.network-service-info h2 { font-size: 16px; }
+.network-service-info p, .network-service-state { font-size: 12px; }
+.network-service-info p { margin-block: 4px; }
+.network-service-row label { margin: 0; font-size: 12px; }
+.network-service-row input { margin-top: 3px; font-family: var(--mono); }
+.network-service-row input:disabled { color: var(--muted); }
+@media (max-width: 580px) {
+  .network-service-row { grid-template-columns: minmax(75px, 1fr) auto; }
+  .network-service-info { grid-column: 1 / -1; }
+}
 .drive-hero {
   position: relative; isolation: isolate; display: flex; align-items: center; min-height: 199px; overflow: hidden;
   padding: 36px clamp(24px, 3.2vw, 50px); border: 1px solid #3d3d40; border-radius: 12px;

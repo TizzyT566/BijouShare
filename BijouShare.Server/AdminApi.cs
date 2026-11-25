@@ -16,9 +16,11 @@ public static class AdminApi
     public sealed record DeviceApproval(Guid[] GroupIds, string Fingerprint);
     public sealed record DeviceUpdate(bool Enabled, Guid[] GroupIds);
     public sealed record InviteCreation(string Name, Guid[] GroupIds, int? MaxUses, DateTimeOffset? ExpiresUtc);
-    private sealed record ShareSummary(Guid Id, string Name, string? LocalPath, bool Enabled, bool IsAggregate);
+    private sealed record ShareSummary(Guid Id, string Name, string? LocalPath, bool Enabled, bool IsAggregate,
+        string Kind = "filesystem", string? Host = null, int? Port = null, NetworkServiceProtocol? Protocol = null);
     public sealed record PermissionRuleUpdate(Guid Id, Guid GroupId, Guid ShareId, string Path,
-        Permission Allow, Permission Deny, bool Inherit, AccessScope[]? AdditionalScopes = null);
+        Permission Allow, Permission Deny, bool Inherit, AccessScope[]? AdditionalScopes = null,
+        NetworkServiceAccess? NetworkAllow = null, NetworkServiceAccess? NetworkDeny = null);
     public sealed record Setup(string ServerName, string AdminName, string Password, string ConfirmPassword);
     public static string CredentialVersion(AdminCredential admin) => Convert.ToHexString(System.Security.Cryptography.SHA3_256.HashData(admin.Hash));
     public static void MapAdminApi(this WebApplication app)
@@ -115,7 +117,9 @@ public static class AdminApi
                 isAdministrator = group.Id == StateStore.AdministratorGroupId
             }),
             shares = s.Shares.Select(share => new ShareSummary(share.Id, share.Name, share.LocalPath, share.Enabled, false))
-                .Prepend(new(StateStore.AllSharesId, StateStore.AllSharesName, null, true, true)),
+                .Concat(s.NetworkServices.Select(share => new ShareSummary(share.Id, share.Name, null, share.Enabled, false,
+                    "network", share.Host, share.Port, share.Protocol)))
+                .Prepend(new(StateStore.AllSharesId, StateStore.AllSharesName, null, true, true, "all")),
             s.Rules,
             devices = s.Devices.Select(d => new
             {
@@ -209,12 +213,21 @@ public static class AdminApi
                 }, x => x.Id == id);
                 return true;
             })));
+        api.MapPut("/network-services/{id:guid}", (Guid id, NetworkServiceShare service, StateStore store, AuditLog audit, HttpContext context) =>
+            Save(context, audit, "NetworkService", service.Name, () => store.Update(s =>
+            {
+                if (id != service.Id)
+                    throw new ArgumentException("ID mismatch.");
+                Upsert(s.NetworkServices, service, x => x.Id == id);
+                return true;
+            })));
         api.MapDelete("/shares/{id:guid}", (Guid id, StateStore store, AuditLog audit, HttpContext context) =>
             Save(context, audit, "DeleteShare", id.ToString(), () => store.Update(s =>
             {
                 if (id == StateStore.AllSharesId)
                     throw new ArgumentException("The built-in All share cannot be deleted.");
                 s.Shares.RemoveAll(x => x.Id == id);
+                s.NetworkServices.RemoveAll(x => x.Id == id);
                 s.Rules.RemoveAll(x => x.ShareId == id);
                 return true;
             })));
@@ -231,6 +244,8 @@ public static class AdminApi
                 var updated = new AccessRule(id, rule.GroupId, rule.ShareId, StateStore.CanonicalRulePath(s, rule.ShareId, rule.Path),
                     rule.Allow, rule.Deny, rule.Inherit)
                 {
+                    NetworkAllow = rule.NetworkAllow ?? (existing?.ShareId == rule.ShareId ? existing.NetworkAllow : NetworkServiceAccess.None),
+                    NetworkDeny = rule.NetworkDeny ?? (existing?.ShareId == rule.ShareId ? existing.NetworkDeny : NetworkServiceAccess.None),
                     AdditionalScopes = scopes.Select(scope =>
                     {
                         ArgumentNullException.ThrowIfNull(scope);

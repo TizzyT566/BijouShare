@@ -67,8 +67,14 @@ internal sealed class UserSessionLauncher(ILogger<UserSessionLauncher> logger, b
             {
                 using (process)
                 {
-                    if (WaitForSingleObject(process, 0) == 258 && !TerminateProcess(process, 0))
-                        logger.LogDebug("The session worker was already closing.");
+                    if (WaitForSingleObject(process, 0) == 258)
+                    {
+                        if (!TerminateProcess(process, 0))
+                            logger.LogDebug("The session worker was already closing.");
+                        // StopServices must finish closing user sockets before uninstall removes their filters.
+                        if (WaitForSingleObject(process, 5000) == 258)
+                            logger.LogWarning("A client session worker is still closing.");
+                    }
                 }
             }
         }

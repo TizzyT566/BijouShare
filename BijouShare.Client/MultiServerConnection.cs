@@ -140,6 +140,9 @@ public sealed class MultiServerConnection : IRemoteConnection, IDisposable
             (target.Connection as IDisposable)?.Dispose();
     }
 
+    internal IRemoteConnection? ConnectionFor(ServerEndpoint endpoint) =>
+        Volatile.Read(ref targets).FirstOrDefault(target => ReferenceEquals(target.Endpoint, endpoint))?.Connection;
+
     public ServerConnectionStatus StatusFor(ServerEndpoint endpoint)
     {
         var target = Volatile.Read(ref targets).SingleOrDefault(target => ReferenceEquals(target.Endpoint, endpoint));

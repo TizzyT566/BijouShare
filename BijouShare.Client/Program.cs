@@ -11,6 +11,14 @@ try
     if (args.Length > 0 && args[0] == "--elevated-drive")
         return await ElevatedDriveHelper.RunAsync(args);
 
+    if (args is ["--cleanup-network-filters"])
+    {
+        using var caller = System.Security.Principal.WindowsIdentity.GetCurrent();
+        if (!caller.IsSystem || !MountAliasPipe.IsInstalledClient) return 1;
+        NetworkPortFilters.Purge();
+        return 0;
+    }
+
     var protocolLink = WadProtocol.ParseActivation(args);
     var commandLine = ClientCommandLine.Parse(protocolLink is null ? args : []);
     if (commandLine.Command == ClientCommand.Help)
@@ -32,6 +40,7 @@ try
         });
         service.Services.AddWindowsService(o => o.ServiceName = "BijouShare.Client");
         service.Services.AddHostedService<ElevatedDriveRestoreService>();
+        service.Services.AddHostedService<NetworkPortBroker>();
         service.Services.AddHostedService(provider => new UserSessionLauncher(
             provider.GetRequiredService<ILogger<UserSessionLauncher>>(), commandLine.NoBrowser));
         using var broker = service.Build();

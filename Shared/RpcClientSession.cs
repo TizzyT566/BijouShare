@@ -17,6 +17,7 @@ public sealed class RpcClientSession : IDisposable
     private Exception? failure;
     internal Exception? Failure => Volatile.Read(ref failure);
     public bool BinaryPayloads => transport.BinaryPayloads;
+    public bool SupportsNetworkServices => transport.SupportsNetworkServices;
     public bool IsClosed => Volatile.Read(ref disposed) != 0;
     public string? UserName => transport.RemoteUserName;
     public string? DeviceName => transport.RemoteDeviceName;

@@ -71,6 +71,7 @@ internal static class ClientSelfTests
         ClientProfileSelfTests.Run(Check);
         CheckMountLogonAccess(Check);
         await ClientManagementSelfTests.RunAsync(Check);
+        NetworkListenerSelfTests.Run(Check);
 
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--data-dir", "--probe"]), "A missing CLI value cannot consume the next command");
         Reject<ArgumentException>(() => ClientCommandLine.Parse(["--data-dir", "-h"]), "A missing CLI value cannot consume a short help option");

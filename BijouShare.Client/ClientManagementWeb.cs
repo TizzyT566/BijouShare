@@ -14,11 +14,14 @@ public static class ClientManagementWeb
     public sealed record ElevatedAccessRequest(string MountPoint, bool? Enabled);
     public sealed record ServerRequest(string Uri, string? MountPoint = null);
     public sealed record ServerRemoval(string Host, int Port, string? MountPoint = null);
+    public sealed record NetworkServiceUpdate(string ServerId, Guid ShareId, bool? Enabled, int? LocalPort);
 
     public static void AddServices(IServiceCollection services)
     {
         services.AddSingleton<ClientDriveState>();
         services.AddSingleton<ClientManagement>();
+        services.AddSingleton<NetworkServices>();
+        services.AddHostedService(provider => provider.GetRequiredService<NetworkServices>());
         services.AddHostedService<ClientActivation>();
         services.AddAntiforgery(options =>
         {
@@ -82,6 +85,24 @@ public static class ClientManagementWeb
         }));
         app.MapGet("/api/state", (ClientManagement management) => Results.Ok(management.Snapshot()));
         app.MapGet("/api/transfers", (TransferMeter transfers) => Results.Ok(transfers.Snapshot()));
+        app.MapGet("/api/network-services", (NetworkServices services) => Results.Ok(services.Snapshot()));
+        app.MapPost("/api/network-services", async (NetworkServiceUpdate request, NetworkServices services) =>
+        {
+            try
+            {
+                await services.SetEnabledAsync(request.ServerId, request.ShareId, request.Enabled ??
+                    throw new ArgumentException("Specify whether to enable this network service."), request.LocalPort);
+                return Results.Ok(services.Snapshot());
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidDataException)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.Cryptography.CryptographicException)
+            {
+                return Results.BadRequest(new { error = "Cannot save this network service setting in your Windows profile." });
+            }
+        });
         app.MapPut("/api/device", (DeviceUpdate update, ClientManagement management, CancellationToken token) =>
             Change(() => management.UpdateDeviceAsync(update.DeviceName, token), management));
         app.MapPost("/api/drives", (DriveRequest request, ClientManagement management, CancellationToken token) =>

@@ -92,7 +92,7 @@ public sealed class ServerEndpoint
     }
 }
 
-public sealed class ClientSettings
+public sealed partial class ClientSettings
 {
     private const int CurrentFormat = 6;
     private const int MaximumSettingsBytes = 1024 * 1024;
@@ -521,6 +521,7 @@ public sealed class ClientSettings
 
     public void Validate(bool requireEnrollment = false)
     {
+        ValidateNetworkListeners();
         if (Servers is null || Servers.Count > 64 || Servers.Any(server => server is null))
             throw new InvalidDataException("Configure at most 64 non-null servers.");
         if (IdentityFormat != CurrentFormat)

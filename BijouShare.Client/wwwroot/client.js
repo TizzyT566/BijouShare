@@ -129,6 +129,7 @@ function selectView(id, remember = true) {
   }
   $('#refresh').hidden = !id.startsWith('drive-');
   monitorTransfers(id === 'transfers');
+  networkServiceView.show(id === 'network-services');
   if (remember) history.replaceState(null, '', '#' + id);
 }
 
@@ -261,6 +262,7 @@ function render(next) {
   $('#dashboard').hidden = !state.setupComplete;
   if (!state.setupComplete) {
     monitorTransfers(false);
+    networkServiceView.show(false);
     if (!previous || previous.setupComplete) {
       $('#setup-name').value = state.deviceName;
       $('#setup-name').focus();
@@ -471,6 +473,16 @@ async function start() {
   catch (error) {$('#loading-message').textContent = error.message; $('#retry-load').hidden = false;}
 }
 $('#retry-load').addEventListener('click', start);
+$('#network-connect-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  await submit(form.querySelector('button'), $('#network-connect-error'), async () => {
+    render(await api('/servers', 'POST', {uri:form.elements.uri.value.trim(), mountPoint:null}));
+    form.reset();
+    form.closest('details').open = false;
+    toast('Server saved. Checking for network services…');
+  });
+});
 async function pollState() {
   if (polling || busy || !state || document.hidden || document.querySelector('dialog[open]')) return;
   polling = true;
